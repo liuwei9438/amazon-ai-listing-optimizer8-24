@@ -381,8 +381,14 @@ class StrategyInputBuilder:
 
             "compatibility_facts": {
                 "brands":
-                    StrategyInputBuilder._list(
-                        profile_compatibility.get("brands", [])
+                    (
+                        StrategyInputBuilder._list(
+                            profile_compatibility.get("brands", [])
+                        )
+                        or
+                        StrategyInputBuilder._list(
+                            normalized_compatibility.get("brands", [])
+                        )
                     ),
                 "models":
                     StrategyInputBuilder._list(
