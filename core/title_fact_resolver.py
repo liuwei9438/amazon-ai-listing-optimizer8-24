@@ -6,7 +6,7 @@ from typing import Any
 class TitleFactResolver:
     """Stable Title Pipeline V1.0: source-backed fact resolver only."""
 
-    VERSION = "stable-v1.4-fact-resolver-brand-model-separated"
+    VERSION = "stable-v1.7-brand-equivalence-trace"
     STRICT_TYPES = {
         "MODEL", "PART_NUMBER", "COMPATIBILITY_MODEL",
         "COMPATIBILITY_BRAND", "SPECIFICATION",
@@ -46,6 +46,76 @@ class TitleFactResolver:
         return out
 
     @staticmethod
+    def _brand_traceable(
+        brand: str,
+        source_title: str,
+    ) -> bool:
+        """
+        Conservative brand traceability with punctuation tolerance.
+
+        Allowed equivalence:
+        - Can-on <-> Canon
+        - TR-AXXAS <-> TRAXXAS
+        - whitespace / punctuation differences
+
+        Multi-token brands may also contain source connector "for" between
+        brand tokens (e.g. "KONICA for MINOLTA").
+
+        This does not use external brand knowledge and does not permit a
+        semantically different brand.
+        """
+        brand = TitleFactResolver._clean(brand)
+        source_title = TitleFactResolver._clean(source_title)
+
+        if not brand or not source_title:
+            return False
+
+        if brand.casefold() in source_title.casefold():
+            return True
+
+        compact_brand = re.sub(
+            r"[^a-z0-9]+",
+            "",
+            brand.casefold(),
+        )
+        compact_source = re.sub(
+            r"[^a-z0-9]+",
+            "",
+            source_title.casefold(),
+        )
+
+        if (
+            compact_brand
+            and len(compact_brand) >= 3
+            and compact_brand in compact_source
+        ):
+            return True
+
+        tokens = [
+            token
+            for token in re.findall(
+                r"[A-Za-z0-9]+",
+                brand,
+            )
+            if token
+        ]
+
+        if len(tokens) >= 2:
+            pattern = r"\b" + r"(?:\W+|\W+for\W+)".join(
+                re.escape(token)
+                for token in tokens
+            ) + r"\b"
+
+            if re.search(
+                pattern,
+                source_title,
+                flags=re.IGNORECASE,
+            ):
+                return True
+
+        return False
+
+    @staticmethod
     def _source_text(profile: dict) -> str:
         ledger = profile.get("source_fact_ledger", {})
         ledger = ledger if isinstance(ledger, dict) else {}
@@ -62,14 +132,30 @@ class TitleFactResolver:
     @staticmethod
     def _quantity(v: Any) -> str:
         m = re.search(
-            r"\b(\d{1,4})\s*(?:pcs?|pieces?|piece|sets?)\b",
+            r"\b(\d{1,4})\s*(pcs?|pieces?|piece|sets?|packs?|pairs?)\b",
             TitleFactResolver._clean(v),
             flags=re.I,
         )
         if not m:
             return ""
+
         n = int(m.group(1))
-        return "" if n <= 1 else f"{n}pcs"
+
+        if n <= 1:
+            return ""
+
+        raw_unit = m.group(2).casefold()
+
+        if raw_unit in {"set", "sets"}:
+            unit = "sets"
+        elif raw_unit in {"pack", "packs"}:
+            unit = "packs"
+        elif raw_unit in {"pair", "pairs"}:
+            unit = "pairs"
+        else:
+            unit = "pcs"
+
+        return f"{n}{unit}"
 
     @staticmethod
     def resolve(profile: dict) -> dict:
@@ -134,7 +220,27 @@ class TitleFactResolver:
 
             if trace is None:
                 trace = typ in TitleFactResolver.STRICT_TYPES
-            traceable = (not trace) or text.casefold() in source.casefold()
+
+            if (
+                trace
+                and typ == "COMPATIBILITY_BRAND"
+            ):
+                traceable = (
+                    TitleFactResolver
+                    ._brand_traceable(
+                        text,
+                        source_title,
+                    )
+                )
+            else:
+                traceable = (
+                    (not trace)
+                    or
+                    text.casefold()
+                    in
+                    source.casefold()
+                )
+
             marketing = any(x in text.casefold() for x in TitleFactResolver.MARKETING)
             noisy = False
 
@@ -206,13 +312,34 @@ class TitleFactResolver:
             else:
                 approved.append(row)
 
-        q = TitleFactResolver._quantity(cf.get("important_quantity"))
+        # Source-first quantity protection.
+        #
+        # Explicit source title quantity/unit is authoritative.  AI/Knowledge
+        # may abbreviate spelling but may never change semantic packaging unit
+        # (for example 5SET must not become 5pcs).
+        q = TitleFactResolver._quantity(source_title)
+
+        if not q:
+            q = TitleFactResolver._quantity(
+                cf.get("important_quantity")
+            )
+
         if not q:
             qs = se.get("quantities", [])
             if isinstance(qs, list) and qs:
                 q = TitleFactResolver._quantity(qs[0])
+
         if q:
-            add(q, "QUANTITY", 100, True, "quantity", False)
+            add(
+                q,
+                "QUANTITY",
+                100,
+                True,
+                "source_title_quantity"
+                if TitleFactResolver._quantity(source_title)
+                else "quantity",
+                False,
+            )
 
         identity = locked.get("identity", {})
         if isinstance(identity, dict):
@@ -273,15 +400,21 @@ class TitleFactResolver:
                     )
                 )
 
-            for x in models.get("secondary", []) or []:
+            for secondary_index, x in enumerate(
+                models.get("secondary", []) or []
+            ):
 
                 if likely_leading_year(x):
                     continue
 
+                # Preserve upstream model priority/order.  Earlier secondary
+                # identifiers receive a tiny deterministic advantage so a
+                # shorter later code cannot displace a more important earlier
+                # model merely because it consumes fewer characters.
                 add(
                     x,
                     "MODEL",
-                    78,
+                    max(74, 80 - secondary_index),
                     False,
                     "locked.models.secondary",
                 )
