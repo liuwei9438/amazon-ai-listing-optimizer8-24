@@ -9,7 +9,7 @@ class TitleBudgetComposer:
     Uses only full_text or AI-supplied complete short_text.
     """
 
-    VERSION = "stable-v1.4-global-factual-completion"
+    VERSION = "stable-v1.5-high-value-budget-promotion"
     MIN_TARGET = 61
     MAX_LENGTH = 75
 
@@ -521,6 +521,314 @@ class TitleBudgetComposer:
 
 
     @staticmethod
+    def _promote_high_value_facts(
+        used: list[dict],
+        rejected: list[dict],
+    ) -> tuple[list[dict], list[dict]]:
+        """
+        Conservative post-selection promotion.
+
+        A rejected high-value identifier may replace strictly lower-priority
+        optional content if that is the only reason it cannot fit.
+
+        Allowed promoted types:
+        - MODEL
+        - PART_NUMBER
+        - COMPATIBILITY_MODEL
+        - optional COMPATIBILITY_BRAND
+
+        Never:
+        - remove a required fact
+        - replace an equal/higher-priority fact
+        - invent/crop an identifier
+        - exceed 75 chars
+        - push an already >=61 title below the target band
+        """
+        if not isinstance(used, list):
+            used = []
+
+        if not isinstance(rejected, list):
+            rejected = []
+
+        original_title = TitleBudgetComposer._render_selected(
+            used
+        )
+        preserve_min = (
+            len(original_title)
+            >=
+            TitleBudgetComposer.MIN_TARGET
+        )
+
+        promotable_types = {
+            "MODEL",
+            "PART_NUMBER",
+            "COMPATIBILITY_MODEL",
+            "COMPATIBILITY_BRAND",
+        }
+
+        candidate_rejected = [
+            fact
+            for fact in rejected
+            if (
+                isinstance(fact, dict)
+                and fact.get("reason") == "CHARACTER_BUDGET"
+                and TitleBudgetComposer._clean(
+                    fact.get("type")
+                ).upper()
+                in promotable_types
+            )
+        ]
+
+        candidate_rejected.sort(
+            key=lambda fact: (
+                int(
+                    fact.get(
+                        "selection_rank",
+                        99,
+                    )
+                ),
+                -float(
+                    fact.get(
+                        "value_score",
+                        0,
+                    )
+                ),
+                int(
+                    fact.get(
+                        "order_index",
+                        999,
+                    )
+                ),
+            )
+        )
+
+        current_used = list(used)
+        current_rejected = list(rejected)
+
+        for high in candidate_rejected:
+            high_rank = int(
+                high.get(
+                    "selection_rank",
+                    99,
+                )
+            )
+
+            high_text = (
+                TitleBudgetComposer._clean(
+                    high.get(
+                        "short_text",
+                        "",
+                    )
+                )
+                or
+                TitleBudgetComposer._clean(
+                    high.get(
+                        "full_text",
+                        "",
+                    )
+                )
+            )
+
+            if not high_text:
+                continue
+
+            parts = [
+                item.get(
+                    "selected_text",
+                    "",
+                )
+                for item in current_used
+            ]
+
+            if TitleBudgetComposer._already_used(
+                high,
+                high_text,
+                parts,
+            ):
+                continue
+
+            promoted_item = {
+                **high,
+                "selected_text": high_text,
+                "selected_source": (
+                    "short_text"
+                    if TitleBudgetComposer._clean(
+                        high.get(
+                            "short_text",
+                            "",
+                        )
+                    )
+                    else
+                    "full_text"
+                ),
+            }
+
+            direct = (
+                current_used
+                +
+                [promoted_item]
+            )
+
+            direct_title = (
+                TitleBudgetComposer
+                ._render_selected(
+                    direct
+                )
+            )
+
+            if (
+                len(direct_title)
+                <=
+                TitleBudgetComposer.MAX_LENGTH
+            ):
+                current_used = direct
+                current_rejected = [
+                    item
+                    for item in current_rejected
+                    if item.get("fact_id")
+                    != high.get("fact_id")
+                ]
+                continue
+
+            removable = [
+                item
+                for item in current_used
+                if (
+                    not item.get(
+                        "required"
+                    )
+                    and
+                    int(
+                        item.get(
+                            "selection_rank",
+                            99,
+                        )
+                    )
+                    >
+                    high_rank
+                )
+            ]
+
+            # Lowest-value / lowest-priority content is removed first.
+            removable.sort(
+                key=lambda item: (
+                    -int(
+                        item.get(
+                            "selection_rank",
+                            99,
+                        )
+                    ),
+                    float(
+                        item.get(
+                            "value_score",
+                            0,
+                        )
+                    ),
+                    -len(
+                        TitleBudgetComposer._clean(
+                            item.get(
+                                "selected_text",
+                                "",
+                            )
+                        )
+                    ),
+                )
+            )
+
+            trial_used = list(
+                current_used
+            )
+            removed = []
+
+            for low in removable:
+                trial_used = [
+                    item
+                    for item in trial_used
+                    if item.get(
+                        "fact_id"
+                    )
+                    !=
+                    low.get(
+                        "fact_id"
+                    )
+                ]
+                removed.append(
+                    low
+                )
+
+                trial_with_high = (
+                    trial_used
+                    +
+                    [promoted_item]
+                )
+
+                trial_title = (
+                    TitleBudgetComposer
+                    ._render_selected(
+                        trial_with_high
+                    )
+                )
+
+                if (
+                    len(trial_title)
+                    <=
+                    TitleBudgetComposer.MAX_LENGTH
+                    and
+                    (
+                        not preserve_min
+                        or
+                        len(trial_title)
+                        >=
+                        TitleBudgetComposer.MIN_TARGET
+                    )
+                ):
+                    current_used = (
+                        trial_with_high
+                    )
+
+                    removed_ids = {
+                        item.get(
+                            "fact_id"
+                        )
+                        for item in removed
+                    }
+
+                    current_rejected = [
+                        item
+                        for item in current_rejected
+                        if item.get(
+                            "fact_id"
+                        )
+                        !=
+                        high.get(
+                            "fact_id"
+                        )
+                    ]
+
+                    current_rejected.extend([
+                        {
+                            **item,
+                            "reason":
+                                "LOWER_VALUE_REPLACED_BY_HIGH_VALUE_FACT",
+                        }
+                        for item in removed
+                        if item.get(
+                            "fact_id"
+                        )
+                        not in {
+                            x.get("fact_id")
+                            for x in current_rejected
+                        }
+                    ])
+
+                    break
+
+        return (
+            current_used,
+            current_rejected,
+        )
+
+    @staticmethod
     def compose(plan: dict) -> dict:
         facts = plan.get(
             "facts",
@@ -734,6 +1042,17 @@ class TitleBudgetComposer:
                             "CHARACTER_BUDGET",
                     }
                 )
+
+        # High-value coverage pass:
+        # a model/part number may replace strictly lower-priority optional
+        # content, but never required or equal/higher-priority facts.
+        used, rejected = (
+            TitleBudgetComposer
+            ._promote_high_value_facts(
+                used,
+                rejected,
+            )
+        )
 
         title = (
             TitleBudgetComposer
