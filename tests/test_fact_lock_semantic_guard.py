@@ -47,3 +47,11 @@ def test_slash_joined_measurements_are_not_models():
 def test_true_slash_identifier_still_survives_measurement_guard():
     models = _extract_models("Sensor R3E-5/12 Replacement")
     assert "R3E-5/12" in models
+
+
+def test_engine_displacement_values_are_not_models():
+    text = "Chainsaw 4500 5200 5800 42cc 52cc 58cc Replacement Spare Part"
+    models = _extract_models(text)
+    assert "42cc" not in models
+    assert "52cc" not in models
+    assert "58cc" not in models
