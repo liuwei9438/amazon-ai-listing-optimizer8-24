@@ -57,6 +57,33 @@ from services.result_storage import (
 
 
 
+def _failure_debug_snapshot(profile):
+    """Return a compact JSON-safe snapshot for failed product diagnostics.
+
+    Failed products used to preserve only the final exception string.  That
+    made upstream classification failures indistinguishable from composer
+    failures after the child task directory was cleaned up.  Keep only the
+    title-pipeline evidence needed for root-cause analysis.
+    """
+    if not isinstance(profile, dict):
+        return {}
+
+    keys = (
+        "product_identity",
+        "identifiers",
+        "brand_info",
+        "compatibility",
+        "fact_lock",
+        "source_identity",
+        "identity_decision",
+        "normalized_knowledge",
+        "title_strategy_input",
+        "stable_title_pipeline",
+        "generated_title",
+    )
+    return {key: profile.get(key) for key in keys if key in profile}
+
+
 def process_batch(
     records,
     task_id,
@@ -237,6 +264,9 @@ def process_batch(
         )
 
 
+        profile = None
+        current_stage = "product_start"
+
         try:
 
 
@@ -262,6 +292,7 @@ def process_batch(
                     "total": total,
                 }
             )
+            current_stage = "understanding"
             profile = engine.analyze(
                 record
             )
@@ -287,6 +318,7 @@ def process_batch(
             start = time.time()
 
 
+            current_stage = "product_knowledge"
             product_knowledge = (
                 ProductKnowledgeBuilder.build(
                     profile
@@ -325,6 +357,7 @@ def process_batch(
 
             try:
 
+                current_stage = "identity_decision"
                 identity_decision = (
                     IdentityDecisionEngine.generate(
                         profile=profile,
@@ -398,6 +431,7 @@ def process_batch(
 
             try:
 
+                current_stage = "knowledge_normalization"
                 normalized_knowledge = (
                     KnowledgeNormalizer.normalize(
                         profile
@@ -719,6 +753,7 @@ def process_batch(
                     }
                 )
 
+                current_stage = "stable_title_pipeline"
                 stable_title_result = (
                     StableTitlePipeline.run(
                         profile=profile,
@@ -993,6 +1028,8 @@ def process_batch(
                     "title": getattr(record, "title", ""),
                     "error": str(exc),
                     "error_type": type(exc).__name__,
+                    "failed_stage": current_stage,
+                    "debug_profile": _failure_debug_snapshot(profile),
                 }
             )
 
