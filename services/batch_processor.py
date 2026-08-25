@@ -35,6 +35,9 @@ from core.knowledge_normalizer import (
     KnowledgeNormalizer,
     KnowledgeNormalizerError,
 )
+from core.cross_layer_fact_guard import (
+    CrossLayerFactGuard,
+)
 from core.title_planner import TitlePlanner
 
 from generator.highlight_generator import HighlightGenerator
@@ -445,6 +448,14 @@ def process_batch(
                 ):
 
                     normalized_knowledge = {}
+
+
+                normalized_knowledge = (
+                    CrossLayerFactGuard.reconcile(
+                        profile,
+                        normalized_knowledge,
+                    )
+                )
 
 
                 profile[
