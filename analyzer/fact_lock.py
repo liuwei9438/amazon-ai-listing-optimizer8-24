@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-# FACT_LOCK_VERSION = "v2.2-conservative-numeric-model-context"
+# FACT_LOCK_VERSION = "v2.3-slash-measurement-semantic-guard"
 
 
 def _clean(value: Any) -> str:
@@ -154,6 +154,24 @@ def _is_obvious_non_model(value: str) -> bool:
         low,
     ):
         return True
+
+    # Slash-joined measurement groups such as 600w/900w, 12V/24V,
+    # 1lb/20lb or 32oz/64oz are specifications, never model identifiers.
+    # Mixed code identifiers such as R3E-5/12 remain eligible because not
+    # every slash segment is a standalone measurable value.
+    if "/" in v:
+        measurement_segment = re.compile(
+            r"^\d+(?:\.\d+)?(?:mm|cm|m|in|inch|inches|ft|v|w|kw|mw|"
+            r"a|ma|hz|khz|mhz|ghz|mah|ah|wh|kwh|g|kg|mg|gr|lb|lbs|oz|"
+            r"ml|l|bar|psi|pa|kpa|mpa|rpm|sec|secs|second|seconds|°c|°f)$",
+            flags=re.IGNORECASE,
+        )
+        slash_segments = [seg.strip() for seg in v.split("/") if seg.strip()]
+        if (
+            len(slash_segments) >= 2
+            and all(measurement_segment.fullmatch(seg) for seg in slash_segments)
+        ):
+            return True
 
     # Slash-joined prose/configuration fragments are not stable identifiers.
     # True slash identifiers are typically compact code-like segments.
