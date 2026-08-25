@@ -19,8 +19,26 @@ from generator.title_budget_composer import (
     TitleBudgetComposer,
 )
 
+from generator.title_deterministic_repair import (
+    TitleDeterministicRepair,
+)
+
+from generator.title_post_repair_completion import (
+    TitlePostRepairCompletion,
+)
+
+from generator.title_quality_gate import (
+    TitleQualityGate,
+)
+
+
 from generator.title_final_validator import (
     TitleFinalValidator,
+)
+
+from analyzer.title_required_core_repair import (
+    TitleRequiredCoreRepair,
+    RequiredCoreRepairError,
 )
 
 
@@ -40,7 +58,7 @@ class StableTitlePipeline:
     No downstream stage may reinterpret source facts.
     """
 
-    VERSION = "stable-title-pipeline-v1.0"
+    VERSION = "stable-title-pipeline-v1.1-quality-closure"
 
     @staticmethod
     def _target_language(profile: dict) -> str:
@@ -161,11 +179,309 @@ class StableTitlePipeline:
             )
         )
 
-        # 5. Program owns final PASS/FAIL.
+        # Rare overflow repair. Normal successful rows never enter this path.
+        # If the immutable required core cannot fit, request ONE stricter
+        # identity-only compression using an exact identity character budget.
+        # The repaired expression must pass deterministic token/subset safety
+        # checks, then the ordinary planner/composer are rerun unchanged.
+        required_core_repair = {}
+
+        if (
+            use_ai_planner
+            and composed.get(
+                "status"
+            )
+            ==
+            "TITLE_BUDGET_CONFLICT"
+        ):
+            try:
+                required_core_repair = (
+                    TitleRequiredCoreRepair
+                    .generate(
+                        plan=plan,
+                        api_key=api_key,
+                        model=model,
+                        target_language=target_language,
+                        max_length=TitleBudgetComposer.MAX_LENGTH,
+                    )
+                )
+
+                repaired_fact_id = (
+                    required_core_repair
+                    .get(
+                        "fact_id",
+                        "",
+                    )
+                )
+
+                # Merge only the repaired short_text into the existing AI
+                # priority plan. Scores/order/reasons remain untouched.
+                repaired_ai_plan = {
+                    **ai_plan,
+                    "fact_priorities": [
+                        (
+                            {
+                                **item,
+                                "short_text": (
+                                    required_core_repair
+                                    .get(
+                                        "short_text",
+                                        "",
+                                    )
+                                ),
+                                "reason": (
+                                    item.get(
+                                        "reason",
+                                        "",
+                                    )
+                                    +
+                                    " | required-core overflow repair"
+                                ).strip(
+                                    " |"
+                                ),
+                            }
+                            if (
+                                isinstance(
+                                    item,
+                                    dict,
+                                )
+                                and
+                                item.get(
+                                    "fact_id"
+                                )
+                                ==
+                                repaired_fact_id
+                            )
+                            else
+                            item
+                        )
+                        for item
+                        in (
+                            ai_plan.get(
+                                "fact_priorities",
+                                [],
+                            )
+                            or
+                            []
+                        )
+                    ],
+                }
+
+                plan = (
+                    TitlePriorityPlanner
+                    .build(
+                        resolved_facts=resolved,
+                        ai_plan=repaired_ai_plan,
+                        target_language=target_language,
+                    )
+                )
+
+                composed = (
+                    TitleBudgetComposer
+                    .compose(
+                        plan
+                    )
+                )
+
+                ai_plan = repaired_ai_plan
+                ai_planner_status = (
+                    ai_planner_status
+                    +
+                    "+required_core_repair"
+                )
+
+            except RequiredCoreRepairError as exc:
+                required_core_repair = {
+                    "status": "failed",
+                    "error": str(exc),
+                }
+
+        # 5. Deterministic presentation cleanup.
+        #
+        # This stage may only delete exact duplication / known noise or merge
+        # repeated compatibility syntax. It never invents or reinterpret facts.
+        deterministic_repair = (
+            TitleDeterministicRepair
+            .repair(
+                composed.get(
+                    "title",
+                    "",
+                ),
+                target_language,
+            )
+        )
+
+        # 6. Refill factual budget freed by cleanup.
+        #
+        # Only already-approved plan facts may be added back.  Every candidate
+        # is checked by the Quality Gate before acceptance.
+        post_repair_completion = (
+            TitlePostRepairCompletion
+            .complete(
+                title=deterministic_repair.get(
+                    "title",
+                    "",
+                ),
+                plan=plan,
+                composed=composed,
+                target_language=target_language,
+            )
+        )
+
+        final_title = (
+            post_repair_completion
+            .get(
+                "title",
+                deterministic_repair.get(
+                    "title",
+                    "",
+                ),
+            )
+        )
+
+        final_used_facts = list(
+            composed.get(
+                "used_facts",
+                [],
+            )
+            or
+            []
+        )
+
+        plan_facts_by_id = {
+            item.get(
+                "fact_id"
+            ):
+            item
+            for item
+            in (
+                plan.get(
+                    "facts",
+                    [],
+                )
+                or
+                []
+            )
+            if isinstance(
+                item,
+                dict,
+            )
+        }
+
+        for added in (
+            post_repair_completion
+            .get(
+                "added_facts",
+                [],
+            )
+            or
+            []
+        ):
+            if not isinstance(
+                added,
+                dict,
+            ):
+                continue
+
+            fact_id = added.get(
+                "fact_id"
+            )
+
+            base_fact = (
+                plan_facts_by_id
+                .get(
+                    fact_id
+                )
+            )
+
+            if not isinstance(
+                base_fact,
+                dict,
+            ):
+                continue
+
+            final_used_facts.append({
+                **base_fact,
+                "selected_text":
+                    added.get(
+                        "selected_text",
+                        "",
+                    ),
+                "selected_source":
+                    added.get(
+                        "selected_source",
+                        "",
+                    ),
+            })
+
+        if (
+            post_repair_completion
+            .get(
+                "status"
+            )
+            ==
+            "SOURCE_FACTS_INSUFFICIENT"
+        ):
+            final_composition_status = (
+                "SOURCE_FACTS_INSUFFICIENT"
+            )
+
+        elif (
+            len(
+                final_title
+            )
+            >=
+            TitleBudgetComposer.MIN_TARGET
+        ):
+            final_composition_status = (
+                "READY"
+            )
+
+        else:
+            final_composition_status = (
+                composed.get(
+                    "status",
+                    "",
+                )
+            )
+
+        final_composed = {
+            **composed,
+            "title":
+                final_title,
+            "status":
+                final_composition_status,
+            "used_facts":
+                final_used_facts,
+            "character_count":
+                len(
+                    final_title
+                ),
+            "budget_remaining":
+                max(
+                    0,
+                    TitleBudgetComposer.MAX_LENGTH
+                    -
+                    len(
+                        final_title
+                    ),
+                ),
+        }
+
+        # 7. Presentation quality gate.
+        quality_validation = (
+            TitleQualityGate
+            .validate(
+                final_title,
+                target_language,
+            )
+        )
+
+        # 8. Program owns final factual PASS/FAIL.
         validation = (
             TitleFinalValidator
             .validate(
-                composed=composed,
+                composed=final_composed,
                 resolved=resolved,
                 target_language=target_language,
             )
@@ -173,24 +489,40 @@ class StableTitlePipeline:
 
         status = (
             "PASS"
-            if validation.get(
-                "status"
+            if (
+                validation.get(
+                    "status"
+                )
+                ==
+                "PASS"
+                and
+                quality_validation.get(
+                    "status"
+                )
+                ==
+                "PASS"
             )
-            ==
-            "PASS"
             else
-            composed.get(
+            final_composed.get(
                 "status",
                 "FAIL",
             )
         )
 
         if (
-            validation.get(
-                "status"
+            (
+                validation.get(
+                    "status"
+                )
+                !=
+                "PASS"
+                or
+                quality_validation.get(
+                    "status"
+                )
+                !=
+                "PASS"
             )
-            !=
-            "PASS"
             and
             status
             ==
@@ -235,7 +567,22 @@ class StableTitlePipeline:
                 plan,
 
             "composition":
+                final_composed,
+
+            "pre_repair_composition":
                 composed,
+
+            "deterministic_repair":
+                deterministic_repair,
+
+            "post_repair_completion":
+                post_repair_completion,
+
+            "quality_validation":
+                quality_validation,
+
+            "required_core_repair":
+                required_core_repair,
 
             "validation":
                 validation,
