@@ -36,3 +36,14 @@ def test_degree_value_is_not_model():
     assert "ER-010" in models
     assert "ER-120" in models
     assert "100" not in models
+
+
+def test_slash_joined_measurements_are_not_models():
+    assert _extract_models("Compatible With 600w/900w Blender Accessories") == []
+    assert _extract_models("Power Adapter 12V/24V Replacement") == []
+    assert _extract_models("Hose Adapter 1lb/20lb Converter") == []
+
+
+def test_true_slash_identifier_still_survives_measurement_guard():
+    models = _extract_models("Sensor R3E-5/12 Replacement")
+    assert "R3E-5/12" in models
