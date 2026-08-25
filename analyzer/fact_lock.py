@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-# FACT_LOCK_VERSION = "v2.3-slash-measurement-semantic-guard"
+# FACT_LOCK_VERSION = "v2.4-displacement-unit-guard"
 
 
 def _clean(value: Any) -> str:
@@ -86,7 +86,7 @@ def _is_obvious_non_model(value: str) -> bool:
     if re.fullmatch(
         r"\d+(?:\.\d+)?\s*"
         r"(?:v|w|kw|mw|a|ma|hz|khz|mhz|ghz|mah|ah|wh|kwh|"
-        r"g|kg|mg|lb|lbs|oz|ml|l|bar|psi|pa|kpa|mpa|rpm|°c|°f)",
+        r"g|kg|mg|lb|lbs|oz|ml|l|cc|bar|psi|pa|kpa|mpa|rpm|°c|°f)",
         low,
     ):
         return True
@@ -129,7 +129,7 @@ def _is_obvious_non_model(value: str) -> bool:
     if re.fullmatch(
         r"(?:to)?\d+(?:\.\d+)?(?:-\d+(?:\.\d+)?)?"
         r"(?:mm|cm|m|in|inch|inches|ft|v|w|kw|a|ma|hz|"
-        r"kg|g|gr|lb|lbs|oz|ml|l|rpm|sec|secs|second|seconds|"
+        r"kg|g|gr|lb|lbs|oz|ml|l|cc|rpm|sec|secs|second|seconds|"
         r"degc|degf|°c|°f)",
         low,
     ):
@@ -162,7 +162,7 @@ def _is_obvious_non_model(value: str) -> bool:
     if "/" in v:
         measurement_segment = re.compile(
             r"^\d+(?:\.\d+)?(?:mm|cm|m|in|inch|inches|ft|v|w|kw|mw|"
-            r"a|ma|hz|khz|mhz|ghz|mah|ah|wh|kwh|g|kg|mg|gr|lb|lbs|oz|"
+            r"a|ma|hz|khz|mhz|ghz|mah|ah|wh|kwh|g|kg|mg|gr|lb|lbs|oz|cc|"
             r"ml|l|bar|psi|pa|kpa|mpa|rpm|sec|secs|second|seconds|°c|°f)$",
             flags=re.IGNORECASE,
         )
