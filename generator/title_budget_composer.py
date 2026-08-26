@@ -2,6 +2,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from core.specification_dominance import SpecificationDominance
+
 
 class TitleBudgetComposer:
     """
@@ -9,7 +11,7 @@ class TitleBudgetComposer:
     Uses only full_text or AI-supplied complete short_text.
     """
 
-    VERSION = "stable-v1.5-high-value-budget-promotion"
+    VERSION = "stable-v1.8-relationship-and-spec-fallback"
     MIN_TARGET = 61
     MAX_LENGTH = 75
 
@@ -70,6 +72,17 @@ class TitleBudgetComposer:
         )
 
     @staticmethod
+    def _blocked_by_selected_dominant(fact: dict, used: list[dict]) -> bool:
+        parent_id = TitleBudgetComposer._clean(fact.get("dominated_by_fact_id", ""))
+        if not parent_id:
+            return False
+        return parent_id in {
+            TitleBudgetComposer._clean(item.get("fact_id", ""))
+            for item in used
+            if isinstance(item, dict)
+        }
+
+    @staticmethod
     def _variant(fact: dict, parts: list[str]) -> str:
         full = TitleBudgetComposer._clean(fact.get("full_text"))
         short = TitleBudgetComposer._clean(fact.get("short_text"))
@@ -99,61 +112,50 @@ class TitleBudgetComposer:
         return ""
 
     @staticmethod
-    def _render_selected(
-        selected: list[dict],
-    ) -> str:
-        """
-        Render order is independent from selection priority.
-        Multi-unit quantity is always prefixed by frozen rule.
-        """
+    def _render_selected(selected: list[dict]) -> str:
+        quantity=[x for x in selected if x.get("type")=="QUANTITY"]
+        rest=[x for x in selected if x.get("type")!="QUANTITY"]
+        rest.sort(key=lambda item:(int(item.get("order_index",99)),int(item.get("selection_rank",99))))
 
-        quantity = [
-            item
-            for item in selected
-            if item.get("type") == "QUANTITY"
-        ]
+        relationship_brands=[]
+        for item in rest:
+            if TitleBudgetComposer._clean(item.get("type")).upper() in {"MODEL","PART_NUMBER","COMPATIBILITY_MODEL"}:
+                rb=TitleBudgetComposer._clean(item.get("relationship_brand",""))
+                if rb and rb.casefold() not in {x.casefold() for x in relationship_brands}:
+                    relationship_brands.append(rb)
 
-        rest = [
-            item
-            for item in selected
-            if item.get("type") != "QUANTITY"
-        ]
+        if len(relationship_brands)<2:
+            return TitleBudgetComposer._join([x.get("selected_text","") for x in quantity+rest])
 
-        rest.sort(
-            key=lambda item: (
-                int(
-                    item.get(
-                        "order_index",
-                        99,
-                    )
-                ),
-                int(
-                    item.get(
-                        "selection_rank",
-                        99,
-                    )
-                ),
-                -float(
-                    item.get(
-                        "value_score",
-                        0,
-                    )
-                ),
-            )
-        )
-
-        ordered = quantity + rest
-
-        return TitleBudgetComposer._join(
-            [
-                item.get(
-                    "selected_text",
-                    "",
-                )
-                for item in ordered
-            ]
-        )
-
+        compatibility_items=[x for x in rest if TitleBudgetComposer._clean(x.get("type")).upper()=="COMPATIBILITY_BRAND"]
+        first_brand=TitleBudgetComposer._clean(compatibility_items[0].get("text","")) if compatibility_items else ""
+        related={TitleBudgetComposer._clean(x.get("relationship_brand","")).casefold() for x in rest if TitleBudgetComposer._clean(x.get("relationship_brand",""))}
+        rendered=[]; rendered_rel=set()
+        for item in quantity+rest:
+            typ=TitleBudgetComposer._clean(item.get("type","")).upper()
+            selected_text=TitleBudgetComposer._clean(item.get("selected_text",""))
+            if not selected_text: continue
+            if typ=="COMPATIBILITY_BRAND":
+                brand=TitleBudgetComposer._clean(item.get("text",""))
+                if first_brand and brand.casefold()!=first_brand.casefold() and brand.casefold() in related:
+                    continue
+                rendered.append(selected_text); continue
+            if typ in {"MODEL","PART_NUMBER","COMPATIBILITY_MODEL"}:
+                rb=TitleBudgetComposer._clean(item.get("relationship_brand",""))
+                if rb:
+                    key=rb.casefold()
+                    if first_brand and key==first_brand.casefold():
+                        rendered.append(selected_text); rendered_rel.add(key); continue
+                    if key not in rendered_rel:
+                        rendered.append(", "+rb+" "+selected_text); rendered_rel.add(key)
+                    else:
+                        rendered.append(selected_text)
+                    continue
+            rendered.append(selected_text)
+        title=" ".join(rendered)
+        title=re.sub(r"\s+,",",",title)
+        title=re.sub(r",\s+",", ",title)
+        return TitleBudgetComposer._clean(title)
 
     @staticmethod
     def _required_core_solution(
@@ -841,6 +843,10 @@ class TitleBudgetComposer:
         ):
             facts = []
 
+        facts, specification_dominance_audit = (
+            SpecificationDominance.filter_dominated_facts(facts)
+        )
+
         required = [
             fact
             for fact in facts
@@ -925,6 +931,13 @@ class TitleBudgetComposer:
         )
 
         for fact in optional:
+
+            if TitleBudgetComposer._blocked_by_selected_dominant(fact, used):
+                rejected.append({
+                    **fact,
+                    "reason": "DOMINATED_SPECIFICATION_ALREADY_USED",
+                })
+                continue
 
             short_text = (
                 TitleBudgetComposer
