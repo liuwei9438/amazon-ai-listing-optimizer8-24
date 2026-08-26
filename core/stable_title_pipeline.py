@@ -31,6 +31,10 @@ from generator.title_quality_gate import (
     TitleQualityGate,
 )
 
+from generator.title_fact_traceability_gate import (
+    TitleFactTraceabilityGate,
+)
+
 
 from generator.title_final_validator import (
     TitleFinalValidator,
@@ -58,7 +62,7 @@ class StableTitlePipeline:
     No downstream stage may reinterpret source facts.
     """
 
-    VERSION = "stable-title-pipeline-v1.1-quality-closure"
+    VERSION = "stable-title-pipeline-v1.2-traceability-closure"
 
     @staticmethod
     def _target_language(profile: dict) -> str:
@@ -477,7 +481,16 @@ class StableTitlePipeline:
             )
         )
 
-        # 8. Program owns final factual PASS/FAIL.
+        # 8. Final critical-fact provenance gate.
+        fact_traceability = (
+            TitleFactTraceabilityGate
+            .validate(
+                profile=profile,
+                composed=final_composed,
+            )
+        )
+
+        # 9. Program owns final factual PASS/FAIL.
         validation = (
             TitleFinalValidator
             .validate(
@@ -501,6 +514,12 @@ class StableTitlePipeline:
                 )
                 ==
                 "PASS"
+                and
+                fact_traceability.get(
+                    "status"
+                )
+                ==
+                "PASS"
             )
             else
             final_composed.get(
@@ -518,6 +537,12 @@ class StableTitlePipeline:
                 "PASS"
                 or
                 quality_validation.get(
+                    "status"
+                )
+                !=
+                "PASS"
+                or
+                fact_traceability.get(
                     "status"
                 )
                 !=
@@ -580,6 +605,9 @@ class StableTitlePipeline:
 
             "quality_validation":
                 quality_validation,
+
+            "fact_traceability":
+                fact_traceability,
 
             "required_core_repair":
                 required_core_repair,
