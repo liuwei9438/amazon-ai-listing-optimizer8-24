@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import re
+
+from core.compatibility_relationship_map import CompatibilityRelationshipMap
+
 
 class StrategyInputBuilderError(Exception):
     pass
@@ -60,6 +64,20 @@ class StrategyInputBuilder:
             .strip()
             .split()
         )
+
+    @staticmethod
+    def _source_title_specifications(source_title: str) -> list[str]:
+        source_title = StrategyInputBuilder._text(source_title)
+        if not source_title: return []
+        unit=(r"mm|cm|m|in|inch|inches|v|kv|w|kw|a|ma|hz|khz|mhz|ghz|mah|ah|wh|kwh|bar|psi|pa|kpa|mpa|rpm|cc|ml|l|kg|g|lb|oz")
+        num=r"\d+(?:\.\d+)?"
+        patterns=(rf"\b{num}(?:\s*[xX×*]\s*{num}){{1,3}}\s*(?:{unit})\b",rf"\b{num}\s*(?:{unit})?\s*/\s*{num}\s*(?:{unit})\b")
+        out=[]
+        for pattern in patterns:
+            for m in re.finditer(pattern,source_title,re.I):
+                v=StrategyInputBuilder._text(m.group(0))
+                if v and v.casefold() not in {x.casefold() for x in out}:out.append(v)
+        return out
 
     @staticmethod
     def build(
@@ -414,6 +432,11 @@ class StrategyInputBuilder:
                     StrategyInputBuilder._text(
                         profile_brand_info.get("seller_brand", "")
                     ),
+
+                "relationship_map":
+                    CompatibilityRelationshipMap.build(
+                        profile
+                    ),
             },
 
             # -----------------------------------------
@@ -544,7 +567,22 @@ class StrategyInputBuilder:
                             "specifications",
                             [],
                         )
-                    ),
+                    )
+                    +
+                    [
+                        value
+                        for value
+                        in StrategyInputBuilder._source_title_specifications(
+                            source_snapshot.get("title", "")
+                        )
+                        if value.casefold()
+                        not in {
+                            existing.casefold()
+                            for existing in StrategyInputBuilder._list(
+                                source_high_confidence.get("specifications", [])
+                            )
+                        }
+                    ],
 
                 "source_title_segments":
                     StrategyInputBuilder._list(
