@@ -3,7 +3,7 @@ import re
 from typing import Any
 from core.specification_dominance import SpecificationDominance
 class TitleFactTraceabilityGate:
-    VERSION="v1.0-final-source-ledger-traceability"
+    VERSION="v1.1-compound-brand-source-equivalence"
     CRITICAL_TYPES={"QUANTITY","COMPATIBILITY_BRAND","MODEL","PART_NUMBER","COMPATIBILITY_MODEL","SPECIFICATION"}
     @staticmethod
     def _clean(v:Any)->str:return re.sub(r"\s+"," ",str(v or "")).strip()
@@ -45,9 +45,17 @@ class TitleFactTraceabilityGate:
             return None
         if typ=="COMPATIBILITY_BRAND":
             f=text.casefold();c=TitleFactTraceabilityGate._compact(text)
+            brand_tokens=re.findall(r"[A-Za-zÀ-ÿ0-9]+",text)
+            compound_pattern=None
+            if len(brand_tokens)>=2:
+                sep=r"(?:\s+(?:for|and|&)\s+|\s+|[-_/,.]+\s*)"
+                compound_pattern=re.compile(r"\b"+sep.join(re.escape(t) for t in brand_tokens)+r"\b",re.I)
             for p in parts:
                 if f in p["text"].casefold():return {"source_path":p["source_path"],"source_text":text,"match_type":"exact_casefold"}
                 if c and len(c)>=3 and c in TitleFactTraceabilityGate._compact(p["text"]):return {"source_path":p["source_path"],"source_text":text,"match_type":"punctuation_normalized_brand"}
+                if compound_pattern:
+                    m=compound_pattern.search(p["text"])
+                    if m:return {"source_path":p["source_path"],"source_text":m.group(0),"match_type":"compound_brand_connector_equivalence"}
             return None
         if typ=="SPECIFICATION" and SpecificationDominance.normalize(text):
             unit=r"mm|cm|m|in|inch|inches|v|kv|w|kw|a|ma|hz|khz|mhz|ghz|mah|ah|wh|kwh|bar|psi|pa|kpa|mpa|rpm|cc|ml|l|kg|g|lb|oz";num=r"\d+(?:\.\d+)?"
