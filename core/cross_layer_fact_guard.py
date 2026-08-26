@@ -4,9 +4,12 @@ import re
 from copy import deepcopy
 from typing import Any
 
+from core.entity_role_resolver import EntityRoleResolver
+from core.source_compatibility_series_extractor import SourceCompatibilitySeriesExtractor
+
 
 class CrossLayerFactGuard:
-    VERSION = "v1.2-source-compatibility-rescue"
+    VERSION = "v1.4-source-series-recovery"
 
     _GENERIC_BRAND_TOKENS = {
         "for", "with", "use", "used", "compatible", "replacement",
@@ -235,10 +238,13 @@ class CrossLayerFactGuard:
             )
         )
 
-        return CrossLayerFactGuard._dedupe([
-            x for x in candidates
-            if CrossLayerFactGuard._supported(x, source_text)
-        ])
+        resolved = []
+        for candidate in CrossLayerFactGuard._dedupe(candidates):
+            if not CrossLayerFactGuard._supported(candidate, source_text):
+                continue
+            if EntityRoleResolver.brand_candidate_decision(candidate, profile).get("accepted"):
+                resolved.append(candidate)
+        return CrossLayerFactGuard._dedupe(resolved)
 
     @staticmethod
     def _explicit_for_brand_candidates(
@@ -428,7 +434,10 @@ class CrossLayerFactGuard:
         # Rescue-only semantics:
         # do not enrich healthy normalized output.  Only restore a field when
         # Normalization has emptied a core fact that already exists upstream.
-        brands = old_brands
+        brands = [
+            brand for brand in old_brands
+            if EntityRoleResolver.brand_candidate_decision(brand, profile).get("accepted")
+        ]
 
         if not brands:
             brands = CrossLayerFactGuard._upstream_brands(
@@ -438,6 +447,11 @@ class CrossLayerFactGuard:
 
         primary_candidates, secondary_candidates = (
             CrossLayerFactGuard._upstream_models(profile, source_text)
+        )
+
+        source_series_recovery = SourceCompatibilitySeriesExtractor.extract(profile)
+        secondary_candidates = CrossLayerFactGuard._dedupe(
+            secondary_candidates + source_series_recovery.get("recovered_models", [])
         )
 
         primary = old_primary
@@ -481,8 +495,11 @@ class CrossLayerFactGuard:
         phrase = CrossLayerFactGuard._clean(
             compat.get("phrase", "")
         )
-        if brands and not phrase:
-            phrase = "Compatible with " + ", ".join(brands)
+        if brands:
+            if not phrase or brands != old_brands:
+                phrase = "Compatible with " + ", ".join(brands)
+        elif old_brands and not brands:
+            phrase = ""
 
         normalized["compatibility"] = {
             **compat,
@@ -527,5 +544,6 @@ class CrossLayerFactGuard:
             "version": CrossLayerFactGuard.VERSION,
             "changed": bool(changes),
             "changes": changes,
+            "source_series_recovery": source_series_recovery,
         }
         return normalized
