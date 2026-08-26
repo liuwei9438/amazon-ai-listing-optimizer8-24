@@ -3,6 +3,9 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from core.specification_dominance import SpecificationDominance
+from core.semantic_containment import SemanticContainment
+
 
 class TitleDeterministicRepair:
     """
@@ -280,6 +283,51 @@ class TitleDeterministicRepair:
         return True
 
     @staticmethod
+    def _repair_specification_dominance(text: str) -> str:
+        text=TitleDeterministicRepair._clean(text)
+        if not text:return text
+        unit=(r"mm|cm|m|in|inch|inches|v|kv|w|kw|a|ma|hz|khz|mhz|ghz|mah|ah|wh|kwh|bar|psi|pa|kpa|mpa|rpm|cc|ml|l|kg|g|lb|oz")
+        num=r"\d+(?:\.\d+)?"
+        pat=re.compile(rf"\b(?:{num}(?:\s*[xX×*]\s*{num}){{1,3}}\s*(?:{unit})|{num}\s*(?:{unit})?\s*/\s*{num}\s*(?:{unit})|{num}\s*(?:{unit}))\b",re.I)
+        matches=list(pat.finditer(text)); remove=set()
+        for i,c in enumerate(matches):
+            for j,d in enumerate(matches):
+                if i==j:continue
+                if not SpecificationDominance.dominates(d.group(0),c.group(0)):continue
+                a=SpecificationDominance.normalize(d.group(0));b=SpecificationDominance.normalize(c.group(0))
+                if not a or not b:continue
+                if a.family==b.family and a.values==b.values and a.unit==b.unit:
+                    if j<i:remove.add((c.start(),c.end()));break
+                else:
+                    remove.add((c.start(),c.end()));break
+        if not remove:return text
+        chars=list(text)
+        for s,e in remove:
+            for k in range(s,e):chars[k]=" "
+        return TitleDeterministicRepair._clean("".join(chars))
+
+    @staticmethod
+    def _repair_provable_range_containment(text: str) -> str:
+        text=TitleDeterministicRepair._clean(text)
+        if not text:return text
+        scalar=re.compile(r"\b\d+(?:\.\d+)?\s*(?:V|kV|W|kW|A|mA|Hz|kHz|MHz|GHz|bar|psi|rpm)\b",re.I)
+        matches=list(scalar.finditer(text));remove=[]
+        range_pat=re.compile(r"(?:AC|DC)?\s*\d+(?:\.\d+)?\s*[-–—]\s*\d+(?:\.\d+)?\s*(?:V|kV|W|kW|A|mA|Hz|kHz|MHz|GHz|bar|psi|rpm)",re.I)
+        ranges=[m.group(0) for m in range_pat.finditer(text)]
+        for m in matches:
+            cand=m.group(0)
+            # if scalar is physically inside a range occurrence, keep it
+            if any(m.start()>=rm.start() and m.end()<=rm.end() for rm in range_pat.finditer(text)):
+                continue
+            if any(SemanticContainment.dominates(r,cand) for r in ranges):
+                remove.append((m.start(),m.end()))
+        if not remove:return text
+        chars=list(text)
+        for s,e in remove:
+            for k in range(s,e):chars[k]=" "
+        return TitleDeterministicRepair._clean("".join(chars))
+
+    @staticmethod
     def repair(title: str, target_language: str = "English") -> dict:
         original = TitleDeterministicRepair._clean(title)
         text = original
@@ -296,6 +344,16 @@ class TitleDeterministicRepair:
             if updated != text:
                 changes.append("remove_known_noise")
                 text = updated
+
+        updated = TitleDeterministicRepair._repair_specification_dominance(text)
+        if updated != text:
+            changes.append("remove_dominated_or_equivalent_specification")
+            text = updated
+
+        updated = TitleDeterministicRepair._repair_provable_range_containment(text)
+        if updated != text:
+            changes.append("remove_provably_contained_range_endpoint")
+            text = updated
 
         updated = TitleDeterministicRepair._repair_compatibility_qualifier(
             text,
