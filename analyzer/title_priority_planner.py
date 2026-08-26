@@ -6,7 +6,7 @@ import re
 class TitlePriorityPlanner:
     """Stable Title Pipeline V1.0: rank approved facts; never compose title."""
 
-    VERSION = "stable-v1.3-priority-planner-short-text-safety"
+    VERSION = "stable-v1.5-representative-model-metadata-only"
     TYPE_ORDER = {
         "QUANTITY": 0, "IDENTITY": 1, "COMPATIBILITY_BRAND": 2,
         "MODEL": 3, "PART_NUMBER": 3, "COMPATIBILITY_MODEL": 4,
