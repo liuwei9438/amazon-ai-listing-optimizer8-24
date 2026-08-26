@@ -75,3 +75,84 @@ def test_final_repair_removes_only_provable_redundancy():
     assert out=="Valve AC220-240V 50Hz"
     out2=TitleDeterministicRepair.repair("Garden Weeder Head for garden use","English")["title"]
     assert out2=="Garden Weeder Head for garden use"
+
+from core.source_compatibility_fact_protector import SourceCompatibilityFactProtector
+from core.cross_layer_fact_guard import CrossLayerFactGuard
+
+
+def _profile_for_source_title(title, *, detected=None, compatibility_brands=None, models=None):
+    return {
+        "brand_info": {
+            "seller_brand": "",
+            "third_party_brands": [],
+            "detected_brands": detected or [],
+            "relationship": "unknown",
+        },
+        "compatibility": {
+            "brands": compatibility_brands or [],
+            "models": models or [],
+            "part_numbers": [],
+            "compatibility_notes": [],
+        },
+        "identifiers": {
+            "model_numbers": models or [],
+            "part_numbers": [],
+            "series_numbers": [],
+            "unknown_codes": [],
+        },
+        "fact_lock": {"compatible_models": models or [], "part_numbers": []},
+        "product_knowledge": {"relationship": {}},
+        "source_fact_ledger": {
+            "source_snapshot": {"title": title, "description": "", "bullets": []},
+            "raw_fields": {"标题": title},
+        },
+    }
+
+
+def test_source_compatibility_protection_recovers_nanxing_but_not_vcbl_b():
+    profile = _profile_for_source_title(
+        "For VCBL-B 125x75x29 TV Suction Cup for Nanxing CNC Machining Center Router Pod Vacuum Block 10.01.12.03166"
+    )
+    out = SourceCompatibilityFactProtector.extract(profile)
+    assert out["protected_brands"] == ["Nanxing"]
+
+
+def test_source_compatibility_protection_does_not_promote_cce016_to_brand():
+    profile = _profile_for_source_title(
+        "10PCS for CCE016 Wholesale Conveyor Track Chain Pads for Marnak Woodworking Edgebanding Machine Spare Parts",
+        models=["CCE016"],
+    )
+    out = SourceCompatibilityFactProtector.extract(profile)
+    assert "CCE016" not in out["protected_brands"]
+    assert "Marnak" in out["protected_brands"]
+
+
+def test_source_compatibility_protection_rejects_generic_for_clause():
+    profile = _profile_for_source_title(
+        "For Computer Board PC Board DC92-01119D DC92-01126D"
+    )
+    assert SourceCompatibilityFactProtector.extract(profile)["protected_brands"] == []
+
+
+def test_cross_layer_guard_restores_source_protected_brand_when_ai_missed_it():
+    profile = _profile_for_source_title(
+        "PSW044 65*12*28mm Press Wheel for Nanxing Woodworking Automatic Edge Banding Machine 10Pieces",
+        models=["PSW044"],
+    )
+    normalized = {
+        "identity": {"text": "Press Wheel", "source": "synthesized", "confidence": 95},
+        "compatibility": {"phrase": "", "brands": []},
+        "models": {"all": [], "primary": "PSW044", "secondary": []},
+    }
+    out = CrossLayerFactGuard.reconcile(profile, normalized)
+    assert out["compatibility"]["brands"] == ["Nanxing"]
+    assert out["compatibility"]["phrase"] == "Compatible with Nanxing"
+
+
+def test_existing_detected_brand_with_explicit_for_is_preserved():
+    profile = _profile_for_source_title(
+        "For Teverun Fighter 11 Main Cable",
+        detected=["Teverun"],
+    )
+    out = SourceCompatibilityFactProtector.extract(profile)
+    assert out["protected_brands"] == ["Teverun"]
