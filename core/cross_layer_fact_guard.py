@@ -6,10 +6,11 @@ from typing import Any
 
 from core.entity_role_resolver import EntityRoleResolver
 from core.source_compatibility_series_extractor import SourceCompatibilitySeriesExtractor
+from core.source_compatibility_fact_protector import SourceCompatibilityFactProtector
 
 
 class CrossLayerFactGuard:
-    VERSION = "v1.4-source-series-recovery"
+    VERSION = "v1.5-source-compatibility-fact-protection"
 
     _GENERIC_BRAND_TOKENS = {
         "for", "with", "use", "used", "compatible", "replacement",
@@ -431,9 +432,12 @@ class CrossLayerFactGuard:
             models.get("all", [])
         )
 
-        # Rescue-only semantics:
-        # do not enrich healthy normalized output.  Only restore a field when
-        # Normalization has emptied a core fact that already exists upstream.
+        # Source compatibility facts are protected before AI-derived brand
+        # arbitration. Explicit source grammar may restore a brand that AI
+        # Understanding/Normalization silently dropped, but identifier-shaped
+        # tokens are never promoted to brands.
+        source_compatibility_protection = SourceCompatibilityFactProtector.extract(profile)
+
         brands = [
             brand for brand in old_brands
             if EntityRoleResolver.brand_candidate_decision(brand, profile).get("accepted")
@@ -444,6 +448,15 @@ class CrossLayerFactGuard:
                 profile,
                 source_text,
             )
+
+        # Fact-conservation invariant: a high-confidence source-protected brand
+        # cannot disappear merely because upstream AI brand fields are empty.
+        for protected_brand in source_compatibility_protection.get("protected_brands", []):
+            if protected_brand.casefold() not in {brand.casefold() for brand in brands}:
+                decision = EntityRoleResolver.brand_candidate_decision(protected_brand, profile)
+                if decision.get("accepted"):
+                    brands.append(protected_brand)
+        brands = CrossLayerFactGuard._dedupe(brands)
 
         primary_candidates, secondary_candidates = (
             CrossLayerFactGuard._upstream_models(profile, source_text)
@@ -545,5 +558,6 @@ class CrossLayerFactGuard:
             "changed": bool(changes),
             "changes": changes,
             "source_series_recovery": source_series_recovery,
+            "source_compatibility_protection": source_compatibility_protection,
         }
         return normalized
