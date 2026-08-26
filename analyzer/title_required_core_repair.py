@@ -18,7 +18,7 @@ class TitleRequiredCoreRepair:
     checks before it can be used by the normal priority planner/composer.
     """
 
-    VERSION = "stable-v1.0-required-core-overflow-repair"
+    VERSION = "stable-v1.1-deterministic-safe-fallback"
 
     @staticmethod
     def _clean(value: Any) -> str:
@@ -99,6 +99,35 @@ class TitleRequiredCoreRepair:
         # must be exact; no newly invented numeric token can appear because of
         # the subset rule above.
         return True
+
+    @staticmethod
+    def deterministic_short_identity(
+        full_text: str,
+        max_identity_chars: int,
+    ) -> str:
+        full = TitleRequiredCoreRepair._clean(full_text)
+        if not full or int(max_identity_chars) <= 0:
+            return ""
+        raw_tokens = re.findall(
+            r"[A-Za-zÀ-ÿ0-9]+(?:[-/][A-Za-zÀ-ÿ0-9]+)*",
+            full,
+        )
+        if len(raw_tokens) < 2:
+            return ""
+        full_unique = {token.casefold() for token in raw_tokens}
+        for start in range(len(raw_tokens)):
+            candidate = " ".join(raw_tokens[start:])
+            if len(candidate) > int(max_identity_chars):
+                continue
+            candidate_unique = {token.casefold() for token in raw_tokens[start:]}
+            retention = len(candidate_unique) / max(1, len(full_unique))
+            if retention < 0.55:
+                continue
+            if TitleRequiredCoreRepair.validate_short_identity(
+                full, candidate, max_identity_chars,
+            ):
+                return candidate
+        return ""
 
     @staticmethod
     def generate(
@@ -182,7 +211,15 @@ Return JSON only:
             short,
             budget,
         ):
-            raise RequiredCoreRepairError("AI short identity failed deterministic safety validation")
+            deterministic = TitleRequiredCoreRepair.deterministic_short_identity(
+                full_identity, budget,
+            )
+            if not deterministic:
+                raise RequiredCoreRepairError("AI short identity failed deterministic safety validation")
+            short = deterministic
+            fallback_reason = "deterministic contiguous-suffix safety fallback"
+        else:
+            fallback_reason = ""
 
         return {
             "version": TitleRequiredCoreRepair.VERSION,
@@ -190,7 +227,10 @@ Return JSON only:
             "full_text": full_identity,
             "short_text": short,
             "max_identity_chars": budget,
-            "reason": TitleRequiredCoreRepair._clean(
-                result.get("reason", "") if isinstance(result, dict) else ""
+            "reason": (
+                fallback_reason
+                or TitleRequiredCoreRepair._clean(
+                    result.get("reason", "") if isinstance(result, dict) else ""
+                )
             ),
         }
