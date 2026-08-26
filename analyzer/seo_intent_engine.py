@@ -3,43 +3,42 @@ from __future__ import annotations
 from typing import Any
 import re
 
-CATEGORY_MAP = {
-    "washing machine part": "washing machine",
-    "printer part": "printer",
-    "shaver part": "electric shaver",
+
+BLOCKED = {
+    "best", "premium", "original", "genuine", "official", "authentic",
+    "cheap", "sale", "discount", "oem", "#1",
 }
 
-REMOVE_WORDS = {
-    "compatible", "replacement", "replace", "for",
-    "function", "power", "drive", "part"
-}
 
-def _words(text: str) -> list[str]:
-    return re.findall(r"[a-z0-9]+", str(text).lower())
+def _clean(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value or "")).strip(" ,;:")
 
-def _category(product_type: str) -> str:
-    value = str(product_type).lower()
-    for key, result in CATEGORY_MAP.items():
-        if key in value:
-            return result
-    return value.strip()
+
+def _safe(value: str) -> str:
+    text = _clean(value)
+    if any(word in text.casefold() for word in BLOCKED):
+        return ""
+    return text
+
 
 def generate_primary_search(profile: dict[str, Any]) -> dict[str, Any]:
-    basic = profile.get("basic_info", {})
-    category = _category(basic.get("product_type", ""))
-    function = basic.get("main_function", "")
+    """Choose a source-backed primary search phrase; do not synthesize fragments."""
+    profile = profile if isinstance(profile, dict) else {}
 
-    words = [w for w in _words(function) if w not in REMOVE_WORDS]
+    title_plan = profile.get("title_plan", {}) or {}
+    candidates = title_plan.get("search_terms", []) or []
+    if not isinstance(candidates, list):
+        candidates = []
 
-    if "start" in words and "button" in words:
-        keyword = "start button"
-    elif "print" in words and "head" in words:
-        keyword = "print head"
-    elif "head" in words:
-        keyword = "head"
-    else:
-        keyword = " ".join(words[:3])
+    for candidate in candidates:
+        text = _safe(candidate)
+        if text:
+            return {"primary_search": [text]}
 
-    result = " ".join(dict.fromkeys((category + " " + keyword).split()))
+    normalized = profile.get("normalized_knowledge", {}) or {}
+    identity = _clean((normalized.get("identity", {}) or {}).get("text", ""))
+    if not identity:
+        basic = profile.get("basic_info", {}) or {}
+        identity = _clean(basic.get("product_name") or basic.get("product_type"))
 
-    return {"primary_search": [result.strip()]}
+    return {"primary_search": [identity] if _safe(identity) else []}
