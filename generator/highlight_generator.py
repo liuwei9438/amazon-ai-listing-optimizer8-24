@@ -1,444 +1,177 @@
 from __future__ import annotations
 
 import re
+from typing import Any
 
 
 class HighlightGenerator:
-
     """
-    Amazon AI Listing Optimizer
+    Highlight Generator V3.1
 
-    Highlight Generator V3.0 Stable
-
-    数据来源:
-    Product Knowledge
-
-    职责:
-    - 提取商品核心亮点
-    - 不重新理解产品
-    - 不猜测产品属性
-    - 不根据关键词判断功能
+    Goal:
+    - product identity + a small number of highest-value confirmed features
+    - no re-understanding, no invented benefits, no title/model stuffing
+    - deterministic cleaning/deduplication
     """
 
-
+    VERSION = "v3.1-fact-focused-highlights"
+    MAX_HIGHLIGHTS = 6
+    MAX_SHORT_HIGHLIGHTS = 3
 
     BLOCKED_WORDS = [
-
-        "best",
-        "best seller",
-        "#1",
-
-        "premium",
-        "original",
-        "genuine",
-        "official",
-        "authentic",
-
-        "discount",
-        "promotion",
-
-        "perfect",
-        "amazing",
-
-        "top quality",
-        "high quality",
-
+        "best", "best seller", "#1", "premium", "original", "genuine",
+        "official", "authentic", "discount", "promotion", "perfect",
+        "amazing", "top quality", "high quality", "oem",
     ]
 
+    @staticmethod
+    def _clean(value: Any) -> str:
+        return re.sub(r"\s+", " ", str(value or "")).strip(" ,;:")
 
     @staticmethod
-    def generate(
-        profile: dict
-    ) -> dict:
-    
-    
-        knowledge = profile.get(
-            "product_knowledge",
-            {}
+    def _list(value: Any) -> list[str]:
+        if not isinstance(value, (list, tuple, set)):
+            return []
+        out, seen = [], set()
+        for item in value:
+            text = HighlightGenerator._clean(item)
+            key = text.casefold()
+            if text and key not in seen:
+                seen.add(key)
+                out.append(text)
+        return out
+
+    @staticmethod
+    def _normalized(value: str) -> str:
+        value = HighlightGenerator._clean(value).casefold()
+        value = value.replace("×", "x").replace("*", "x")
+        return re.sub(r"[^a-z0-9]+", " ", value).strip()
+
+    @staticmethod
+    def _blocked(value: str) -> bool:
+        lower = HighlightGenerator._clean(value).casefold()
+        return any(word in lower for word in HighlightGenerator.BLOCKED_WORDS)
+
+    @staticmethod
+    def _redundant(candidate: str, accepted: list[str]) -> bool:
+        c = HighlightGenerator._normalized(candidate)
+        if not c:
+            return True
+        for item in accepted:
+            a = HighlightGenerator._normalized(item)
+            if not a:
+                continue
+            if c == a:
+                return True
+            # Avoid repeating a short feature already contained by identity or
+            # another richer highlight. Require at least two words so numeric
+            # specs such as 240W are not swallowed accidentally.
+            c_words = c.split()
+            if len(c_words) >= 2 and c in a:
+                return True
+        return False
+
+    @staticmethod
+    def _identity(profile: dict) -> str:
+        normalized = profile.get("normalized_knowledge", {}) or {}
+        identity = normalized.get("identity", {}) or {}
+        text = HighlightGenerator._clean(identity.get("text", ""))
+        if text:
+            return text
+
+        knowledge = profile.get("product_knowledge", {}) or {}
+        identity = knowledge.get("identity", {}) or {}
+        return HighlightGenerator._clean(
+            identity.get("product_name")
+            or identity.get("object_name")
+            or identity.get("product_type")
+            or ""
         )
-    
-    
-        if not isinstance(
-            knowledge,
-            dict
+
+    @staticmethod
+    def _feature_pool(profile: dict) -> list[str]:
+        knowledge = profile.get("product_knowledge", {}) or {}
+        identity = knowledge.get("identity", {}) or {}
+        classification = knowledge.get("feature_classification", {}) or {}
+        strategy = knowledge.get("generation_strategy", {}) or {}
+
+        # Functional facts first, then materials/specs, then design. This keeps
+        # highlights concise and buyer-relevant without inventing benefits.
+        groups = [
+            identity.get("functional_features", []),
+            classification.get("functional_features", []),
+            classification.get("materials", []),
+            classification.get("specifications", []),
+            identity.get("design_features", []),
+        ]
+
+        pool = []
+        for group in groups:
+            pool.extend(HighlightGenerator._list(group))
+
+        if not pool:
+            pool.extend(HighlightGenerator._list(strategy.get("highlight_focus", [])))
+
+        return pool
+
+    @staticmethod
+    def _compatibility(profile: dict) -> str:
+        normalized = profile.get("normalized_knowledge", {}) or {}
+        compat = normalized.get("compatibility", {}) or {}
+        phrase = HighlightGenerator._clean(compat.get("phrase", ""))
+        if phrase:
+            return phrase
+
+        knowledge = profile.get("product_knowledge", {}) or {}
+        relation = knowledge.get("relationship", {}) or {}
+        brands = HighlightGenerator._list(relation.get("brands", []))
+        if brands:
+            return "Compatible with " + ", ".join(brands[:3])
+        return ""
+
+    @staticmethod
+    def generate(profile: dict) -> dict:
+        profile = profile if isinstance(profile, dict) else {}
+
+        highlights: list[dict] = []
+        accepted_texts: list[str] = []
+
+        identity = HighlightGenerator._identity(profile)
+        if identity and not HighlightGenerator._blocked(identity):
+            highlights.append({"type": "product", "text": identity})
+            accepted_texts.append(identity)
+
+        for feature in HighlightGenerator._feature_pool(profile):
+            text = HighlightGenerator._clean(feature)
+            if not text or HighlightGenerator._blocked(text):
+                continue
+            if HighlightGenerator._redundant(text, accepted_texts):
+                continue
+            highlights.append({"type": "feature", "text": text})
+            accepted_texts.append(text)
+            if len(highlights) >= HighlightGenerator.MAX_HIGHLIGHTS - 1:
+                break
+
+        compatibility = HighlightGenerator._compatibility(profile)
+        if (
+            compatibility
+            and not HighlightGenerator._blocked(compatibility)
+            and not HighlightGenerator._redundant(compatibility, accepted_texts)
+            and len(highlights) < HighlightGenerator.MAX_HIGHLIGHTS
         ):
-            knowledge = {}
-    
-    
-        identity = knowledge.get(
-            "identity",
-            {}
-        )
-    
-    
-        feature_classification = knowledge.get(
-            "feature_classification",
-            {}
-        )
-    
-    
-        highlights = []
-    
-    
-        # =================================================
-        # 1. Product Identity
-        # 产品主体
-        # =================================================
-    
-        if isinstance(
-            identity,
-            dict
-        ):
-    
-            product_name = (
-                identity.get(
-                    "product_name"
-                )
-                or
-                identity.get(
-                    "object_name"
-                )
-                or
-                ""
-            )
-    
-    
-            if product_name:
-    
-                highlights.append(
-                    {
-                        "type":
-                        "product",
-    
-                        "text":
-                        product_name,
-                    }
-                )
-    
-    
-    
-        # =================================================
-        # 2. Feature Collection
-        # 商品特点
-        # =================================================
-    
-        highlight_focus = []
-    
-    
-        # -----------------------------
-        # Identity Features
-        # -----------------------------
-    
-        if isinstance(
-            identity,
-            dict
-        ):
-    
-            highlight_focus.extend(
-                identity.get(
-                    "design_features",
-                    []
-                )
-            )
-    
-    
-            highlight_focus.extend(
-                identity.get(
-                    "functional_features",
-                    []
-                )
-            )
-    
-    
-    
-        # -----------------------------
-        # Fact Features
-        # -----------------------------
-    
-        if isinstance(
-            feature_classification,
-            dict
-        ):
-    
-            highlight_focus.extend(
-                feature_classification.get(
-                    "materials",
-                    []
-                )
-            )
-    
-    
-            highlight_focus.extend(
-                feature_classification.get(
-                    "specifications",
-                    []
-                )
-            )
-    
-    
-    
-        # -----------------------------
-        # Fallback old logic
-        # -----------------------------
-    
-        if not highlight_focus:
-    
-            strategy = knowledge.get(
-                "generation_strategy",
-                {}
-            )
-    
-    
-            if isinstance(
-                strategy,
-                dict
-            ):
-    
-                highlight_focus.extend(
-                    strategy.get(
-                        "highlight_focus",
-                        []
-                    )
-                )
-    
-    
-    
-        for feature in highlight_focus:
-    
-            text = HighlightGenerator.clean_text(
-                feature
-            )
-    
-    
-            if text:
-    
-                highlights.append(
-                    {
-                        "type":
-                        "feature",
-    
-                        "text":
-                        text,
-                    }
-                )
-    
-    
-    
-        # =================================================
-        # 3. Compatibility
-        # =================================================
-    
-        compatibility = knowledge.get(
-            "relationship",
-            {}
-        )
-    
-    
-        if isinstance(
-            compatibility,
-            dict
-        ):
-    
-            brands = compatibility.get(
-                "brands",
-                []
-            )
-    
-    
-            if brands:
-    
-                highlights.append(
-                    {
-                        "type":
-                        "compatibility",
-    
-                        "text":
-                        HighlightGenerator.build_compatibility(
-                            brands
-                        )
-                    }
-                )
-    
-    
-    
-        # =================================================
-        # 4. Clean
-        # =================================================
-    
-        highlights = (
-            HighlightGenerator.clean_highlights(
-                highlights
-            )
-        )
-    
-    
-        blocked = (
-            HighlightGenerator.check_blocked_words(
-                str(highlights)
-            )
-        )
-    
-    
+            highlights.append({"type": "compatibility", "text": compatibility})
+
+        blocked = HighlightGenerator.check_blocked_words(str(highlights))
+
         return {
-    
-            "highlights":
-                highlights,
-    
-    
-            "validation":
-            {
-                "compliance_ok":
-                    len(blocked) == 0
-            },
-    
-    
-            "blocked_words":
-                blocked,
-    
+            "version": HighlightGenerator.VERSION,
+            "highlights": highlights,
+            "short_highlights": highlights[: HighlightGenerator.MAX_SHORT_HIGHLIGHTS],
+            "validation": {"compliance_ok": len(blocked) == 0},
+            "blocked_words": blocked,
         }
 
-    # =========================
-    # 兼容表达
-    # =========================
-
     @staticmethod
-    def build_compatibility(
-        brands
-    ):
-
-
-        return (
-            "Compatible with "
-            +
-            ", ".join(
-                [
-                    str(x)
-                    for x in brands[:3]
-                ]
-            )
-            +
-            " Models"
-        )
-
-
-
-    # =========================
-    # 去重清理
-    # =========================
-
-    @staticmethod
-    def clean_highlights(
-        highlights
-    ):
-
-
-        result = []
-
-        seen = set()
-
-
-        for item in highlights:
-
-
-            text = HighlightGenerator.clean_text(
-                item.get(
-                    "text",
-                    ""
-                )
-            )
-
-
-            if not text:
-
-                continue
-
-
-
-            key = (
-                item.get(
-                    "type",
-                    ""
-                )
-                +
-                "_"
-                +
-                text.lower()
-            )
-
-
-            if key not in seen:
-
-                result.append(
-                    {
-                        "type":
-                        item.get(
-                            "type",
-                            ""
-                        ),
-
-                        "text":
-                        text,
-                    }
-                )
-
-
-                seen.add(
-                    key
-                )
-
-
-
-        return result
-
-
-
-    # =========================
-    # 文本清理
-    # =========================
-
-    @staticmethod
-    def clean_text(
-        text
-    ):
-
-
-        return re.sub(
-            r"\s+",
-            " ",
-            str(text)
-        ).strip()
-
-
-
-    # =========================
-    # 禁用词检查
-    # =========================
-
-    @staticmethod
-    def check_blocked_words(
-        text
-    ):
-
-
-        found = []
-
-
-        for word in HighlightGenerator.BLOCKED_WORDS:
-
-
-            if re.search(
-                r"\b"
-                +
-                re.escape(word)
-                +
-                r"\b",
-                text,
-                flags=re.I,
-            ):
-
-                found.append(
-                    word
-                )
-
-
-        return found
+    def check_blocked_words(text):
+        lower = HighlightGenerator._clean(text).casefold()
+        return [word for word in HighlightGenerator.BLOCKED_WORDS if word in lower]
