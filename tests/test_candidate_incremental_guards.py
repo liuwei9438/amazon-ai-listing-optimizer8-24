@@ -156,3 +156,24 @@ def test_existing_detected_brand_with_explicit_for_is_preserved():
     )
     out = SourceCompatibilityFactProtector.extract(profile)
     assert out["protected_brands"] == ["Teverun"]
+
+def test_compound_brand_traceability_with_compatibility_connector():
+    profile={"source_fact_ledger":{"source_snapshot":{"title":"1PC DR313 Drum Unit For KONICA for MINOLTA for Bizhub C258","bullets":[],"description":""},"raw_fields":{}}}
+    result=TitleFactTraceabilityGate.validate(profile,{"used_facts":[{"fact_id":"B","type":"COMPATIBILITY_BRAND","text":"KONICA MINOLTA"}]})
+    assert result["status"]=="PASS"
+    assert result["audited_facts"][0]["trace"]["match_type"]=="compound_brand_connector_equivalence"
+
+
+def test_required_core_deterministic_suffix_fallbacks_are_safe():
+    from analyzer.title_required_core_repair import TitleRequiredCoreRepair
+    cases=[
+        ("Cassette Bypass Pickup Separation Roller",34,"Bypass Pickup Separation Roller"),
+        ("Chainsaw Brake Clutch Side Cover and Front Handle Kit",39,"Clutch Side Cover and Front Handle Kit"),
+        ("Metal Balance Chassis Board Seesaw Spring Plate Drive Shaft Upgrade Kit",55,"Board Seesaw Spring Plate Drive Shaft Upgrade Kit"),
+        ("Electric Water Inlet Solenoid Valve for Washing Machine",38,"Solenoid Valve for Washing Machine"),
+        ("3D Printer Extruder Front Cover with Cooling Fan Assembly",43,"Front Cover with Cooling Fan Assembly"),
+    ]
+    for full,budget,expected in cases:
+        short=TitleRequiredCoreRepair.deterministic_short_identity(full,budget)
+        assert short==expected
+        assert TitleRequiredCoreRepair.validate_short_identity(full,short,budget)
