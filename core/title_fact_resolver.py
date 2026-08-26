@@ -2,11 +2,13 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from core.representative_model_selector import RepresentativeModelSelector
+
 
 class TitleFactResolver:
     """Stable Title Pipeline V1.0: source-backed fact resolver only."""
 
-    VERSION = "stable-v1.7-brand-equivalence-trace"
+    VERSION = "stable-v1.9-representative-model-ranking"
     STRICT_TYPES = {
         "MODEL", "PART_NUMBER", "COMPATIBILITY_MODEL",
         "COMPATIBILITY_BRAND", "SPECIFICATION",
@@ -200,6 +202,16 @@ class TitleFactResolver:
         locked = locked if isinstance(locked, dict) else {}
         compat = si.get("compatibility_facts", {})
         compat = compat if isinstance(compat, dict) else {}
+
+        relationship_map = compat.get("relationship_map", {})
+        relationship_map = relationship_map if isinstance(relationship_map, dict) else {}
+        model_to_brand = {}
+        for relationship_brand, relationship_models in (relationship_map.get("bindings", {}) or {}).items():
+            for relationship_model in relationship_models if isinstance(relationship_models, list) else []:
+                model_key = TitleFactResolver._clean(relationship_model).casefold()
+                if model_key:
+                    model_to_brand[model_key] = TitleFactResolver._clean(relationship_brand)
+
         cf = si.get("candidate_facts", {})
         cf = cf if isinstance(cf, dict) else {}
         se = si.get("source_evidence", {})
@@ -298,6 +310,11 @@ class TitleFactResolver:
                 "priority": int(priority), "required": bool(required),
                 "source_key": source_key, "source_traceable": bool(traceable),
             }
+
+            if typ in {"MODEL", "PART_NUMBER", "COMPATIBILITY_MODEL"}:
+                relationship_brand = model_to_brand.get(text.casefold(), "")
+                if relationship_brand:
+                    row["relationship_brand"] = relationship_brand
             seq += 1
 
             if not traceable:
@@ -600,6 +617,11 @@ class TitleFactResolver:
                     )
 
             approved = retained
+
+        approved = RepresentativeModelSelector.annotate(
+            approved,
+            source_title,
+        )
 
         return {
             "version": TitleFactResolver.VERSION,
