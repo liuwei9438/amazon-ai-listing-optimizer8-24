@@ -6,15 +6,16 @@ from typing import Any
 
 class HighlightGenerator:
     """
-    Highlight Generator V3.1
+    Highlight Generator V3.2
 
-    Goal:
-    - product identity + a small number of highest-value confirmed features
-    - no re-understanding, no invented benefits, no title/model stuffing
-    - deterministic cleaning/deduplication
+    Root-cause fixes:
+    - semantic fact dedupe (e.g. "30MM" vs "30MM size")
+    - suppress features already expressed by product identity
+    - rank concrete buyer-relevant facts above generic function fragments
+    - remain source-backed and deterministic; never invent benefits
     """
 
-    VERSION = "v3.1-fact-focused-highlights"
+    VERSION = "v3.2-semantic-dedupe-ranked-highlights"
     MAX_HIGHLIGHTS = 6
     MAX_SHORT_HIGHLIGHTS = 3
 
@@ -24,12 +25,27 @@ class HighlightGenerator:
         "amazing", "top quality", "high quality", "oem",
     ]
 
+    # Words that add little fact meaning when comparing equivalent facts.
+    SEMANTIC_NOISE = {
+        "size", "dimension", "dimensions", "material", "materials",
+        "color", "colour", "feature", "features", "function", "functions",
+        "type", "design", "shape",
+    }
+
+    # Low-value function fragments that should not displace concrete specs.
+    GENERIC_FUNCTION_WORDS = {
+        "cooling", "heating", "sealing", "sensing", "pressing", "cleaning",
+        "polishing", "cutting", "charging", "mounting", "supporting",
+    }
+
     @staticmethod
     def _clean(value: Any) -> str:
         return re.sub(r"\s+", " ", str(value or "")).strip(" ,;:")
 
     @staticmethod
     def _list(value: Any) -> list[str]:
+        if isinstance(value, str):
+            value = [value]
         if not isinstance(value, (list, tuple, set)):
             return []
         out, seen = [], set()
@@ -45,7 +61,18 @@ class HighlightGenerator:
     def _normalized(value: str) -> str:
         value = HighlightGenerator._clean(value).casefold()
         value = value.replace("×", "x").replace("*", "x")
-        return re.sub(r"[^a-z0-9]+", " ", value).strip()
+        value = re.sub(r"(?<=\d)\s+(?=[a-z]{1,5}\b)", "", value)
+        value = re.sub(r"[^a-z0-9]+", " ", value).strip()
+        return value
+
+    @staticmethod
+    def _semantic_tokens(value: str) -> list[str]:
+        tokens = HighlightGenerator._normalized(value).split()
+        return [t for t in tokens if t not in HighlightGenerator.SEMANTIC_NOISE]
+
+    @staticmethod
+    def _semantic_key(value: str) -> str:
+        return " ".join(HighlightGenerator._semantic_tokens(value))
 
     @staticmethod
     def _blocked(value: str) -> bool:
@@ -53,22 +80,65 @@ class HighlightGenerator:
         return any(word in lower for word in HighlightGenerator.BLOCKED_WORDS)
 
     @staticmethod
+    def _token_overlap(a: str, b: str) -> float:
+        aa = set(HighlightGenerator._semantic_tokens(a))
+        bb = set(HighlightGenerator._semantic_tokens(b))
+        if not aa or not bb:
+            return 0.0
+        return len(aa & bb) / min(len(aa), len(bb))
+
+    @staticmethod
+    def _numeric_atoms(value: str) -> set[str]:
+        text = HighlightGenerator._clean(value).casefold().replace("×", "x").replace("*", "x")
+        atoms: set[str] = set()
+
+        # Expand combined dimensions such as 65x12x28 mm into 65mm/12mm/28mm
+        # so a later partial spec like "outer diameter 65mm" can be recognized
+        # as already covered by the richer combined dimension.
+        for m in re.finditer(r"(\d+(?:\.\d+)?(?:x\d+(?:\.\d+)?)+)\s*(mm|cm|m|in|inch|kg|g|lb)?", text):
+            values = m.group(1).split("x")
+            unit = m.group(2) or ""
+            for number in values:
+                atoms.add(number + unit)
+
+        for number, unit in re.findall(r"(\d+(?:\.\d+)?)\s*(mm|cm|m|in|inch|oz|ml|l|v|w|kw|rpm|hz|kg|g|lb|mah|ah|ohm|k)\b", text):
+            atoms.add(number + unit)
+        return atoms
+
+    @staticmethod
     def _redundant(candidate: str, accepted: list[str]) -> bool:
-        c = HighlightGenerator._normalized(candidate)
+        c = HighlightGenerator._semantic_key(candidate)
         if not c:
             return True
+
+        c_atoms = HighlightGenerator._numeric_atoms(candidate)
+
         for item in accepted:
-            a = HighlightGenerator._normalized(item)
+            a = HighlightGenerator._semantic_key(item)
             if not a:
                 continue
             if c == a:
                 return True
-            # Avoid repeating a short feature already contained by identity or
-            # another richer highlight. Require at least two words so numeric
-            # specs such as 240W are not swallowed accidentally.
-            c_words = c.split()
-            if len(c_words) >= 2 and c in a:
+
+            # Equivalent fact with only a wrapper word added/removed:
+            # "30MM" vs "30MM size", "rubber" vs "rubber material".
+            if c in a or a in c:
+                c_tokens = c.split()
+                a_tokens = a.split()
+                if min(len(c_tokens), len(a_tokens)) <= 2:
+                    return True
+
+            # A partial numeric specification is redundant when an already
+            # accepted richer combined spec contains every numeric atom.
+            a_atoms = HighlightGenerator._numeric_atoms(item)
+            if c_atoms and a_atoms and c_atoms.issubset(a_atoms) and len(a_atoms) > len(c_atoms):
                 return True
+
+            # Suppress a short feature already expressed by identity, e.g.
+            # "cooling" under "Hot End Cooling Fan".
+            if len(c.split()) <= 2 and HighlightGenerator._token_overlap(candidate, item) >= 1.0:
+                return True
+
         return False
 
     @staticmethod
@@ -89,30 +159,77 @@ class HighlightGenerator:
         )
 
     @staticmethod
-    def _feature_pool(profile: dict) -> list[str]:
+    def _fact_score(text: str, fact_type: str, identity: str) -> float:
+        norm = HighlightGenerator._normalized(text)
+        tokens = HighlightGenerator._semantic_tokens(text)
+        score = {
+            "specification": 95.0,
+            "material": 82.0,
+            "functional": 78.0,
+            "design": 70.0,
+        }.get(fact_type, 60.0)
+
+        # Concrete numeric specifications are especially useful.
+        if re.search(r"\d", text):
+            score += 12.0
+        if re.search(r"\b(?:mm|cm|m|in|inch|oz|ml|l|v|w|kw|rpm|hz|kg|g|lb|mah|ah|ohm|k)\b", norm):
+            score += 6.0
+
+        # Penalize generic one-word function fragments and identity overlap.
+        if len(tokens) == 1 and tokens[0] in HighlightGenerator.GENERIC_FUNCTION_WORDS:
+            score -= 28.0
+        overlap = HighlightGenerator._token_overlap(text, identity)
+        if overlap >= 1.0 and len(tokens) <= 2:
+            score -= 35.0
+        elif overlap >= 0.75:
+            score -= 18.0
+
+        # Very long prose is less suitable as a compact highlight.
+        if len(text) > 70:
+            score -= 20.0
+        elif len(text) > 45:
+            score -= 8.0
+
+        return score
+
+    @staticmethod
+    def _feature_pool(profile: dict, identity: str) -> list[tuple[float, int, str]]:
         knowledge = profile.get("product_knowledge", {}) or {}
-        identity = knowledge.get("identity", {}) or {}
+        ident = knowledge.get("identity", {}) or {}
         classification = knowledge.get("feature_classification", {}) or {}
         strategy = knowledge.get("generation_strategy", {}) or {}
 
-        # Functional facts first, then materials/specs, then design. This keeps
-        # highlights concise and buyer-relevant without inventing benefits.
         groups = [
-            identity.get("functional_features", []),
-            classification.get("functional_features", []),
-            classification.get("materials", []),
-            classification.get("specifications", []),
-            identity.get("design_features", []),
+            ("specification", classification.get("specifications", [])),
+            ("material", classification.get("materials", [])),
+            ("functional", ident.get("functional_features", [])),
+            ("functional", classification.get("functional_features", [])),
+            ("design", ident.get("design_features", [])),
+            ("design", classification.get("design_features", [])),
         ]
 
-        pool = []
-        for group in groups:
-            pool.extend(HighlightGenerator._list(group))
+        candidates: list[tuple[float, int, str]] = []
+        source_order = 0
+        for fact_type, group in groups:
+            for text in HighlightGenerator._list(group):
+                candidates.append((
+                    HighlightGenerator._fact_score(text, fact_type, identity),
+                    source_order,
+                    text,
+                ))
+                source_order += 1
 
-        if not pool:
-            pool.extend(HighlightGenerator._list(strategy.get("highlight_focus", [])))
+        if not candidates:
+            for text in HighlightGenerator._list(strategy.get("highlight_focus", [])):
+                candidates.append((
+                    HighlightGenerator._fact_score(text, "functional", identity),
+                    source_order,
+                    text,
+                ))
+                source_order += 1
 
-        return pool
+        candidates.sort(key=lambda x: (-x[0], x[1]))
+        return candidates
 
     @staticmethod
     def _compatibility(profile: dict) -> str:
@@ -141,7 +258,7 @@ class HighlightGenerator:
             highlights.append({"type": "product", "text": identity})
             accepted_texts.append(identity)
 
-        for feature in HighlightGenerator._feature_pool(profile):
+        for _score, _order, feature in HighlightGenerator._feature_pool(profile, identity):
             text = HighlightGenerator._clean(feature)
             if not text or HighlightGenerator._blocked(text):
                 continue
