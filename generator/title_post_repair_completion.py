@@ -4,6 +4,7 @@ import re
 from typing import Any
 
 from generator.title_quality_gate import TitleQualityGate
+from core.specification_dominance import SpecificationDominance
 
 
 class TitlePostRepairCompletion:
@@ -18,7 +19,7 @@ class TitlePostRepairCompletion:
     would recreate a Quality Gate failure.
     """
 
-    VERSION = "v1.0-approved-fact-refill"
+    VERSION = "v1.1-specification-dominance-aware-refill"
     MIN_TARGET = 61
     MAX_LENGTH = 75
 
@@ -52,11 +53,22 @@ class TitlePostRepairCompletion:
             fact_type
         ).upper()
 
+        if fact_type == "SPECIFICATION":
+            title_tokens = re.findall(
+                r"[A-Za-z0-9]+(?:[._/+*×-][A-Za-z0-9]+)*",
+                title,
+            )
+            if expression.casefold() in {token.casefold() for token in title_tokens}:
+                return True
+            return any(
+                SpecificationDominance.dominates(token, expression)
+                for token in title_tokens
+            )
+
         if fact_type in {
             "MODEL",
             "PART_NUMBER",
             "COMPATIBILITY_MODEL",
-            "SPECIFICATION",
         }:
             title_tokens = {
                 token.casefold()
