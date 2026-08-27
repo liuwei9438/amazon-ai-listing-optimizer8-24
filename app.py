@@ -51,6 +51,8 @@ from analyzer.title_strategy_generator import (
     TitleStrategyGenerator,
 )
 
+from image.image_storage import cloudinary_ready
+
 VERSION = "V2.4.4-Performance-3-Title-Completion"
 
 
@@ -392,6 +394,32 @@ if uploaded is not None:
     )
 
 
+    enable_image = st.checkbox(
+        "优化首图（V1.3.2 稳定基线）",
+        False,
+        help="只优化第一张主图；其他图片保留。图片模块失败不会影响文字优化结果。",
+    )
+
+    try:
+        cloudinary_config = {
+            "cloud_name": str(st.secrets.get("CLOUDINARY_CLOUD_NAME", "")).strip(),
+            "api_key": str(st.secrets.get("CLOUDINARY_API_KEY", "")).strip(),
+            "api_secret": str(st.secrets.get("CLOUDINARY_API_SECRET", "")).strip(),
+        }
+    except Exception:
+        cloudinary_config = {
+            "cloud_name": "",
+            "api_key": "",
+            "api_secret": "",
+        }
+
+    if enable_image and not cloudinary_ready(cloudinary_config):
+        st.warning(
+            "已勾选首图优化，但正式 App 尚未配置 Cloudinary Secrets。"
+            "文字任务仍可运行，图片会记录为失败并保留原图。"
+        )
+
+
 
     # =================================================
     # 开始任务
@@ -504,6 +532,15 @@ if uploaded is not None:
 
             "seo":
                 enable_seo,
+
+            "image":
+                enable_image,
+
+            "image_column":
+                envelope.fields.images,
+
+            "cloudinary":
+                cloudinary_config,
 
             # Internal safe default for product-level concurrency.
             "max_workers":
@@ -741,6 +778,19 @@ if current_task:
 failed_items = load_failed_items(
     current_task
 ) if current_task else []
+
+image_results = [
+    p.get("image_result", {})
+    for p in profiles
+    if isinstance(p, dict) and isinstance(p.get("image_result"), dict)
+]
+if image_results:
+    image_success = sum(r.get("status") == "success" for r in image_results)
+    image_failed = sum(r.get("status") == "failed" for r in image_results)
+    image_skipped = sum(r.get("status") == "skipped" for r in image_results)
+    st.caption(
+        f"图片处理：成功 {image_success}｜失败 {image_failed}｜跳过 {image_skipped}"
+    )
 
 if DEBUG_MODE:
     st.caption(
