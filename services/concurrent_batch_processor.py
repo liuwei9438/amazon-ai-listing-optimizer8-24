@@ -16,6 +16,7 @@ from services.result_storage import (
 )
 from services.task_control import load_control, save_control
 from services.task_manager import get_task_dir, save_status
+from image.image_pipeline import optimize_record_images
 
 
 DEFAULT_MAX_WORKERS = 4
@@ -97,6 +98,14 @@ def _run_one_record(*, record, index, parent_task_id, api_key, model, options):
                 failed = failed_items[0] if failed_items else None
 
                 if profile is not None:
+                    if bool(options.get("image")):
+                        profile = dict(profile)
+                        profile["image_result"] = optimize_record_images(
+                            record,
+                            image_column=options.get("image_column"),
+                            cloudinary_config=options.get("cloudinary"),
+                        )
+
                     return {
                         "index": index,
                         "profile": profile,
