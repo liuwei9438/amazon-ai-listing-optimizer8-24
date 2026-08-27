@@ -10,3 +10,5 @@ python-dotenv
 streamlit-autorefresh
 
 requests>=2.31.0
+Pillow
+cloudinary
