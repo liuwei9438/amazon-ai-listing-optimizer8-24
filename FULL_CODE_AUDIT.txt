@@ -1,0 +1,28 @@
+Full-code audit repair
+
+Root cause found in uploaded eef5d1db-f73f-410c-a445-4f4efdceebec.zip:
+The services directory was incomplete. app.py imports modules that were not present in the uploaded repository.
+
+Missing files restored:
+- services/__init__.py
+- services/current_task.py
+- services/json_storage.py
+- services/listing_exporter.py
+- services/optimization_cache.py
+- services/result_storage.py
+- services/task_control.py
+- services/task_manager.py
+- services/task_worker.py
+
+Verified existing image integration files:
+- image/__init__.py
+- image/image_pipeline.py
+- image/image_storage.py
+- image/v132_image_pipeline.py
+
+Checks:
+- python -m compileall: PASS
+- static local-import scan: 0 unresolved local imports
+- requirements include Pillow and cloudinary
+
+This package is based on the exact uploaded current code and only restores the missing service modules from the matching V2.4.5 integration baseline.
