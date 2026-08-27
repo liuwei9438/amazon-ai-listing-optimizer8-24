@@ -833,15 +833,20 @@ class ListingExporter:
             )
 
 
-            # 没有任何生成内容，
-            # 不写入 Excel。
+            image_result = cls.get_dict(
+                profile.get("image_result")
+            )
+            has_image_result = (
+                image_result.get("status") == "success"
+                and bool(str(image_result.get("image_value", "")).strip())
+            )
 
-            if not cls.has_generated_content(
-                generated
+            # 没有任何文字生成内容、也没有成功图片结果时，不写入 Excel。
+            if (
+                not cls.has_generated_content(generated)
+                and not has_image_result
             ):
-
                 skipped_profiles += 1
-
                 continue
 
 
@@ -905,6 +910,16 @@ class ListingExporter:
                     column,
                     "",
                 )
+
+            # 图片是独立链路：只有图片模块明确成功时才覆盖原图片列。
+            # 失败/跳过时完全保留原始图片值。
+            if has_image_result:
+                image_column = str(image_result.get("column", "")).strip()
+                if image_column and image_column in result.columns:
+                    result.at[
+                        result.index[position],
+                        image_column,
+                    ] = str(image_result.get("image_value", "")).strip()
 
 
             written_positions.add(
