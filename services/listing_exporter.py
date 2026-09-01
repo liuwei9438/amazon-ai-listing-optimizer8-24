@@ -6,6 +6,8 @@ from typing import Any
 
 import pandas as pd
 
+from core.field_detector import BULLET_GROUPS, FIELD_ALIASES, find_named_column
+
 
 class ListingExporter:
     """
@@ -32,6 +34,20 @@ class ListingExporter:
         "AI Bullet Points",
         "AI Description",
     ]
+
+    # 短标题 / 商品亮点 列识别别名。
+    # 导出优先写入模板同名列；模板缺少时在末尾补列，保证结果不丢失。
+    # 注意：短标题别名不能包含 "highlights"/"item highlights"，
+    # 否则会与商品亮点列互相误匹配。
+    SHORT_TITLE_ALIASES = (
+        "短标题", "亮点短标题", "商品短标题", "产品短标题",
+        "short title", "short_title",
+    )
+
+    HIGHLIGHT_ALIASES = (
+        "商品亮点", "产品亮点", "亮点",
+        "highlights", "item highlights", "highlight",
+    )
 
     # =====================================================
     # 通用安全函数
@@ -729,15 +745,8 @@ class ListingExporter:
 
     @staticmethod
     def find_image_column(dataframe: pd.DataFrame):
-        aliases = {
-            "产品图片", "商品图片", "图片", "图片链接", "主图", "产品图",
-            "image", "images", "image url", "image urls",
-            "product image", "product images", "main image", "main images",
-        }
-        for column in dataframe.columns:
-            if str(column).strip().casefold() in {x.casefold() for x in aliases}:
-                return column
-        return None
+        # 复用 core.field_detector 的标准化匹配，兼容 "主图链接"、"产品图片链接" 等变体。
+        return find_named_column(dataframe.columns, FIELD_ALIASES["images"])
 
     @classmethod
     def apply_image_result(cls, result: pd.DataFrame, position: int, profile: dict):
@@ -754,34 +763,39 @@ class ListingExporter:
 
     @staticmethod
     def find_title_column(dataframe: pd.DataFrame):
-        aliases = {"标题(必填)", "标题", "title", "product title", "商品标题"}
-        for column in dataframe.columns:
-            if str(column).strip().casefold() in {x.casefold() for x in aliases}:
-                return column
-        return None
+        return find_named_column(dataframe.columns, FIELD_ALIASES["title"])
 
     @staticmethod
     def find_description_column(dataframe: pd.DataFrame):
-        aliases = {"简介", "描述", "产品描述", "description", "product description"}
-        for column in dataframe.columns:
-            if str(column).strip().casefold() in {x.casefold() for x in aliases}:
-                return column
-        return None
+        return find_named_column(dataframe.columns, FIELD_ALIASES["description"])
+
+    @classmethod
+    def find_short_title_column(cls, dataframe: pd.DataFrame):
+        return find_named_column(dataframe.columns, cls.SHORT_TITLE_ALIASES)
+
+    @classmethod
+    def find_highlight_column(cls, dataframe: pd.DataFrame):
+        return find_named_column(dataframe.columns, cls.HIGHLIGHT_ALIASES)
+
+    @classmethod
+    def ensure_export_column(cls, dataframe: pd.DataFrame, column, fallback: str) -> str:
+        """返回可写列名。模板缺少该字段列时在末尾补一列，避免 AI 结果丢失。"""
+        if column is not None:
+            return column
+        dataframe[fallback] = ""
+        return fallback
 
     @staticmethod
     def find_bullet_columns(dataframe: pd.DataFrame, max_bullets: int = 5) -> list:
         """Locate numbered bullet-point columns (要点1..要点N, Bullet Point 1..N, etc.),
         in order. Returns [] when the sheet has no such numbered set — callers should
         fall back to a single combined bullets/highlights column in that case."""
-        patterns = ["要点{}", "卖点{}", "Bullet Point {}", "Bullet {}", "Key Feature {}"]
         found = {}
-        columns_cf = {str(c).strip().casefold(): c for c in dataframe.columns}
         for i in range(1, max_bullets + 1):
-            for pattern in patterns:
-                key = pattern.format(i).casefold()
-                if key in columns_cf:
-                    found[i] = columns_cf[key]
-                    break
+            group = BULLET_GROUPS[i - 1] if i - 1 < len(BULLET_GROUPS) else ()
+            column = find_named_column(dataframe.columns, group)
+            if column is not None:
+                found[i] = column
         return [found[i] for i in sorted(found)]
 
     @classmethod
@@ -790,10 +804,17 @@ class ListingExporter:
         instead of joining them into one cell — needed to spread them across separate
         要点1..要点5-style columns in export_unified()."""
         if not isinstance(profile, dict):
-            return {"title": "", "description": "", "bullets": [], "highlights": []}
+            return {"title": "", "short_title": "", "description": "", "bullets": [], "highlights": []}
 
         generated_title = cls.get_dict(profile.get("generated_title"))
         title = generated_title.get("title", "")
+
+        short_title_result = cls.get_dict(profile.get("short_title_result"))
+        short_title = (
+            short_title_result.get("short_title", "")
+            or short_title_result.get("title", "")
+            or short_title_result.get("text", "")
+        )
 
         highlight_result = profile.get("highlight_result", {})
         highlights = []
@@ -835,6 +856,7 @@ class ListingExporter:
 
         return {
             "title": str(title or "").strip(),
+            "short_title": str(short_title or "").strip(),
             "description": cls.safe_value(description),
             "bullets": as_text_list(bullets),
             "highlights": as_text_list(highlights),
@@ -843,12 +865,14 @@ class ListingExporter:
     @classmethod
     def export_unified(cls, dataframe, profiles):
         """Write AI-optimized content directly into the SAME columns the source sheet
-        already uses (标题(必填)/要点1-5/简介/产品图 etc.) instead of appending separate
+        already uses (标题(必填)/短标题/要点1-5/简介/商品亮点/产品图 etc.) instead of appending separate
         'AI Title' / 'AI Bullet Points' columns next to the originals. One row per
         product, optimized content only — matches the format the AliExpress collector
         plugin's own export already uses, so this file can be used interchangeably.
         A field with no generated content for a given row keeps its original value
-        rather than being blanked out.
+        rather than being blanked out. When the sheet has no
+        短标题/商品亮点 column at all, one is appended at the end so those results
+        are not silently dropped.
         """
         if dataframe is None:
             raise ValueError("原始 Excel DataFrame 不存在")
@@ -864,6 +888,8 @@ class ListingExporter:
         title_column = cls.find_title_column(result)
         description_column = cls.find_description_column(result)
         bullet_columns = cls.find_bullet_columns(result)
+        short_title_column = cls.find_short_title_column(result)
+        highlight_column = cls.find_highlight_column(result)
 
         written_positions = set()
         successful_profiles = 0
@@ -883,7 +909,13 @@ class ListingExporter:
                 and image_result.get("status") == "success"
                 and bool(image_result.get("optimized_images"))
             )
-            has_text_output = bool(raw["title"] or raw["description"] or raw["bullets"] or raw["highlights"])
+            has_text_output = bool(
+                raw["title"]
+                or raw["short_title"]
+                or raw["description"]
+                or raw["bullets"]
+                or raw["highlights"]
+            )
 
             if not has_text_output and not has_image_output:
                 skipped_profiles += 1
@@ -908,6 +940,19 @@ class ListingExporter:
             if description_column is not None and raw["description"]:
                 result.at[idx, description_column] = raw["description"]
 
+            # 短标题 / 商品亮点：写入模板同名列；模板没有该列时补列，避免结果丢失。
+            if raw["short_title"]:
+                short_title_column = cls.ensure_export_column(
+                    result, short_title_column, "短标题",
+                )
+                result.at[idx, short_title_column] = raw["short_title"]
+
+            if raw["highlights"]:
+                highlight_column = cls.ensure_export_column(
+                    result, highlight_column, "商品亮点",
+                )
+                result.at[idx, highlight_column] = "\n".join(raw["highlights"])
+
             bullet_values = raw["bullets"] or raw["highlights"]
             if bullet_columns and bullet_values:
                 for i, column in enumerate(bullet_columns):
@@ -929,245 +974,4 @@ class ListingExporter:
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
             result.to_excel(writer, index=False, sheet_name="导入产品模板")
         output.seek(0)
-        return output
-
-
-
-        if dataframe is None:
-
-            raise ValueError(
-                "原始 Excel DataFrame 不存在"
-            )
-
-
-        if not isinstance(
-            dataframe,
-            pd.DataFrame,
-        ):
-
-            raise TypeError(
-                "dataframe 必须是 pandas DataFrame"
-            )
-
-
-        if profiles is None:
-
-            profiles = []
-
-
-        if not isinstance(
-            profiles,
-            list,
-        ):
-
-            raise TypeError(
-                "profiles 必须是 list"
-            )
-
-
-        # =================================================
-        # 1. 完整复制原 Excel 数据
-        # =================================================
-
-        result = (
-            cls.ensure_ai_columns(
-                dataframe
-            )
-        )
-
-
-        sku_column = (
-            cls.find_dataframe_sku_column(
-                result
-            )
-        )
-
-
-        # =================================================
-        # 2. 建立写入保护
-        #
-        # 一个 Excel 行只能被一个 Profile 写入。
-        # 防止重复 Profile 覆盖前面的正确结果。
-        # =================================================
-
-        written_positions = set()
-
-        successful_profiles = 0
-
-        skipped_profiles = 0
-
-        duplicate_profiles = 0
-
-        unmatched_profiles = []
-
-
-        # =================================================
-        # 3. 遍历 profiles
-        #
-        # 注意：
-        #
-        # 这里只遍历 AI 结果。
-        #
-        # 不创建新 DataFrame。
-        # 不 append 原始行。
-        # 不 concat。
-        # =================================================
-
-        for profile_index, profile in enumerate(
-            profiles
-        ):
-
-            if not isinstance(
-                profile,
-                dict,
-            ):
-
-                skipped_profiles += 1
-
-                continue
-
-
-            generated = cls.get_generated(
-                profile
-            )
-
-
-            # Allow image-only runs too. A successful image result is a valid
-            # generated output even when every text module is disabled.
-            image_result = profile.get("image_result", {})
-            has_image_output = (
-                isinstance(image_result, dict)
-                and image_result.get("status") == "success"
-                and bool(image_result.get("optimized_images"))
-            )
-
-            if not cls.has_generated_content(generated) and not has_image_output:
-                skipped_profiles += 1
-                continue
-
-
-            position = cls.locate_profile_row(
-                result,
-                profile,
-                sku_column,
-            )
-
-
-            # 找不到对应原行，
-            # 绝不猜测。
-
-            if position is None:
-
-                unmatched_profiles.append(
-                    {
-                        "profile_index":
-                            profile_index,
-
-                        "source_row_index":
-                            cls.get_source_row_index(
-                                profile
-                            ),
-
-                        "sku":
-                            cls.find_sku(
-                                profile
-                            ),
-                    }
-                )
-
-                continue
-
-
-            # 同一个 Excel 行如果已经写过，
-            # 后面的 Profile 不允许再次覆盖。
-
-            if position in written_positions:
-
-                duplicate_profiles += 1
-
-                continue
-
-
-            # =================================================
-            # 4. 只写 AI 字段
-            #
-            # 原始 SKU、标题、描述、价格、图片……
-            # 全部保持原样。
-            # =================================================
-
-            for column in cls.AI_COLUMNS:
-
-                result.at[
-                    result.index[
-                        position
-                    ],
-                    column,
-                ] = generated.get(
-                    column,
-                    "",
-                )
-
-            # Image integration is isolated from text export. Only a successful
-            # image_result may replace the original image column.
-            cls.apply_image_result(result, position, profile)
-
-            written_positions.add(
-                position
-            )
-
-            successful_profiles += 1
-
-
-        # =================================================
-        # 5. 没有任何结果时直接报错
-        # =================================================
-
-        if successful_profiles == 0:
-
-            raise ValueError(
-                "没有找到可正确匹配并导出的 AI 优化结果。"
-                "请检查 source_identity.source_row_index。"
-            )
-
-
-        # =================================================
-        # 6. 最终完整性检查
-        # =================================================
-
-        if len(
-            result
-        ) != len(
-            dataframe
-        ):
-
-            raise RuntimeError(
-                "导出过程中原始 Excel 行数发生变化，"
-                "已终止导出。"
-            )
-
-
-        # =================================================
-        # 7. 输出 Excel
-        # =================================================
-
-        output = BytesIO()
-
-
-        with pd.ExcelWriter(
-            output,
-            engine="openpyxl",
-        ) as writer:
-
-            result.to_excel(
-                writer,
-                index=False,
-                sheet_name="AI Optimized",
-            )
-
-
-        output.seek(
-            0
-        )
-
-
         return output
