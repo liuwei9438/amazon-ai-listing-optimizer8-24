@@ -47,6 +47,8 @@ from services.listing_exporter import (
     ListingExporter,
 )
 
+from image.image_storage import cloudinary_ready
+
 from analyzer.title_strategy_generator import (
     TitleStrategyGenerator,
 )
@@ -395,7 +397,9 @@ if uploaded is not None:
     enable_images = st.checkbox(
         "优化首图（V1.3.2 稳定基线）",
         False,
-        help="仅优化第一张主图；其他图片保留。图片失败不会影响文字优化结果。",
+        help="仅优化第一张主图；其他图片保留。图片失败不会影响文字优化结果。"
+        "需要配置 Cloudinary Secrets（CLOUDINARY_CLOUD_NAME / API_KEY / API_SECRET），"
+        "否则图片上传会失败。",
     )
 
 
@@ -520,6 +524,19 @@ if uploaded is not None:
                 4,
 
         }
+
+
+        # 首图优化依赖 Cloudinary 上传。缺配置时提前告知，
+        # 否则图片会全部静默失败，看起来像"没有起作用"。
+        if options.get("optimize_images") and not cloudinary_ready():
+
+            st.warning(
+                "已开启首图优化，但未配置 Cloudinary Secrets"
+                "（CLOUDINARY_CLOUD_NAME / CLOUDINARY_API_KEY / "
+                "CLOUDINARY_API_SECRET）。"
+                "所有图片上传都会失败，文字优化不受影响。"
+                "请先在环境变量或 Streamlit Secrets 中配置。"
+            )
 
 
 
@@ -980,6 +997,87 @@ if profiles:
             display_generated_content(
                 profile
             )
+
+
+    # =================================================
+    # 图片优化状态
+    #
+    # 图片失败以前完全静默：不写入导出、页面无提示。
+    # 这里把每个产品的图片处理结果显示出来。
+    # =================================================
+
+    image_results = [
+        (index, profile.get("image_result"))
+        for index, profile in enumerate(
+            profiles,
+            1,
+        )
+        if isinstance(
+            profile,
+            dict,
+        )
+        and isinstance(
+            profile.get("image_result"),
+            dict,
+        )
+    ]
+
+    if image_results:
+
+        failed_images = [
+            (index, result)
+            for index, result in image_results
+            if result.get("status") != "success"
+        ]
+
+        with st.expander(
+            f"图片优化状态（成功 "
+            f"{len(image_results) - len(failed_images)} / "
+            f"失败 {len(failed_images)}）",
+            expanded=bool(failed_images),
+        ):
+
+            for index, result in image_results:
+
+                status = result.get(
+                    "status",
+                    "",
+                )
+
+                sku = result.get(
+                    "sku",
+                    "",
+                )
+
+                if status == "success":
+
+                    st.markdown(
+                        f"✅ 产品 {index}｜{sku or '-'}｜"
+                        f"{result.get('transform', '')}"
+                    )
+
+                    st.caption(
+                        result.get(
+                            "main_image_optimized",
+                            "",
+                        )
+                    )
+
+                else:
+
+                    st.markdown(
+                        f"❌ 产品 {index}｜{sku or '-'}｜"
+                        f"图片优化未生效"
+                    )
+
+                    st.caption(
+                        "原因："
+                        + str(
+                            result.get("error")
+                            or status
+                            or "-"
+                        )
+                    )
 
 
 

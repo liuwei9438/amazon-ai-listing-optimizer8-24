@@ -1,0 +1,50 @@
+上传说明（Amazon AI Listing Optimizer 修复版）
+================================================
+
+本文件夹里的 2 个文件要上传到 GitHub 仓库：
+    liuwei9438/amazon-ai-listing-optimizer8-24
+    分支：stable-v2.4.4   ← 你实际运行的 App 用的分支，不要传到 main！
+
+------------------------------------------------
+文件 1：app.py
+    上传位置：仓库根目录（和原来的 app.py 同位置，直接替换）
+
+文件 2：listing_exporter.py
+    上传位置：services 文件夹里面（替换 services/listing_exporter.py）
+    注意：必须先点进 services 文件夹再上传，不能传到根目录！
+
+------------------------------------------------
+上传步骤（在 GitHub 网页上操作）：
+
+1. 打开 github.com 并登录（部署 Streamlit 用的那个账号）
+2. 打开仓库 amazon-ai-listing-optimizer8-24
+3. 页面左上角有个分支下拉框（默认显示 main），点开，切换成 stable-v2.4.4
+4. 上传 app.py：
+   点 "Add file" → "Upload files" → 把本文件夹的 app.py 拖进虚线框
+   → 点绿色 "Commit changes" 按钮
+5. 上传 listing_exporter.py：
+   先点进 services 文件夹 → 同样 "Add file" → "Upload files"
+   → 把 listing_exporter.py 拖进去 → "Commit changes"
+6. 提交后，Streamlit Cloud 会自动重新部署（等 2-3 分钟）
+
+------------------------------------------------
+然后配置 Cloudinary（在 Streamlit 网页控制台，不是 GitHub）：
+
+1. 打开 share.streamlit.io，点开 stable-v2.4.4 那个 App
+2. 点右下角 "Settings" → "Secrets" 标签
+3. 粘贴以下三行，把中文占位符换成 cloudinary.com 控制台
+   (Dashboard → Account Details) 里的真实值：
+
+CLOUDINARY_CLOUD_NAME = "把CloudName填在这里"
+CLOUDINARY_API_KEY = "把APIKey填在这里"
+CLOUDINARY_API_SECRET = "把APISecret填在这里"
+
+4. 点 Save。Secrets 属于敏感信息：不要截图、不要发给任何人。
+
+------------------------------------------------
+验证（必须重新跑一次新任务，旧结果不会自动补上）：
+
+1. 打开 App，上传 Excel，勾选"优化首图"，跑 2-3 个产品
+2. 页面上看「图片优化状态」：全部 ✅ = 图片生效；
+   有 ❌ 会显示原因，把原因文字复制发回来即可（不含密钥，可以发）
+3. 导出 Excel → 检查"短标题"和"商品亮点"两列有内容
