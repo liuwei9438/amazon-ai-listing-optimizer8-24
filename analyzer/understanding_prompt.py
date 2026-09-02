@@ -97,6 +97,18 @@ Analyze the SOURCE as one product and fill the complete Product Profile.
 IMPORTANT RULES:
 
 
+## -1. NO GUESSED SPECIFICATIONS (STRICT)
+
+For material, quantity, temperature, voltage, weight, and dimensions:
+the exact value must literally appear in the SOURCE text. If it does not,
+return an empty string for that field.
+
+Known failure pattern to avoid: guessing "PP" as the material for 3D
+printer parts, or writing "metal"/"plastic" based on the product
+category instead of the source text. An empty field is always correct
+when the source does not state the value.
+
+
 ## 0. SOURCE FACT COVERAGE — NO SILENT DROP
 
 A deterministic SOURCE FACT LEDGER is provided below.

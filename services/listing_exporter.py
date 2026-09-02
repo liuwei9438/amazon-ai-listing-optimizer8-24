@@ -95,6 +95,13 @@ class ListingExporter:
         )
 
 
+    # 标题尾部悬垂词："...Voron 3D"、"...MK4S printing"——
+    # 标题组装截断后留下的不成短语单词。
+    _DANGLING_TAIL_RE = re.compile(
+        r"\s+\b(?:3d|printing|print)\b[\s.!]*$",
+        flags=re.I,
+    )
+
     @classmethod
     def sanitize_title(
         cls,
@@ -103,6 +110,7 @@ class ListingExporter:
         """去掉标题里的包裹重量/包裹尺寸（发货信息不是搜索关键词）。
 
         产品规格（0.4mm、24V 40W、5x120mm、300℃ 等）不受影响。
+        同时去掉尾部悬垂词（"...Voron 3D" → "...Voron"）。
         """
 
         if not text:
@@ -121,6 +129,11 @@ class ListingExporter:
 
         cleaned = cls.sanitize_text(
             cleaned
+        )
+
+        cleaned = cls._DANGLING_TAIL_RE.sub(
+            "",
+            cleaned,
         )
 
         return (

@@ -38,6 +38,17 @@ class BulletGenerator:
     ]
 
 
+    # 不是品牌的"品牌"：AI 偶尔把 "3D Printer" 拆开，
+    # 把 Print / 3D 当成兼容品牌输出（"Compatible with Print"）。
+    JUNK_BRAND_WORDS = {
+        "print",
+        "prints",
+        "3d",
+        "printer",
+        "printing",
+    }
+
+
     @staticmethod
     def generate(
         profile: dict,
@@ -209,11 +220,34 @@ class BulletGenerator:
 
                     break
 
-                if item and item not in bullets:
+                if not item:
 
-                    bullets.append(
-                        item
+                    continue
+
+                item_key = item.casefold()
+
+                # 跳过两种低质量补位：
+                # 1. 纯规格串（"13 x 9 x 8 cm"、"0.150 kg"）
+                #    单独当一条要点没有可读性；
+                # 2. 与已有要点重复/被包含（产品名换个说法再出现一次）。
+                if BulletGenerator.is_spec_only(item):
+
+                    continue
+
+                if any(
+                    item_key in existing
+                    or existing in item_key
+                    for existing in (
+                        str(bullet).casefold()
+                        for bullet in bullets
                     )
+                ):
+
+                    continue
+
+                bullets.append(
+                    item
+                )
 
 
         for fallback in (
@@ -222,6 +256,12 @@ class BulletGenerator:
 
             "Package contents and specifications are listed above; "
             "please review them before ordering.",
+
+            "Please check the product images and stated dimensions "
+            "carefully to ensure this item matches your needs.",
+
+            "If anything is unclear, verify the details against "
+            "your equipment model before ordering.",
         ):
 
             if len(bullets) >= 5:
@@ -335,16 +375,29 @@ class BulletGenerator:
 
             return ""
 
-        # 源数据里的功能常以 "to xxx" 开头，直接拼接会得到
-        # "Used to to drive" 这种双 to，先剥掉开头的 to。
+        # V2.6.1：AI 返回的功能短语形态不定（第三人称动词 / 动名词 /
+        # 名词短语都有），固定写 "Used to xxx" 会拼出
+        # "Used to drives"、"Used to heating" 这类语法错误。
+        # 改成 "Function: {首字母大写}。" 对任何形态都通顺。
         function_text = re.sub(
             r"^to\s+",
             "",
-            function.lower().strip(),
+            function.strip().rstrip("."),
+            flags=re.I,
+        )
+
+        if not function_text:
+
+            return ""
+
+        function_text = (
+            function_text[0].upper()
+            +
+            function_text[1:]
         )
 
         return (
-            f"Function: Used to {function_text}."
+            f"Function: {function_text}."
         )
 
     @staticmethod
@@ -359,10 +412,17 @@ class BulletGenerator:
             return ""
 
 
-        brands = relationship.get(
-            "brands",
-            [],
-        )
+        brands = [
+            str(brand).strip()
+            for brand in relationship.get(
+                "brands",
+                [],
+            )
+            if str(brand)
+            .strip()
+            .lower()
+            not in BulletGenerator.JUNK_BRAND_WORDS
+        ]
 
 
         models = relationship.get(
@@ -542,16 +602,11 @@ class BulletGenerator:
 
         if not features:
 
-            product_name = BulletGenerator.first_text(
-                identity.get("product_name"),
-                identity.get("object_name"),
-            )
+            # V2.6.1：不再用 "Features: {产品名}" 兜底——那只是把要点1
+            # 换个前缀重复一遍。没有真实特点就返回空，
+            # 由亮点补位 + 购买提示把 5 个槽位填满。
 
-            if product_name:
-
-                return (
-                    f"Features: {product_name}."
-                )
+            return ""
 
 
         joined = (
@@ -572,6 +627,43 @@ class BulletGenerator:
             "."
         )
 
+
+
+    @staticmethod
+    def is_spec_only(
+        text: str,
+    ) -> bool:
+        """判断是否为纯规格串（如 "13 x 9 x 8 cm"、"0.150 kg"）。
+
+        规则：含数字，且去掉单位词后剩下的实义词不超过 1 个。
+        """
+
+        value = str(
+            text
+        ).strip()
+
+        if not value or not re.search(
+            r"\d",
+            value,
+        ):
+
+            return False
+
+        units = {
+            "mm", "cm", "m", "kg", "g", "v", "w", "oz", "ml", "l",
+            "mah", "x", "℃",
+        }
+
+        real_words = [
+            word
+            for word in re.findall(
+                r"[A-Za-z]+",
+                value,
+            )
+            if word.lower() not in units
+        ]
+
+        return len(real_words) <= 1
 
 
     @staticmethod

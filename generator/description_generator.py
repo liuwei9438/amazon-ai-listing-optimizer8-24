@@ -43,6 +43,16 @@ class DescriptionGenerator:
 
     ]
 
+    # 不是品牌的"品牌"：AI 偶尔把 "3D Printer" 拆开，
+    # 把 Print / 3D 当成兼容品牌输出（"Compatible with Print"）。
+    JUNK_BRAND_WORDS = {
+        "print",
+        "prints",
+        "3d",
+        "printer",
+        "printing",
+    }
+
 
     @staticmethod
     def generate(
@@ -226,9 +236,10 @@ class DescriptionGenerator:
         )
 
 
-        # V2.6：不再使用按关键词匹配的固定文案（历史上曾把含 "switch"
-        # 的 3D 打印机产品误写成"洗衣机启动按钮"）。改为只用画像里的
-        # 真实数据拼通用介绍；没有数据就不写介绍。
+        # V2.6.1：简介开头不再拼接功能短语——AI 返回的功能形态不定
+        # （第三人称动词 / 动名词 / 名词短语都有），固定句式会拼出
+        # "designed for drives filament" 这类语法错误。
+        # 改成安全的中性句，功能信息由要点2的 "Function: ..." 承载。
         type_text = (
             str(
                 product_type
@@ -243,35 +254,16 @@ class DescriptionGenerator:
 
             return ""
 
-        function_text = (
-            str(
-                main_function
-            )
-            .strip()
-            .rstrip(
-                "."
-            )
-            .lower()
+        # a/an 冠词随首字母元音切换，避免 "a encoder motor" 这类小错。
+        article = (
+            "an"
+            if type_text[:1].lower()
+            in "aeiou"
+            else "a"
         )
 
-        if function_text:
-
-            if function_text.startswith(
-                "to "
-            ):
-
-                return (
-                    f"This {type_text.lower()} is designed "
-                    f"{function_text}."
-                )
-
-            return (
-                f"This {type_text.lower()} is designed "
-                f"for {function_text}."
-            )
-
         return (
-            f"This is a compatible replacement "
+            f"This is {article} "
             f"{type_text.lower()}."
         )
     
@@ -382,10 +374,17 @@ class DescriptionGenerator:
 
 
 
-        brands = compatibility.get(
-            "brands",
-            []
-        )
+        brands = [
+            str(brand).strip()
+            for brand in compatibility.get(
+                "brands",
+                []
+            )
+            if str(brand)
+            .strip()
+            .lower()
+            not in DescriptionGenerator.JUNK_BRAND_WORDS
+        ]
 
 
         models = compatibility.get(

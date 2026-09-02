@@ -231,17 +231,42 @@ class HighlightGenerator:
         candidates.sort(key=lambda x: (-x[0], x[1]))
         return candidates
 
+    # 不是品牌的"品牌"：AI 偶尔把 "3D Printer" 拆开，
+    # 把 Print / 3D 当成兼容品牌输出（"Compatible with Print"）。
+    JUNK_BRAND_WORDS = {
+        "print", "prints", "3d", "printer", "printing",
+        "compatible", "with", "and", "models", "model",
+    }
+
     @staticmethod
     def _compatibility(profile: dict) -> str:
         normalized = profile.get("normalized_knowledge", {}) or {}
         compat = normalized.get("compatibility", {}) or {}
         phrase = HighlightGenerator._clean(compat.get("phrase", ""))
+
         if phrase:
-            return phrase
+            # 剔除假品牌词后若已不剩任何实际品牌，整句丢弃，
+            # 避免 "Compatible with Print" 这种残句进入亮点。
+            stripped = phrase
+            for junk in HighlightGenerator.JUNK_BRAND_WORDS:
+                stripped = re.sub(
+                    r"(?i)\b" + re.escape(junk) + r"\b",
+                    " ",
+                    stripped,
+                )
+            leftover = re.findall(r"[A-Za-z0-9][A-Za-z0-9.\-/]*", stripped)
+            if leftover:
+                return phrase
+            return ""
 
         knowledge = profile.get("product_knowledge", {}) or {}
         relation = knowledge.get("relationship", {}) or {}
-        brands = HighlightGenerator._list(relation.get("brands", []))
+        brands = [
+            b for b in HighlightGenerator._list(relation.get("brands", []))
+            if b.casefold() not in {
+                "print", "prints", "3d", "printer", "printing",
+            }
+        ]
         if brands:
             return "Compatible with " + ", ".join(brands[:3])
         return ""

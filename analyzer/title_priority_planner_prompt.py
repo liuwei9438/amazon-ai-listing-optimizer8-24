@@ -54,6 +54,10 @@ TITLE-WORTHINESS RULES (V2.6):
   from the approved facts. Never reformat or merge them
   (e.g. never turn "MK4/XL" into "i3 XL").
 - A short_text must not contain the same word or brand twice.
+- Keep multi-word terms intact: never split a phrase like "3D Printer"
+  by inserting numbers or other tokens between its words.
+- Fastener/screw part numbers from a package list (e.g. "BT3-10") are
+  package contents, not product models; give them value_score 0.
 
 COMPATIBILITY:
 - if an approved COMPATIBILITY_BRAND exists, preserve it
