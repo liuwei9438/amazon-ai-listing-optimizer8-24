@@ -4,6 +4,7 @@ import json
 
 from openai import OpenAI
 
+from services.ai_client import get_openai_base_url
 from services.ai_runtime import DEFAULT_TIMEOUT_SECONDS, execute_with_retry
 
 
@@ -594,6 +595,7 @@ Return valid JSON only.
 
         client = OpenAI(
             api_key=api_key,
+            base_url=get_openai_base_url() or None,
             timeout=DEFAULT_TIMEOUT_SECONDS,
             max_retries=0,
         )
