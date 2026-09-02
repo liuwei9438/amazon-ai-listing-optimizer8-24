@@ -27,15 +27,19 @@ DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 
 
 def get_openai_base_url() -> str:
-    """读取自定义 API 端点；空字符串表示使用 OpenAI 官方。"""
-    url = ""
-    try:
-        url = str(st.secrets.get("OPENAI_BASE_URL", "") or "").strip()
-    except Exception:
-        url = ""
+    """读取自定义 API 端点；空字符串表示使用 OpenAI 官方。
+
+    优先级：环境变量 > Streamlit Secrets。
+    页面上的「AI 服务商」选择器通过环境变量注入，因此可以覆盖
+    Secrets 里的静态配置。
+    """
+    url = str(os.getenv("OPENAI_BASE_URL", "") or "").strip()
 
     if not url:
-        url = str(os.getenv("OPENAI_BASE_URL", "") or "").strip()
+        try:
+            url = str(st.secrets.get("OPENAI_BASE_URL", "") or "").strip()
+        except Exception:
+            url = ""
 
     return url.rstrip("/")
 
