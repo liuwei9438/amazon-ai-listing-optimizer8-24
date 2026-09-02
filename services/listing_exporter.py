@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from io import BytesIO
 from typing import Any
 
@@ -48,6 +49,88 @@ class ListingExporter:
         "商品亮点", "产品亮点", "亮点",
         "highlights", "item highlights", "highlight",
     )
+
+    # =====================================================
+    # V2.6 导出前文本清洗
+    #
+    # 所有 AI 文案写入 Excel 前的最后关口，集中处理两类
+    # 低级瑕疵：相邻重复词、标题里的包裹规格。
+    # =====================================================
+
+    # 相邻重复词："Used to to drive" / "the the"。
+    # 只匹配纯字母词，数字（如尺寸 "5 5"）不受影响。
+    _REPEATED_WORD_RE = re.compile(
+        r"\b([A-Za-z]+)(\s+\1\b)+",
+        flags=re.I,
+    )
+
+    # 标题里的包裹重量（发货信息）：0.1kg / 0.046 kg 这类
+    # 带 小数的重量。整数产品规格（500g、1kg、40W、24V）不匹配。
+    _PKG_WEIGHT_RE = re.compile(
+        r"\b\d+\.\d+\s?(?:kg|g|lbs?|oz)\b",
+        flags=re.I,
+    )
+
+    # 标题里的三段包裹尺寸：16 x 14 x 3 cm。
+    # 单位限定 cm，避免误删 5x6x25mm 这类产品规格。
+    _PKG_DIMS_RE = re.compile(
+        r"\b\d+(?:\.\d+)?\s*[x×]\s*\d+(?:\.\d+)?\s*[x×]\s*\d+(?:\.\d+)?\s*cm\b",
+        flags=re.I,
+    )
+
+    @classmethod
+    def sanitize_text(
+        cls,
+        text: str,
+    ) -> str:
+        """合并相邻重复词："Used to to drive" -> "Used to drive"。"""
+
+        if not text:
+
+            return text
+
+        return cls._REPEATED_WORD_RE.sub(
+            r"\1",
+            str(text),
+        )
+
+
+    @classmethod
+    def sanitize_title(
+        cls,
+        text: str,
+    ) -> str:
+        """去掉标题里的包裹重量/包裹尺寸（发货信息不是搜索关键词）。
+
+        产品规格（0.4mm、24V 40W、5x120mm、300℃ 等）不受影响。
+        """
+
+        if not text:
+
+            return text
+
+        cleaned = cls._PKG_WEIGHT_RE.sub(
+            " ",
+            str(text),
+        )
+
+        cleaned = cls._PKG_DIMS_RE.sub(
+            " ",
+            cleaned,
+        )
+
+        cleaned = cls.sanitize_text(
+            cleaned
+        )
+
+        return (
+            " ".join(
+                cleaned.split()
+            )
+            .strip(
+                " ,;-"
+            )
+        )
 
     # =====================================================
     # 通用安全函数
@@ -854,12 +937,13 @@ class ListingExporter:
                     out.append(t)
             return out
 
+        # V2.6：导出前统一清洗（重复词 + 标题包裹规格）。
         return {
-            "title": str(title or "").strip(),
-            "short_title": str(short_title or "").strip(),
-            "description": cls.safe_value(description),
-            "bullets": as_text_list(bullets),
-            "highlights": as_text_list(highlights),
+            "title": cls.sanitize_title(str(title or "").strip()),
+            "short_title": cls.sanitize_title(str(short_title or "").strip()),
+            "description": cls.sanitize_text(cls.safe_value(description)),
+            "bullets": [cls.sanitize_text(t) for t in as_text_list(bullets)],
+            "highlights": [cls.sanitize_text(t) for t in as_text_list(highlights)],
         }
 
     @classmethod

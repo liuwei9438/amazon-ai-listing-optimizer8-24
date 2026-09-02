@@ -43,6 +43,18 @@ FROZEN CONTENT PRIORITY:
 
 PRIMARY MODEL must not lose to material/color/generic feature.
 
+TITLE-WORTHINESS RULES (V2.6):
+
+- Package/shipping facts are NEVER title-worthy. Package weight
+  (e.g. "0.1kg", "0.046 kg") and package dimensions
+  (e.g. "16 x 14 x 3 cm") always get value_score 0.
+- Buyer-searched product specifications keep normal value:
+  0.4mm nozzle, 24V 40W, 5x120mm shaft, 300℃, 4MM carbon.
+- Copy model numbers, part numbers and compatibility series VERBATIM
+  from the approved facts. Never reformat or merge them
+  (e.g. never turn "MK4/XL" into "i3 XL").
+- A short_text must not contain the same word or brand twice.
+
 COMPATIBILITY:
 - if an approved COMPATIBILITY_BRAND exists, preserve it
 - downstream code will render the language-specific qualifier

@@ -25,6 +25,11 @@ Rules:
 - Separate product identity, features, usage scenarios, specifications, and identifiers.
 - Treat third-party brands as compatibility references unless ownership is proven.
 - Never accept claims such as original, genuine, official, OEM, authentic as verified facts.
+- Never guess specifications. If the source does not explicitly state a material,
+  quantity, temperature, voltage, weight, or dimension, return an empty string for
+  that field. An empty answer is always better than a plausible guess.
+- Never generalize from the product category (for example: do not output "PP" or
+  "metal" unless the source literally says so).
 
 Return only JSON matching the schema.
 """.strip()

@@ -191,6 +191,49 @@ class BulletGenerator:
             )
 
 
+        # =========================
+        # 补足 5 条（V2.6）
+        #
+        # 导出时要点槽位只写新生成内容，条数不足会保留原表旧值，
+        # 而原表旧要点常是历史遗留的乱数据。这里用亮点文案 +
+        # 核对提示把 5 个槽位填满，保证导出内容全部是新生成的。
+        # =========================
+
+        if len(bullets) < 5:
+
+            for item in BulletGenerator.extract_highlight_texts(
+                highlights
+            ):
+
+                if len(bullets) >= 5:
+
+                    break
+
+                if item and item not in bullets:
+
+                    bullets.append(
+                        item
+                    )
+
+
+        for fallback in (
+            "Please confirm the original part number and model "
+            "before purchase to ensure compatibility.",
+
+            "Package contents and specifications are listed above; "
+            "please review them before ordering.",
+        ):
+
+            if len(bullets) >= 5:
+
+                break
+
+            if fallback not in bullets:
+
+                bullets.append(
+                    fallback
+                )
+
 
         bullets = [
             BulletGenerator.clean(item)
@@ -292,10 +335,18 @@ class BulletGenerator:
 
             return ""
 
+        # 源数据里的功能常以 "to xxx" 开头，直接拼接会得到
+        # "Used to to drive" 这种双 to，先剥掉开头的 to。
+        function_text = re.sub(
+            r"^to\s+",
+            "",
+            function.lower().strip(),
+        )
 
         return (
-            f"Function: Used to {function.lower()}."
+            f"Function: Used to {function_text}."
         )
+
     @staticmethod
     def build_compatibility(
         relationship: dict,
@@ -503,16 +554,93 @@ class BulletGenerator:
                 )
 
 
-        return (
-            "Features: "
-            +
+        joined = (
             "; ".join(
                 features[:3]
             )
+        )
+
+        if not joined:
+
+            return ""
+
+        return (
+            "Features: "
+            +
+            joined
             +
             "."
         )
 
+
+
+    @staticmethod
+    def extract_highlight_texts(
+        highlights,
+    ) -> list:
+        """从 highlight_result 里取出纯文本列表，用于补足要点条数。"""
+
+        if isinstance(
+            highlights,
+            dict,
+        ):
+
+            data = highlights.get(
+                "highlights",
+                [],
+            )
+
+        elif isinstance(
+            highlights,
+            list,
+        ):
+
+            data = highlights
+
+        else:
+
+            data = []
+
+
+        texts = []
+
+        if isinstance(
+            data,
+            list,
+        ):
+
+            for item in data:
+
+                if isinstance(
+                    item,
+                    dict,
+                ):
+
+                    text = str(
+                        item.get(
+                            "text"
+                        )
+                        or
+                        ""
+                    ).strip()
+
+                else:
+
+                    text = str(
+                        item
+                        or
+                        ""
+                    ).strip()
+
+
+                if text:
+
+                    texts.append(
+                        text
+                    )
+
+
+        return texts
 
 
     @staticmethod

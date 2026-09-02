@@ -226,50 +226,54 @@ class DescriptionGenerator:
         )
 
 
-        text = (
-            product_type
-            +
-            " "
-            +
-            main_function
-        ).lower()
+        # V2.6：不再使用按关键词匹配的固定文案（历史上曾把含 "switch"
+        # 的 3D 打印机产品误写成"洗衣机启动按钮"）。改为只用画像里的
+        # 真实数据拼通用介绍；没有数据就不写介绍。
+        type_text = (
+            str(
+                product_type
+            )
+            .strip()
+            .rstrip(
+                "."
+            )
+        )
 
+        if not type_text:
 
+            return ""
 
-        if (
-            "button" in text
-            or "switch" in text
-        ):
+        function_text = (
+            str(
+                main_function
+            )
+            .strip()
+            .rstrip(
+                "."
+            )
+            .lower()
+        )
+
+        if function_text:
+
+            if function_text.startswith(
+                "to "
+            ):
+
+                return (
+                    f"This {type_text.lower()} is designed "
+                    f"{function_text}."
+                )
 
             return (
-                "This compatible replacement start button "
-                "is designed to help restore normal "
-                "washing machine control operation."
+                f"This {type_text.lower()} is designed "
+                f"for {function_text}."
             )
 
-
-        if "filter" in text:
-
-            return (
-                "This compatible replacement filter "
-                "is designed for regular maintenance "
-                "and replacement use."
-            )
-
-
-        if (
-            "shaver" in text
-            or "razor" in text
-            or "trimmer" in text
-        ):
-
-            return (
-                "This grooming device is designed "
-                "for convenient daily personal care use."
-            )
-
-
-        return ""
+        return (
+            f"This is a compatible replacement "
+            f"{type_text.lower()}."
+        )
     
     # =========================
     # Highlight 提取

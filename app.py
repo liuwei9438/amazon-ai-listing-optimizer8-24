@@ -58,7 +58,7 @@ from analyzer.title_strategy_generator import (
     TitleStrategyGenerator,
 )
 
-VERSION = "V2.5.0-UI-3"
+VERSION = "V2.6.0-EMP-1"
 
 
 TASK_RUNNING_STATUS = [
@@ -70,6 +70,72 @@ TASK_RUNNING_STATUS = [
 
 
 DEBUG_MODE = False
+
+
+# =====================================================
+# V2.6 员工模式 / 管理员模式
+#
+# 这个工具主要给员工日常使用，页面默认只保留
+# 上传 → 开始 → 进度 → 下载 四步。
+# 完整功能（五个标签页、诊断 JSON、模块勾选）只在
+# Secrets 里配置 ADMIN_MODE = "true" 后显示。
+#
+# API Key 同理：Secrets 里配了 OPENAI_API_KEY /
+# DEEPSEEK_API_KEY 后，员工全程不需要接触密钥。
+# =====================================================
+
+
+def _read_secrets_flag(name: str) -> bool:
+
+    try:
+
+        return str(
+            st.secrets.get(name, "") or ""
+        ).strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
+
+    except Exception:
+
+        return False
+
+
+ADMIN_MODE = _read_secrets_flag(
+    "ADMIN_MODE"
+)
+
+
+def get_saved_provider_key(
+    provider_name: str,
+) -> str:
+    """按服务商读 Secrets 里的密钥（员工模式不再手动填 Key）。"""
+
+    names = (
+        ["DEEPSEEK_API_KEY", "OPENAI_API_KEY"]
+        if provider_name == "DeepSeek"
+        else ["OPENAI_API_KEY"]
+    )
+
+    try:
+
+        for name in names:
+
+            value = str(
+                st.secrets.get(name, "") or ""
+            ).strip()
+
+            if value:
+
+                return value
+
+    except Exception:
+
+        pass
+
+    return ""
 
 
 # =====================================================
@@ -424,6 +490,17 @@ api_key = ""
 model = "gpt-4.1-mini"
 provider = "OpenAI"
 
+# 优化模块开关的默认值。员工模式下侧边栏不显示模块勾选，
+# 一直用这组默认值（全文字模块开、图片关）；
+# 管理员模式会被侧边栏的勾选覆盖。
+enable_title = True
+enable_short_title = True
+enable_highlight = True
+enable_bullet = True
+enable_description = True
+enable_seo = True
+enable_images = False
+
 with st.sidebar:
 
     st.markdown(
@@ -544,18 +621,48 @@ with st.sidebar:
                 else "到 platform.openai.com 充值并创建 Key"
             )
 
-            saved_api_key = get_openai_api_key()
-
-            manual_api_key = st.text_input(
-                key_label,
-                type="password",
-            )
-
-            api_key = (
-                manual_api_key.strip()
+            # 按服务商读 Secrets：DeepSeek 用 DEEPSEEK_API_KEY，
+            # OpenAI 用 OPENAI_API_KEY（找不到时回退旧配置）。
+            saved_api_key = (
+                get_saved_provider_key(provider)
                 or
-                saved_api_key
+                get_openai_api_key()
             )
+
+            if ADMIN_MODE:
+
+                manual_api_key = st.text_input(
+                    key_label,
+                    type="password",
+                )
+
+                api_key = (
+                    manual_api_key.strip()
+                    or
+                    saved_api_key
+                )
+
+            else:
+
+                # 员工模式：密钥由管理员配置在 Secrets 里，
+                # 页面上不出现输入框，员工全程接触不到密钥。
+                api_key = saved_api_key
+
+                if api_key:
+
+                    st.success(
+                        "✅ API 已配置"
+                    )
+
+                else:
+
+                    # Secrets 里没配密钥时的兜底：仍然显示输入框，
+                    # 否则员工模式下会没有地方填 Key，任务无法开始。
+                    api_key = st.text_input(
+                        key_label,
+                        type="password",
+                        key="emp_api_key",
+                    ).strip()
 
             if not api_key.strip():
                 st.caption(f"💡 {key_hint}")
@@ -575,87 +682,112 @@ with st.sidebar:
             ):
                 st.session_state["model_input"] = default_model
 
-            model = st.text_input(
-                "模型",
-                key="model_input",
-            )
+            if ADMIN_MODE:
+
+                model = st.text_input(
+                    "模型",
+                    key="model_input",
+                )
+
+            else:
+
+                # 员工模式不显示模型输入框，跟随服务商默认值。
+                model = st.session_state["model_input"]
 
             # ----------------------------------------
-            # 第 3 步：优化模块
+            # 第 3 步：优化模块（仅管理员模式显示）
+            #
+            # 员工模式用顶部定义的默认值：全文字模块开、
+            # 图片关，不显示任何勾选项。
             # ----------------------------------------
 
-            st.markdown(
-                '<div class="side-step"><span class="step-badge">3</span> 优化模块</div>',
-                unsafe_allow_html=True,
-            )
+            if ADMIN_MODE:
 
-            quick_a, quick_b, quick_c = st.columns(3)
+                st.markdown(
+                    '<div class="side-step"><span class="step-badge">3</span> 优化模块</div>',
+                    unsafe_allow_html=True,
+                )
 
-            if quick_a.button("全选", key="quick_select_all", use_container_width=True):
-                for key in MODULE_ALL_KEYS:
-                    st.session_state[key] = True
-                st.rerun()
+                quick_a, quick_b, quick_c = st.columns(3)
 
-            if quick_b.button("仅文字", key="quick_text_only", use_container_width=True):
-                for key in MODULE_TEXT_KEYS:
-                    st.session_state[key] = True
-                st.session_state["enable_images"] = False
-                st.rerun()
+                if quick_a.button("全选", key="quick_select_all", use_container_width=True):
+                    for key in MODULE_ALL_KEYS:
+                        st.session_state[key] = True
+                    st.rerun()
 
-            if quick_c.button("清空", key="quick_clear_all", use_container_width=True):
-                for key in MODULE_ALL_KEYS:
-                    st.session_state[key] = False
-                st.rerun()
+                if quick_b.button("仅文字", key="quick_text_only", use_container_width=True):
+                    for key in MODULE_TEXT_KEYS:
+                        st.session_state[key] = True
+                    st.session_state["enable_images"] = False
+                    st.rerun()
 
-            enable_title = st.checkbox(
-                "优化标题",
-                True,
-                key="enable_title",
-            )
+                if quick_c.button("清空", key="quick_clear_all", use_container_width=True):
+                    for key in MODULE_ALL_KEYS:
+                        st.session_state[key] = False
+                    st.rerun()
 
-            enable_short_title = st.checkbox(
-                "优化短标题",
-                True,
-                key="enable_short_title",
-            )
+                enable_title = st.checkbox(
+                    "优化标题",
+                    True,
+                    key="enable_title",
+                )
 
-
-            enable_highlight = st.checkbox(
-                "优化商品亮点",
-                True,
-                key="enable_highlight",
-            )
+                enable_short_title = st.checkbox(
+                    "优化短标题",
+                    True,
+                    key="enable_short_title",
+                )
 
 
-            enable_bullet = st.checkbox(
-                "优化五点描述",
-                True,
-                key="enable_bullet",
-            )
+                enable_highlight = st.checkbox(
+                    "优化商品亮点",
+                    True,
+                    key="enable_highlight",
+                )
 
 
-            enable_description = st.checkbox(
-                "优化详情描述",
-                True,
-                key="enable_description",
-            )
+                enable_bullet = st.checkbox(
+                    "优化五点描述",
+                    True,
+                    key="enable_bullet",
+                )
 
 
-            enable_seo = st.checkbox(
-                "优化SEO关键词",
-                True,
-                key="enable_seo",
-            )
+                enable_description = st.checkbox(
+                    "优化详情描述",
+                    True,
+                    key="enable_description",
+                )
 
 
-            enable_images = st.checkbox(
-                "优化首图（V1.3.2 稳定基线）",
-                False,
-                key="enable_images",
-                help="仅优化第一张主图；其他图片保留。图片失败不会影响文字优化结果。"
-                "需要配置 Cloudinary Secrets（CLOUDINARY_CLOUD_NAME / API_KEY / API_SECRET），"
-                "否则图片上传会失败。",
-            )
+                enable_seo = st.checkbox(
+                    "优化SEO关键词",
+                    True,
+                    key="enable_seo",
+                )
+
+
+                enable_images = st.checkbox(
+                    "优化首图（V1.3.2 稳定基线）",
+                    False,
+                    key="enable_images",
+                    help="仅优化第一张主图；其他图片保留。图片失败不会影响文字优化结果。"
+                    "需要配置 Cloudinary Secrets（CLOUDINARY_CLOUD_NAME / API_KEY / API_SECRET），"
+                    "否则图片上传会失败。",
+                )
+
+            else:
+
+                enable_title = True
+                enable_short_title = True
+                enable_highlight = True
+                enable_bullet = True
+                enable_description = True
+                enable_seo = True
+
+                # 员工模式默认不优化图片（避免未配置 Cloudinary 时
+                # 全部图片失败的困扰）。
+                enable_images = False
 
             # ----------------------------------------
             # 第 4 步：开始任务
@@ -837,11 +969,11 @@ with st.sidebar:
 # =====================================================
 
 st.markdown(
-    """
+    f"""
     <div class="app-hero">
         <div class="hero-title">🛒 Amazon AI Listing Optimizer</div>
         <div class="hero-sub">AI 生成标题 · 短标题 · 五点 · 详情 · 商品亮点 · 首图优化</div>
-        <span class="version-pill">V2.5.0</span>
+        <span class="version-pill">V2.6.0{" · 管理模式" if ADMIN_MODE else " · 员工版"}</span>
     </div>
     """,
     unsafe_allow_html=True,
@@ -965,12 +1097,23 @@ elif status and status.get("status") in {"completed", "cancelled", "failed"} and
 
     hint_html = (
         f"🔁 有 {len(failed_items)} 个失败产品 → "
-        "切到「🚨 失败诊断」标签页点「重新优化」"
+        + (
+            "切到「🚨 失败诊断」标签页点「重新优化」"
+            if ADMIN_MODE
+            else "点下方「重新优化失败产品」按钮"
+        )
     )
 
 elif status and status.get("status") in {"completed", "cancelled", "failed"} and profiles:
 
-    hint_html = "✅ 任务已完成 → 切到「⬇️ 导出」标签页下载优化结果"
+    hint_html = (
+        "✅ 任务已完成 → "
+        + (
+            "切到「⬇️ 导出」标签页下载优化结果"
+            if ADMIN_MODE
+            else "点下方「下载优化结果」按钮"
+        )
+    )
 
 elif uploaded is None and current_task:
 
@@ -1015,32 +1158,42 @@ if not current_task and not profiles:
         )
 
     with g2:
+        card2_text = (
+            "填写 API Key，勾选要优化的模块"
+            "（标题 / 短标题 / 五点 / 亮点 / 详情 / 首图），"
+            "点「开始 AI 商品理解」。"
+            if ADMIN_MODE
+            else "选好 AI 服务商（不确定就用默认），"
+            "点「开始 AI 商品理解」。"
+            "API 已由管理员配置，无需填写密钥。"
+        )
         st.markdown(
-            """
+            f"""
             <div class="guide-card">
                 <div class="guide-num">2</div>
                 <div class="guide-title">🔑 配置并开始</div>
-                <div class="guide-text">
-                填写 OpenAI API Key，勾选要优化的模块
-                （标题 / 短标题 / 五点 / 亮点 / 详情 / 首图），
-                点「开始 AI 商品理解」。
-                </div>
+                <div class="guide-text">{card2_text}</div>
             </div>
             """,
             unsafe_allow_html=True,
         )
 
     with g3:
+        card3_text = (
+            "任务完成后切到「导出」标签页，"
+            "下载优化后的 Excel（含短标题、商品亮点、"
+            "优化首图）或诊断 JSON。"
+            if ADMIN_MODE
+            else "任务完成后点页面中的"
+            "「下载优化结果」按钮，"
+            "得到优化后的 Excel。"
+        )
         st.markdown(
-            """
+            f"""
             <div class="guide-card">
                 <div class="guide-num">3</div>
                 <div class="guide-title">⬇️ 导出结果</div>
-                <div class="guide-text">
-                任务完成后切到「导出」标签页，
-                下载优化后的 Excel（含短标题、商品亮点、
-                优化首图）或诊断 JSON。
-                </div>
+                <div class="guide-text">{card3_text}</div>
             </div>
             """,
             unsafe_allow_html=True,
@@ -1114,7 +1267,266 @@ if current_task and status:
         )
 
     # --------------------------------------------
-    # 标签页
+    # V2.6 重新优化失败产品（员工面板 / 失败诊断共用）
+    #
+    # 只重跑失败的产品：已成功的不重复调用 AI。
+    # 新任务通过 base_profiles.json 继承旧的成功结果，
+    # 导出时自动合并，不需要手动拼文件。
+    # --------------------------------------------
+
+    def render_retry_failed_button(key_prefix: str):
+
+        task_is_idle = bool(
+            status
+            and status.get("status") not in TASK_RUNNING_STATUS
+        )
+
+        if uploaded is None or envelope is None:
+
+            st.info(
+                "💡 想重新优化失败产品：请在左侧重新上传原 Excel 文件后，"
+                "这里会出现「重新优化」按钮。"
+            )
+
+        elif not task_is_idle:
+
+            st.caption(
+                "任务运行中，等任务结束后才能重新优化失败产品。"
+            )
+
+        else:
+
+            if st.button(
+                f"🔄 重新优化这 {len(failed_items)} 个失败产品",
+                type="primary",
+                key=f"{key_prefix}_retry_failed_products",
+            ):
+
+                if not api_key.strip():
+
+                    st.error(
+                        "请先在左侧填写 API Key"
+                    )
+
+                else:
+
+                    failed_rows = {
+                        item.get("source_row_index")
+                        for item in failed_items
+                        if isinstance(item, dict)
+                        and item.get("source_row_index") is not None
+                    }
+
+                    failed_skus = {
+                        str(item.get("sku") or "").strip()
+                        for item in failed_items
+                        if isinstance(item, dict)
+                        and str(item.get("sku") or "").strip()
+                    }
+
+                    retry_records = [
+                        record
+                        for record in envelope.records
+                        if (
+                            getattr(record, "row_number", None) in failed_rows
+                        )
+                        or (
+                            bool(str(getattr(record, "sku") or "").strip())
+                            and str(getattr(record, "sku") or "").strip() in failed_skus
+                        )
+                    ]
+
+                    if not retry_records:
+
+                        st.error(
+                            "无法在当前 Excel 里定位这些失败产品"
+                            "（行号/SKU 对不上）。请确认上传的是原任务用的同一个文件。"
+                        )
+
+                    else:
+
+                        retry_task_id = create_task(
+                            total_products=len(retry_records),
+                            filename=uploaded.name,
+                        )
+
+                        # 继承全部已成功结果（含更早重试继承来的）。
+                        save_json(
+                            get_task_dir(retry_task_id) / "base_profiles.json",
+                            profiles,
+                        )
+
+                        retry_options = {
+
+                            "title":
+                                enable_title,
+
+                            "short_title":
+                                enable_short_title,
+
+                            "highlight":
+                                enable_highlight,
+
+                            "bullet":
+                                enable_bullet,
+
+                            "description":
+                                enable_description,
+
+                            "seo":
+                                enable_seo,
+
+                            "optimize_images":
+                                enable_images,
+
+                            "max_workers":
+                                4,
+
+                        }
+
+                        start_worker(
+
+                            retry_records,
+
+                            retry_task_id,
+
+                            api_key,
+
+                            model,
+
+                            retry_options,
+
+                        )
+
+                        save_current_task(
+                            retry_task_id
+                        )
+
+                        st.session_state["task_started"] = True
+                        st.session_state["current_task"] = retry_task_id
+
+                        st.success(
+                            f"重试任务已启动：{retry_task_id}"
+                            f"（本次只重跑 {len(retry_records)} 个失败产品）"
+                        )
+
+                        st.rerun()
+
+        st.caption(
+            "说明：重试只调用 AI 处理失败的产品，已成功的产品不会重跑、不重复消耗 token；"
+            "导出的 Excel 会自动合并新旧结果。"
+        )
+
+
+    # --------------------------------------------
+    # V2.6 员工模式：极简任务面板
+    #
+    # 员工只看到：刷新 / 开始新任务 / 下载 / 失败重试。
+    # 五个标签页和诊断工具只在管理员模式显示。
+    # --------------------------------------------
+
+    if not ADMIN_MODE:
+
+        col_refresh, col_new = st.columns(2)
+
+        with col_refresh:
+
+            if st.button(
+                "🔄 刷新进度",
+                use_container_width=True,
+                key="emp_refresh",
+            ):
+                st.rerun()
+
+        with col_new:
+
+            if status_value in {"completed", "cancelled", "failed"}:
+
+                if st.button(
+                    "🧹 开始新任务",
+                    use_container_width=True,
+                    key="emp_new_task",
+                ):
+                    clear_current_task()
+                    st.session_state.pop("current_task", None)
+                    st.session_state["task_started"] = False
+                    st.rerun()
+
+        if status_value in TASK_RUNNING_STATUS:
+
+            st.info(
+                "⏳ AI 正在处理，不用一直开着页面；"
+                "稍后回来点「刷新进度」即可。"
+            )
+
+        elif status_value in {"completed", "cancelled", "failed"} and not profiles:
+
+            st.warning(
+                "本次任务没有成功的产品，请联系管理员查看原因。"
+            )
+
+        # 下载优化结果（员工唯一的导出入口）
+        if profiles and uploaded is not None and envelope is not None:
+
+            try:
+
+                optimized_export = ListingExporter.export_unified(
+                    envelope.dataframe,
+                    profiles,
+                )
+
+                optimized_data = (
+                    optimized_export.getvalue()
+                    if hasattr(optimized_export, "getvalue")
+                    else optimized_export
+                )
+
+                safe_stem = re.sub(
+                    r"\.xlsx$",
+                    "",
+                    uploaded.name,
+                    flags=re.I,
+                )
+
+                st.download_button(
+                    "⬇️ 下载优化结果（Excel）",
+                    data=optimized_data,
+                    file_name=
+                    f"{safe_stem}_{VERSION}_AI优化结果.xlsx",
+                    mime=
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary",
+                    key="emp_download_excel",
+                    use_container_width=True,
+                )
+
+                st.caption(
+                    f"✅ 已优化 {len(profiles)} 个产品，"
+                    "点上面按钮下载 Excel。"
+                )
+
+            except Exception as exc:
+
+                st.error(
+                    f"生成优化文件失败：{exc}"
+                )
+
+        elif uploaded is None and profiles:
+
+            st.warning(
+                "请重新上传原 Excel 文件后才能下载结果。"
+            )
+
+        # 失败产品一键重试
+        if failed_items and status_value not in TASK_RUNNING_STATUS:
+
+            render_retry_failed_button("emp")
+
+        # 员工模式到此为止，下面的标签页只有管理员模式渲染。
+        st.stop()
+
+    # --------------------------------------------
+    # 标签页（仅管理员模式）
     # --------------------------------------------
 
     tab_status, tab_preview, tab_images, tab_export, tab_diag = st.tabs(
@@ -1638,153 +2050,11 @@ if current_task and status:
             )
 
             # ----------------------------------------
-            # 重新优化失败产品
-            #
-            # 只重跑失败的产品：已成功的不重复调用 AI。
-            # 新任务通过 base_profiles.json 继承旧的成功结果，
-            # 导出时自动合并，不需要手动拼文件。
+            # 重新优化失败产品（V2.6 抽成公共函数，
+            # 与员工模式主页面的按钮逻辑完全一致）
             # ----------------------------------------
 
-            task_is_idle = bool(
-                status
-                and status.get("status") not in TASK_RUNNING_STATUS
-            )
-
-            if uploaded is None or envelope is None:
-
-                st.info(
-                    "💡 想重新优化这些失败产品：请在左侧重新上传原 Excel 文件后，"
-                    "这里会出现「重新优化」按钮。"
-                )
-
-            elif not task_is_idle:
-
-                st.caption(
-                    "任务运行中，等任务结束后才能重新优化失败产品。"
-                )
-
-            else:
-
-                if st.button(
-                    f"🔄 重新优化这 {len(failed_items)} 个失败产品",
-                    type="primary",
-                    key="retry_failed_products",
-                ):
-
-                    if not api_key.strip():
-
-                        st.error(
-                            "请先在左侧填写 OpenAI API Key"
-                        )
-
-                    else:
-
-                        failed_rows = {
-                            item.get("source_row_index")
-                            for item in failed_items
-                            if isinstance(item, dict)
-                            and item.get("source_row_index") is not None
-                        }
-
-                        failed_skus = {
-                            str(item.get("sku") or "").strip()
-                            for item in failed_items
-                            if isinstance(item, dict)
-                            and str(item.get("sku") or "").strip()
-                        }
-
-                        retry_records = [
-                            record
-                            for record in envelope.records
-                            if (
-                                getattr(record, "row_number", None) in failed_rows
-                            )
-                            or (
-                                bool(str(getattr(record, "sku") or "").strip())
-                                and str(getattr(record, "sku") or "").strip() in failed_skus
-                            )
-                        ]
-
-                        if not retry_records:
-
-                            st.error(
-                                "无法在当前 Excel 里定位这些失败产品"
-                                "（行号/SKU 对不上）。请确认上传的是原任务用的同一个文件。"
-                            )
-
-                        else:
-
-                            retry_task_id = create_task(
-                                total_products=len(retry_records),
-                                filename=uploaded.name,
-                            )
-
-                            # 继承全部已成功结果（含更早重试继承来的）。
-                            save_json(
-                                get_task_dir(retry_task_id) / "base_profiles.json",
-                                profiles,
-                            )
-
-                            retry_options = {
-
-                                "title":
-                                    enable_title,
-
-                                "short_title":
-                                    enable_short_title,
-
-                                "highlight":
-                                    enable_highlight,
-
-                                "bullet":
-                                    enable_bullet,
-
-                                "description":
-                                    enable_description,
-
-                                "seo":
-                                    enable_seo,
-
-                                "optimize_images":
-                                    enable_images,
-
-                                "max_workers":
-                                    4,
-
-                            }
-
-                            start_worker(
-
-                                retry_records,
-
-                                retry_task_id,
-
-                                api_key,
-
-                                model,
-
-                                retry_options,
-
-                            )
-
-                            save_current_task(
-                                retry_task_id
-                            )
-
-                            st.session_state["task_started"] = True
-                            st.session_state["current_task"] = retry_task_id
-
-                            st.success(
-                                f"重试任务已启动：{retry_task_id}"
-                                f"（本次只重跑 {len(retry_records)} 个失败产品）"
-                            )
-
-                            st.rerun()
-
-                st.caption(
-                    "说明：重试只调用 AI 处理失败的产品，已成功的产品不会重跑、不重复消耗 token；"
-                    "导出的 Excel 会自动合并新旧结果。"
-                )
+            render_retry_failed_button("diag")
 
             for failed_index, item in enumerate(failed_items, 1):
                 if not isinstance(item, dict):
