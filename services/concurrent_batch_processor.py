@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import os
 import shutil
 import time
@@ -187,6 +188,78 @@ def _cleanup_child(parent_task_id: str, index: int, attempt: int = 1):
         pass
 
 
+# =====================================================
+# 同源变体合并（V2.6.2）
+#
+# 采集表里多变体产品每个变体各占一行，但标题/五点/简介完全相同
+#（只有颜色、图片、SKU 不同）。AI 的输入不含图片和颜色，这些行
+# 跑完整 3 步 AI 只会得到一模一样的结果——15 个变体就花 15 倍
+# token 和时间。
+#
+# 方案：按「标题+五点+简介+短标题+语言」计算内容指纹，指纹相同的
+# 行只对第一行（代表行）跑 AI，其余行克隆代表行的结果，仅替换
+# 各自行份字段（SKU/父SKU/行号）。
+# =====================================================
+
+
+def _source_content_key(record) -> tuple:
+    """喂给 AI 的全部文本源字段构成的内容指纹。"""
+    return (
+        getattr(record, "title", "") or "",
+        tuple(getattr(record, "bullets", ()) or ()),
+        getattr(record, "description", "") or "",
+        getattr(record, "short_title", "") or "",
+        getattr(record, "language", "") or "",
+    )
+
+
+def _build_variant_groups(records) -> tuple[dict, set]:
+    """返回 (members, duplicate_indices)。
+
+    members: 代表行 index -> 同指纹成员行 index 列表（不含代表行自身）
+    duplicate_indices: 所有非代表行的 index 集合（这些行不提交 AI）
+    """
+    representative_of: dict[tuple, int] = {}
+    members: dict[int, list[int]] = {}
+    duplicate_indices: set[int] = set()
+
+    for index, record in enumerate(records):
+        key = _source_content_key(record)
+        rep = representative_of.get(key)
+        if rep is None:
+            representative_of[key] = index
+        else:
+            members.setdefault(rep, []).append(index)
+            duplicate_indices.add(index)
+
+    return members, duplicate_indices
+
+
+def _clone_profile_for_record(profile: dict, record, cloned_from_index: int) -> dict:
+    """深拷贝代表行结果并替换为成员行自己的身份字段。"""
+    clone = copy.deepcopy(profile)
+    source_identity = clone.get("source_identity")
+    if not isinstance(source_identity, dict):
+        source_identity = {}
+    source_identity["sku"] = getattr(record, "sku", "")
+    source_identity["parent_sku"] = getattr(record, "parent_sku", "")
+    source_identity["source_row_index"] = getattr(record, "row_number", None)
+    clone["source_identity"] = source_identity
+    clone["variant_dedupe"] = {"cloned_from_index": cloned_from_index}
+    return clone
+
+
+def _clone_failed_for_record(failed: dict, record, cloned_from_index: int) -> dict:
+    """克隆失败结果并替换为成员行自己的身份字段（保留真实错误信息）。"""
+    clone = dict(failed)
+    clone["index"] = None  # 由调用方按成员 index 覆盖
+    clone["source_row_index"] = getattr(record, "row_number", None)
+    clone["sku"] = getattr(record, "sku", "")
+    clone["title"] = getattr(record, "title", "")
+    clone["variant_dedupe"] = {"cloned_from_index": cloned_from_index}
+    return clone
+
+
 def process_batch_concurrent(
     records,
     task_id,
@@ -200,6 +273,14 @@ def process_batch_concurrent(
 
     total = len(records)
     max_workers = min(_resolve_max_workers(options), max(total, 1))
+
+    # V2.6.2 同源变体合并：默认开启，可用 options["variant_dedupe"]=False 关闭。
+    variant_dedupe_enabled = options.get("variant_dedupe", True)
+    if variant_dedupe_enabled:
+        variant_members, duplicate_indices = _build_variant_groups(records)
+    else:
+        variant_members, duplicate_indices = {}, set()
+    ai_rows = total - len(duplicate_indices)
 
     if total == 0:
         save_status(
@@ -228,7 +309,14 @@ def process_batch_concurrent(
         {
             "task_id": task_id,
             "status": "processing",
-            "message": f"并发优化启动：{max_workers} 个产品 Worker",
+            "message": (
+                f"并发优化启动：{max_workers} 个产品 Worker"
+                + (
+                    f"；同源变体合并：{total} 行只跑 {ai_rows} 次 AI"
+                    if duplicate_indices
+                    else ""
+                )
+            ),
             "completed": 0,
             "total": total,
             "success": 0,
@@ -278,6 +366,12 @@ def process_batch_concurrent(
                 and next_index < total
                 and len(futures) < max_workers
             ):
+                # V2.6.2 同源变体合并：非代表行不提交 AI，
+                # 等代表行完成后直接克隆结果。
+                if next_index in duplicate_indices:
+                    next_index += 1
+                    continue
+
                 record = records[next_index]
                 future = executor.submit(
                     _run_one_record,
@@ -338,6 +432,21 @@ def process_batch_concurrent(
                 if result.get("profile") is not None:
                     profiles_by_index[index] = result["profile"]
                     failed_by_index.pop(index, None)
+
+                    # V2.6.2 同源变体合并：把代表行结果克隆给同指纹成员行。
+                    for member_index in variant_members.get(index, []):
+                        member_record = records[member_index]
+                        clone = _clone_profile_for_record(
+                            result["profile"],
+                            member_record,
+                            cloned_from_index=index,
+                        )
+                        if bool(options.get("optimize_images", False)):
+                            clone["image_result"] = optimize_record_images(
+                                member_record, clone
+                            )
+                        profiles_by_index[member_index] = clone
+                        failed_by_index.pop(member_index, None)
                 else:
                     failed = result.get("failed")
                     if not isinstance(failed, dict):
@@ -353,6 +462,18 @@ def process_batch_concurrent(
                             "error_type": "invalid_future_terminal_result",
                         }
                     failed_by_index[index] = failed
+
+                    # V2.6.2 同源变体合并：代表行失败时，同指纹成员行
+                    # 记录同一失败（保留真实错误信息，重试时可再跑）。
+                    for member_index in variant_members.get(index, []):
+                        member_record = records[member_index]
+                        member_failed = _clone_failed_for_record(
+                            failed,
+                            member_record,
+                            cloned_from_index=index,
+                        )
+                        member_failed["index"] = member_index
+                        failed_by_index[member_index] = member_failed
             ordered_profiles, ordered_failed = persist_parent_results()
             completed = len(ordered_profiles) + len(ordered_failed)
 
