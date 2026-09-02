@@ -58,7 +58,7 @@ from analyzer.title_strategy_generator import (
     TitleStrategyGenerator,
 )
 
-VERSION = "V2.6.0-EMP-1"
+VERSION = "V2.6.0-EMP-2"
 
 
 TASK_RUNNING_STATUS = [
@@ -111,31 +111,41 @@ ADMIN_MODE = _read_secrets_flag(
 def get_saved_provider_key(
     provider_name: str,
 ) -> str:
-    """按服务商读 Secrets 里的密钥（员工模式不再手动填 Key）。"""
+    """严格按服务商读 Secrets 里的密钥。
 
-    names = (
-        ["DEEPSEEK_API_KEY", "OPENAI_API_KEY"]
+    不做跨服务商回退：OpenAI 的 Key 发给 DeepSeek 接口只会得到
+    401 密钥错误，导致整个任务全部失败。配错了宁可显示输入框。
+    """
+
+    name = (
+        "DEEPSEEK_API_KEY"
         if provider_name == "DeepSeek"
-        else ["OPENAI_API_KEY"]
+        else "OPENAI_API_KEY"
     )
 
     try:
 
-        for name in names:
-
-            value = str(
-                st.secrets.get(name, "") or ""
-            ).strip()
-
-            if value:
-
-                return value
+        return str(
+            st.secrets.get(name, "") or ""
+        ).strip()
 
     except Exception:
 
-        pass
+        return ""
 
-    return ""
+
+def get_other_provider_key(
+    provider_name: str,
+) -> str:
+    """对方服务商的密钥——只用来判断"是不是配错了家"，不拿来用。"""
+
+    other = (
+        "OpenAI"
+        if provider_name == "DeepSeek"
+        else "DeepSeek"
+    )
+
+    return get_saved_provider_key(other)
 
 
 # =====================================================
@@ -621,13 +631,9 @@ with st.sidebar:
                 else "到 platform.openai.com 充值并创建 Key"
             )
 
-            # 按服务商读 Secrets：DeepSeek 用 DEEPSEEK_API_KEY，
-            # OpenAI 用 OPENAI_API_KEY（找不到时回退旧配置）。
-            saved_api_key = (
-                get_saved_provider_key(provider)
-                or
-                get_openai_api_key()
-            )
+            # 严格按服务商读对应的 Secrets 密钥（见函数注释：
+            # 跨服务商回退会让错误家的 Key 发给接口，全部 401 失败）。
+            saved_api_key = get_saved_provider_key(provider)
 
             if ADMIN_MODE:
 
@@ -656,13 +662,30 @@ with st.sidebar:
 
                 else:
 
-                    # Secrets 里没配密钥时的兜底：仍然显示输入框，
-                    # 否则员工模式下会没有地方填 Key，任务无法开始。
+                    # Secrets 里没配当前服务商的密钥：显示输入框兜底。
                     api_key = st.text_input(
                         key_label,
                         type="password",
                         key="emp_api_key",
                     ).strip()
+
+                    # 只配了另一家服务商的 Key 时明确提示，
+                    # 避免以为已配置、实际全任务 401 失败。
+                    if get_other_provider_key(provider):
+
+                        needed = (
+                            "DEEPSEEK_API_KEY"
+                            if provider == "DeepSeek"
+                            else "OPENAI_API_KEY"
+                        )
+
+                        st.caption(
+                            f"⚠️ 当前选择 {provider}，但 Secrets 里"
+                            f"只配置了另一家的密钥。用 {provider} 需要"
+                            f"在 Secrets 配置 {needed}；"
+                            "也可以直接在上方输入框里粘贴"
+                            f"{provider} 的 Key。"
+                        )
 
             if not api_key.strip():
                 st.caption(f"💡 {key_hint}")
@@ -973,7 +996,7 @@ st.markdown(
     <div class="app-hero">
         <div class="hero-title">🛒 Amazon AI Listing Optimizer</div>
         <div class="hero-sub">AI 生成标题 · 短标题 · 五点 · 详情 · 商品亮点 · 首图优化</div>
-        <span class="version-pill">V2.6.0{" · 管理模式" if ADMIN_MODE else " · 员工版"}</span>
+        <span class="version-pill">V2.6.0{" · 管理模式" if ADMIN_MODE else " · 基础版"}</span>
     </div>
     """,
     unsafe_allow_html=True,
