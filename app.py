@@ -23,6 +23,7 @@ from services.task_manager import (
     create_task,
     load_status,
 )
+
 from services.task_control import save_control
 
 from services.result_storage import (
@@ -53,7 +54,7 @@ from analyzer.title_strategy_generator import (
     TitleStrategyGenerator,
 )
 
-VERSION = "V2.4.4-Performance-3-Title-Completion"
+VERSION = "V2.5.0-UI-1"
 
 
 TASK_RUNNING_STATUS = [
@@ -67,7 +68,6 @@ TASK_RUNNING_STATUS = [
 DEBUG_MODE = False
 
 
-
 # =====================================================
 # 页面配置
 # =====================================================
@@ -78,6 +78,116 @@ st.set_page_config(
 )
 
 
+# =====================================================
+# 视觉样式（V2.5.0 UI）
+# =====================================================
+
+CUSTOM_CSS = """
+<style>
+.stApp { background: #f6f7f9; }
+
+/* ---- 顶部横幅 ---- */
+.app-hero {
+    background: linear-gradient(120deg, #232F3E 0%, #37475A 78%);
+    color: #ffffff;
+    padding: 26px 32px 22px 32px;
+    border-radius: 16px;
+    margin-bottom: 14px;
+}
+.hero-title { font-size: 30px; font-weight: 800; letter-spacing: 0.5px; }
+.hero-sub { color: #d5dbd1; margin-top: 6px; font-size: 14px; }
+.version-pill {
+    display: inline-block;
+    background: #FF9900;
+    color: #232F3E;
+    font-weight: 700;
+    border-radius: 999px;
+    padding: 3px 14px;
+    font-size: 13px;
+    margin-top: 12px;
+}
+
+/* ---- 流程提示条 ---- */
+.hint-bar {
+    background: #FFF7E6;
+    border: 1px solid #FFD591;
+    border-left: 5px solid #FF9900;
+    border-radius: 10px;
+    padding: 12px 16px;
+    margin: 2px 0 18px 0;
+    font-size: 15px;
+    color: #3b2f00;
+}
+
+/* ---- 新手引导卡片 ---- */
+.guide-card {
+    background: #ffffff;
+    border: 1px solid #e6e8eb;
+    border-radius: 14px;
+    padding: 20px;
+    height: 100%;
+}
+.guide-num {
+    width: 34px; height: 34px;
+    border-radius: 50%;
+    background: #232F3E;
+    color: #FF9900;
+    font-weight: 800;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 16px;
+    margin-bottom: 10px;
+}
+.guide-title { font-size: 16px; font-weight: 700; color: #232F3E; margin-bottom: 6px; }
+.guide-text { font-size: 13px; color: #5b6b7a; line-height: 1.7; }
+
+/* ---- 指标卡 ---- */
+[data-testid="stMetric"] {
+    background: #ffffff;
+    border: 1px solid #e6e8eb;
+    border-radius: 12px;
+    padding: 12px 18px;
+    box-shadow: 0 1px 3px rgba(16, 24, 40, 0.06);
+}
+[data-testid="stMetricLabel"] { font-size: 13px; color: #5b6b7a; }
+[data-testid="stMetricValue"] { font-weight: 800; }
+
+/* ---- 侧边栏 ---- */
+[data-testid="stSidebar"] { border-right: 1px solid #e6e8eb; }
+.side-brand {
+    font-size: 17px; font-weight: 800; color: #232F3E;
+    padding: 6px 2px 2px 2px;
+}
+.side-brand span { color: #FF9900; }
+.side-step {
+    display: flex; align-items: center; gap: 8px;
+    font-weight: 700; font-size: 14px; color: #232F3E;
+    margin: 18px 0 8px 0;
+}
+.step-badge {
+    background: #FF9900; color: #232F3E;
+    border-radius: 50%;
+    min-width: 22px; height: 22px;
+    display: inline-flex; align-items: center; justify-content: center;
+    font-weight: 800; font-size: 12px;
+}
+
+/* ---- 按钮 / 标签页 / 折叠面板 ---- */
+.stButton > button { border-radius: 9px; font-weight: 600; }
+.stTabs [data-baseweb="tab"] { font-weight: 600; padding: 8px 16px; }
+.stTabs [data-baseweb="tab-highlight"] { background: #FF9900; }
+[data-testid="stExpander"] {
+    border: 1px solid #e6e8eb;
+    border-radius: 12px;
+    overflow: hidden;
+}
+[data-testid="stFileUploaderDropzone"] { border-radius: 10px; }
+
+#MainMenu, footer { visibility: hidden; }
+</style>
+"""
+
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
 
 # =====================================================
 # 任务恢复
@@ -86,7 +196,6 @@ st.set_page_config(
 current_task = st.session_state.get(
     "current_task"
 ) or load_current_task()
-
 
 
 # Validate the persisted task pointer.  Failed/completed tasks remain visible
@@ -105,7 +214,6 @@ if current_task:
         current_task = ""
 
 
-
 # =====================================================
 # Highlight展示
 # =====================================================
@@ -114,6 +222,7 @@ if current_task:
 def display_highlights(
     highlight_result
 ):
+
 
     if not highlight_result:
 
@@ -136,6 +245,7 @@ def display_highlights(
                 st.write(
                     "• " + item
                 )
+
 
 
             elif isinstance(
@@ -161,7 +271,7 @@ def display_highlights(
 
 
 # =====================================================
-# 内容展示
+# 内容展示（V2.5.0：含短标题 / 商品亮点 / 首图缩略图）
 # =====================================================
 
 
@@ -169,10 +279,27 @@ def display_generated_content(
     profile
 ):
 
+    if not isinstance(
+        profile,
+        dict,
+    ):
+        return
 
     title = profile.get(
         "generated_title",
         {}
+    )
+
+    short_title_result = (
+        profile.get("short_title_result", {})
+        if isinstance(profile.get("short_title_result", {}), dict)
+        else {}
+    )
+
+    short_title = (
+        short_title_result.get("short_title")
+        or short_title_result.get("title")
+        or ""
     )
 
 
@@ -180,14 +307,17 @@ def display_generated_content(
         "title"
     ):
 
-        st.write(
-            "### AI标题"
-        )
-
+        st.markdown("#### 🏷️ AI 标题")
 
         st.write(
             title["title"]
         )
+
+        if short_title:
+            st.markdown(
+                f"**短标题：** {str(short_title)}"
+            )
+
 
 
 
@@ -205,9 +335,7 @@ def display_generated_content(
 
     if bullets:
 
-        st.write(
-            "### AI五点"
-        )
+        st.markdown("#### 📋 AI 五点")
 
 
         for item in bullets:
@@ -217,6 +345,14 @@ def display_generated_content(
                 +
                 str(item)
             )
+
+
+
+    highlight_result = profile.get("highlight_result", {})
+
+    if highlight_result:
+        st.markdown("#### ✨ 商品亮点")
+        display_highlights(highlight_result)
 
 
 
@@ -230,9 +366,7 @@ def display_generated_content(
         "description"
     ):
 
-        st.write(
-            "### AI详情"
-        )
+        st.markdown("#### 📄 AI 详情")
 
 
         st.write(
@@ -241,366 +375,429 @@ def display_generated_content(
 
 
 
-# =====================================================
-# 页面主体
-# =====================================================
+    image_result = (
+        profile.get("image_result", {})
+        if isinstance(profile.get("image_result", {}), dict)
+        else {}
+    )
 
+    if (
+        image_result.get("status") == "success"
+        and image_result.get("main_image_optimized")
+    ):
 
-st.title(
-    "Amazon AI Listing Optimizer"
-)
+        st.markdown("#### 🖼️ 优化首图")
 
-
-st.caption(
-    VERSION
-)
-
-
-st.info(
-    "基于 AI 商品理解生成标题、五点、详情和商品亮点。"
-    "采用 Worker 后台任务模式，避免长任务导致页面阻塞。"
-)
-
-
-
-# =====================================================
-# 上传文件
-# =====================================================
-
-
-uploaded = st.file_uploader(
-    "上传 Excel",
-    type=["xlsx"],
-    key="main_excel_uploader"
-)
-
-if uploaded is None:
-    # 文件被移除后主动释放解析缓存，避免 Session 长期保留整份工作簿对象。
-    st.session_state.pop("excel_fingerprint", None)
-    st.session_state.pop("excel_envelope", None)
-    st.session_state.pop("excel_bytes", None)
-    st.session_state.pop("excel_name", None)
-
-
-if uploaded is not None:
-
-    excel_bytes = uploaded.getvalue()
-    file_fingerprint = hashlib.sha1(excel_bytes).hexdigest()
-
-    st.session_state["excel_name"] = uploaded.name
-    st.session_state["excel_bytes"] = excel_bytes
-
-    cached_fingerprint = st.session_state.get("excel_fingerprint")
-    cached_envelope = st.session_state.get("excel_envelope")
-
-    try:
-        if cached_fingerprint == file_fingerprint and cached_envelope is not None:
-            envelope = cached_envelope
-        else:
-            envelope = read_workbook(
-                uploaded.name,
-                excel_bytes,
+        try:
+            st.image(
+                str(image_result["main_image_optimized"]),
+                width=280,
             )
-            st.session_state["excel_fingerprint"] = file_fingerprint
-            st.session_state["excel_envelope"] = envelope
+        except Exception:
+            st.caption(
+                str(image_result["main_image_optimized"])
+            )
 
-    except Exception as exc:
+
+# =====================================================
+# 页面：侧边栏（全部操作，按步骤编号）
+# =====================================================
+
+MODULE_TEXT_KEYS = [
+    "enable_title",
+    "enable_short_title",
+    "enable_highlight",
+    "enable_bullet",
+    "enable_description",
+    "enable_seo",
+]
+
+MODULE_ALL_KEYS = MODULE_TEXT_KEYS + ["enable_images"]
+
+uploaded = None
+envelope = None
+api_key = ""
+model = "gpt-4.1-mini"
+
+with st.sidebar:
+
+    st.markdown(
+        '<div class="side-brand">🛒 Amazon <span>AI</span> Optimizer</div>',
+        unsafe_allow_html=True,
+    )
+
+    # --------------------------------------------
+    # 第 1 步：上传 Excel
+    # --------------------------------------------
+
+    st.markdown(
+        '<div class="side-step"><span class="step-badge">1</span> 上传 Excel</div>',
+        unsafe_allow_html=True,
+    )
+
+    uploaded = st.file_uploader(
+        "上传 Excel",
+        type=["xlsx"],
+        key="main_excel_uploader"
+    )
+
+    if uploaded is None:
+        # 文件被移除后主动释放解析缓存，避免 Session 长期保留整份工作簿对象。
         st.session_state.pop("excel_fingerprint", None)
         st.session_state.pop("excel_envelope", None)
-        st.error(
-            f"读取文件失败：{exc}"
-        )
-        st.stop()
+        st.session_state.pop("excel_bytes", None)
+        st.session_state.pop("excel_name", None)
 
 
-    st.success(
-        f"读取成功："
-        f"{len(envelope.records)} 个产品"
-    )
+    if uploaded is not None:
 
+        excel_bytes = uploaded.getvalue()
+        file_fingerprint = hashlib.sha1(excel_bytes).hexdigest()
 
+        st.session_state["excel_name"] = uploaded.name
+        st.session_state["excel_bytes"] = excel_bytes
 
-    # =================================================
-    # API KEY
-    # =================================================
+        cached_fingerprint = st.session_state.get("excel_fingerprint")
+        cached_envelope = st.session_state.get("excel_envelope")
 
+        try:
+            if cached_fingerprint == file_fingerprint and cached_envelope is not None:
+                envelope = cached_envelope
+            else:
+                envelope = read_workbook(
+                    uploaded.name,
+                    excel_bytes,
+                )
+                st.session_state["excel_fingerprint"] = file_fingerprint
+                st.session_state["excel_envelope"] = envelope
 
-    saved_api_key = get_openai_api_key()
-
-
-    manual_api_key = st.text_input(
-        "OpenAI API Key",
-        type="password",
-    )
-
-
-    api_key = (
-        manual_api_key.strip()
-        or
-        saved_api_key
-    )
-
-
-    model = st.text_input(
-        "模型",
-        value="gpt-4.1-mini"
-    )
-
-
-
-    # =================================================
-    # 优化模块选择
-    # =================================================
-
-
-    st.subheader(
-        "优化内容选择"
-    )
-
-
-    enable_title = st.checkbox(
-        "优化标题",
-        True
-    )
-
-
-    enable_short_title = st.checkbox(
-        "优化短标题",
-        True
-    )
-
-
-    enable_highlight = st.checkbox(
-        "优化商品亮点",
-        True
-    )
-
-
-    enable_bullet = st.checkbox(
-        "优化五点描述",
-        True
-    )
-
-
-    enable_description = st.checkbox(
-        "优化详情描述",
-        True
-    )
-
-
-    enable_seo = st.checkbox(
-        "优化SEO关键词",
-        True
-    )
-
-
-    enable_images = st.checkbox(
-        "优化首图（V1.3.2 稳定基线）",
-        False,
-        help="仅优化第一张主图；其他图片保留。图片失败不会影响文字优化结果。"
-        "需要配置 Cloudinary Secrets（CLOUDINARY_CLOUD_NAME / API_KEY / API_SECRET），"
-        "否则图片上传会失败。",
-    )
-
-
-
-    # =================================================
-    # 开始任务
-    # =================================================
-
-
-    current_status = None
-
-
-    if current_task:
-
-
-        current_status = load_status(
-            current_task
-        )
-
-
-
-    button_disabled = False
-
-
-
-    if st.session_state.get(
-        "task_started",
-        False
-    ):
-    
-        if current_status:
-    
-            if current_status.get("status") in [
-                "processing",
-                "running",
-                "created"
-            ]:
-    
-                button_disabled = True
-
-
-
-    if current_status:
-
-
-        if current_status.get(
-            "status"
-        ) in TASK_RUNNING_STATUS:
-
-            button_disabled = True
-
-
-
-    if st.button(
-        "开始 AI 商品理解",
-        type="primary",
-        disabled=button_disabled,
-    ):
-
-
-        if not api_key:
-
-
+        except Exception as exc:
+            st.session_state.pop("excel_fingerprint", None)
+            st.session_state.pop("excel_envelope", None)
             st.error(
-                "请输入 OpenAI API Key"
+                f"读取文件失败：{exc}"
+            )
+            envelope = None
+
+        if envelope is not None:
+
+            st.success(
+                f"读取成功："
+                f"{len(envelope.records)} 个产品"
+            )
+
+            # ----------------------------------------
+            # 第 2 步：API 配置
+            # ----------------------------------------
+
+            st.markdown(
+                '<div class="side-step"><span class="step-badge">2</span> API 配置</div>',
+                unsafe_allow_html=True,
+            )
+
+            saved_api_key = get_openai_api_key()
+
+            manual_api_key = st.text_input(
+                "OpenAI API Key",
+                type="password",
+            )
+
+            api_key = (
+                manual_api_key.strip()
+                or
+                saved_api_key
+            )
+
+            model = st.text_input(
+                "模型",
+                value="gpt-4.1-mini"
+            )
+
+            # ----------------------------------------
+            # 第 3 步：优化模块
+            # ----------------------------------------
+
+            st.markdown(
+                '<div class="side-step"><span class="step-badge">3</span> 优化模块</div>',
+                unsafe_allow_html=True,
+            )
+
+            quick_a, quick_b, quick_c = st.columns(3)
+
+            if quick_a.button("全选", key="quick_select_all", use_container_width=True):
+                for key in MODULE_ALL_KEYS:
+                    st.session_state[key] = True
+                st.rerun()
+
+            if quick_b.button("仅文字", key="quick_text_only", use_container_width=True):
+                for key in MODULE_TEXT_KEYS:
+                    st.session_state[key] = True
+                st.session_state["enable_images"] = False
+                st.rerun()
+
+            if quick_c.button("清空", key="quick_clear_all", use_container_width=True):
+                for key in MODULE_ALL_KEYS:
+                    st.session_state[key] = False
+                st.rerun()
+
+            enable_title = st.checkbox(
+                "优化标题",
+                True,
+                key="enable_title",
+            )
+
+            enable_short_title = st.checkbox(
+                "优化短标题",
+                True,
+                key="enable_short_title",
             )
 
 
-            st.stop()
-
-
-
-        task_id = create_task(
-
-            total_products=len(
-                envelope.records
-            ),
-
-            filename=uploaded.name,
-
-        )
-
-
-
-        save_current_task(
-            task_id
-        )
-
-
-
-        options = {
-
-
-            "title":
-                enable_title,
-
-
-            "short_title":
-                enable_short_title,
-
-
-            "highlight":
-                enable_highlight,
-
-
-            "bullet":
-                enable_bullet,
-
-
-            "description":
-                enable_description,
-
-
-            "seo":
-                enable_seo,
-
-            "optimize_images":
-                enable_images,
-
-            # Internal safe default for product-level concurrency.
-            "max_workers":
-                4,
-
-        }
-
-
-        # 首图优化依赖 Cloudinary 上传。缺配置时提前告知，
-        # 否则图片会全部静默失败，看起来像"没有起作用"。
-        if options.get("optimize_images") and not cloudinary_ready():
-
-            st.warning(
-                "已开启首图优化，但未配置 Cloudinary Secrets"
-                "（CLOUDINARY_CLOUD_NAME / CLOUDINARY_API_KEY / "
-                "CLOUDINARY_API_SECRET）。"
-                "所有图片上传都会失败，文字优化不受影响。"
-                "请先在环境变量或 Streamlit Secrets 中配置。"
+            enable_highlight = st.checkbox(
+                "优化商品亮点",
+                True,
+                key="enable_highlight",
             )
 
 
+            enable_bullet = st.checkbox(
+                "优化五点描述",
+                True,
+                key="enable_bullet",
+            )
 
-        start_worker(
 
-            envelope.records,
+            enable_description = st.checkbox(
+                "优化详情描述",
+                True,
+                key="enable_description",
+            )
 
-            task_id,
 
-            api_key,
+            enable_seo = st.checkbox(
+                "优化SEO关键词",
+                True,
+                key="enable_seo",
+            )
 
-            model,
 
-            options,
+            enable_images = st.checkbox(
+                "优化首图（V1.3.2 稳定基线）",
+                False,
+                key="enable_images",
+                help="仅优化第一张主图；其他图片保留。图片失败不会影响文字优化结果。"
+                "需要配置 Cloudinary Secrets（CLOUDINARY_CLOUD_NAME / API_KEY / API_SECRET），"
+                "否则图片上传会失败。",
+            )
 
+            # ----------------------------------------
+            # 第 4 步：开始任务
+            # ----------------------------------------
+
+            st.markdown(
+                '<div class="side-step"><span class="step-badge">4</span> 开始任务</div>',
+                unsafe_allow_html=True,
+            )
+
+            current_status = None
+
+
+            if current_task:
+
+
+                current_status = load_status(
+                    current_task
+                )
+
+
+
+            button_disabled = False
+
+
+
+            if st.session_state.get(
+                "task_started",
+                False
+            ):
+
+                if current_status:
+
+                    if current_status.get("status") in [
+                        "processing",
+                        "running",
+                        "created"
+                    ]:
+
+                        button_disabled = True
+
+
+
+            if current_status:
+
+                if current_status.get(
+                    "status"
+                ) in TASK_RUNNING_STATUS:
+
+                    button_disabled = True
+
+
+            if st.button(
+                "🚀 开始 AI 商品理解",
+                type="primary",
+                disabled=button_disabled,
+                use_container_width=True,
+            ):
+
+
+                if not api_key:
+
+                    st.error(
+                        "请输入 OpenAI API Key"
+                    )
+
+                    st.stop()
+
+
+
+                task_id = create_task(
+
+                    total_products=len(
+                        envelope.records
+                    ),
+
+                    filename=uploaded.name,
+
+                )
+
+
+
+                save_current_task(
+                    task_id
+                )
+
+
+
+                options = {
+
+                    "title":
+                        enable_title,
+
+                    "short_title":
+                        enable_short_title,
+
+                    "highlight":
+                        enable_highlight,
+
+                    "bullet":
+                        enable_bullet,
+
+                    "description":
+                        enable_description,
+
+                    "seo":
+                        enable_seo,
+
+                    "optimize_images":
+                        enable_images,
+
+                    # Internal safe default for product-level concurrency.
+                    "max_workers":
+                        4,
+
+                }
+
+                # 首图优化依赖 Cloudinary 上传。缺配置时提前告知，
+                # 否则图片会全部静默失败，看起来像"没有起作用"。
+                if options.get("optimize_images") and not cloudinary_ready():
+
+                    st.warning(
+                        "已开启首图优化，但未配置 Cloudinary Secrets"
+                        "（CLOUDINARY_CLOUD_NAME / CLOUDINARY_API_KEY / "
+                        "CLOUDINARY_API_SECRET）。"
+                        "所有图片上传都会失败，文字优化不受影响。"
+                        "请先在环境变量或 Streamlit Secrets 中配置。"
+                    )
+
+
+                start_worker(
+
+                    envelope.records,
+
+                    task_id,
+
+                    api_key,
+
+                    model,
+
+                    options,
+
+                )
+
+
+
+                st.session_state[
+                    "task_started"
+                ] = True
+
+
+
+                save_current_task(
+                    task_id
+                )
+
+
+                st.session_state["current_task"] = task_id
+
+                st.success(
+                    f"任务已启动：{task_id}"
+                )
+
+                st.info(
+                    "AI 正在后台运行，可以刷新页面查看状态。"
+                )
+
+                st.rerun()
+
+    else:
+
+        st.caption(
+            "上传后，API 配置和优化模块会出现在这里。"
         )
 
-
-
-        st.session_state[
-            "task_started"
-        ] = True
-
-
-
-        save_current_task(
-            task_id
-        )
-        
-        
-        st.session_state["current_task"] = task_id
-        
-        
-        st.success(
-            f"任务已启动：{task_id}"
-        )
-        
-        
-        st.info(
-            "AI 正在后台运行，可以刷新页面查看状态。"
-        )
-
-        st.rerun()
 
 # =====================================================
-# 当前任务状态
+# 页面主体：横幅 + 流程提示
 # =====================================================
 
+st.markdown(
+    """
+    <div class="app-hero">
+        <div class="hero-title">🛒 Amazon AI Listing Optimizer</div>
+        <div class="hero-sub">AI 生成标题 · 短标题 · 五点 · 详情 · 商品亮点 · 首图优化</div>
+        <span class="version-pill">V2.5.0</span>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# =====================================================
+# 任务数据加载
+# =====================================================
 
 profiles = []
+status = None
 
 
 if current_task:
-
 
     status = load_status(
         current_task
     )
 
-
     profiles = load_profiles(
         current_task
     )
-
 
     if DEBUG_MODE:
         st.caption(
@@ -608,121 +805,280 @@ if current_task:
         )
 
 
-    if status:
+# =====================================================
+# V2.4.4 Failure Observability
+#
+# A failed product must be visible as a terminal result.
+# Do not hide failure diagnostics inside profiles-only JSON.
+# =====================================================
+
+failed_items = load_failed_items(
+    current_task
+) if current_task else []
+
+if DEBUG_MODE:
+    st.caption(
+        f"DEBUG: success={len(profiles)} / failed={len(failed_items)}"
+    )
+
+terminal_success = len(profiles)
+terminal_failed = len(failed_items)
+terminal_completed = terminal_success + terminal_failed
+
+if current_task:
+    expected_total = (
+        status.get("total")
+        or
+        status.get("total_products")
+        or
+        0
+    )
+else:
+    expected_total = 0
 
 
-        st.subheader(
-            "任务状态"
+# =====================================================
+# 流程提示条（告诉用户当前该做什么）
+# =====================================================
+
+if uploaded is None and not current_task:
+
+    hint_html = "👈 <b>第 1 步：</b>在左侧上传 Excel 文件开始"
+
+elif uploaded is not None and not api_key.strip():
+
+    hint_html = "👈 <b>第 2 步：</b>在左侧填写 OpenAI API Key"
+
+elif status and status.get("status") in TASK_RUNNING_STATUS:
+
+    completed_now = status.get("completed", 0)
+    total_now = (
+        status.get("total")
+        or status.get("total_products")
+        or 0
+    )
+    hint_html = (
+        f"⏳ AI 处理中：{completed_now} / {total_now}，"
+        "可以离开页面，稍后回来点「刷新任务状态」。"
+    )
+
+elif status and status.get("status") in {"completed", "cancelled", "failed"} and profiles:
+
+    hint_html = "✅ 任务已完成 → 切到「⬇️ 导出」标签页下载优化结果"
+
+elif uploaded is None and current_task:
+
+    hint_html = "📎 任务里有结果，但当前没有上传原 Excel — 请重新上传原文件才能导出"
+
+elif uploaded is not None:
+
+    hint_html = "👈 <b>第 3 步：</b>选好左侧优化模块，点「🚀 开始 AI 商品理解」"
+
+else:
+
+    hint_html = "👈 在左侧上传 Excel 文件开始"
+
+
+st.markdown(
+    f'<div class="hint-bar">{hint_html}</div>',
+    unsafe_allow_html=True,
+)
+
+
+# =====================================================
+# 新手引导（没有任务时显示）
+# =====================================================
+
+if not current_task and not profiles:
+
+    g1, g2, g3 = st.columns(3)
+
+    with g1:
+        st.markdown(
+            """
+            <div class="guide-card">
+                <div class="guide-num">1</div>
+                <div class="guide-title">📤 上传 Excel</div>
+                <div class="guide-text">
+                在左侧边栏上传采集插件导出的 xlsx 文件，
+                系统会自动识别产品数量。
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
-        if st.button("刷新任务状态"):
 
-            st.session_state.pop(
-                "current_task",
-                None
-            )
-        
-            st.rerun()
-        col1, col2, col3 = st.columns(3)
-        
-        
+    with g2:
+        st.markdown(
+            """
+            <div class="guide-card">
+                <div class="guide-num">2</div>
+                <div class="guide-title">🔑 配置并开始</div>
+                <div class="guide-text">
+                填写 OpenAI API Key，勾选要优化的模块
+                （标题 / 短标题 / 五点 / 亮点 / 详情 / 首图），
+                点「开始 AI 商品理解」。
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with g3:
+        st.markdown(
+            """
+            <div class="guide-card">
+                <div class="guide-num">3</div>
+                <div class="guide-title">⬇️ 导出结果</div>
+                <div class="guide-text">
+                任务完成后切到「导出」标签页，
+                下载优化后的 Excel（含短标题、商品亮点、
+                优化首图）或诊断 JSON。
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
+# =====================================================
+# 工作区：指标 + 标签页
+# =====================================================
+
+if current_task and status:
+
+    # --------------------------------------------
+    # 指标卡行
+    # --------------------------------------------
+
+    status_value = status.get(
+        "status",
+        ""
+    )
+
+    message = status.get(
+        "message",
+        ""
+    )
+
+    completed = status.get(
+        "completed",
+        0
+    )
+
+    total = (
+        status.get("total")
+        or
+        status.get("total_products")
+        or
+        0
+    )
+
+    success_count = status.get("success", len(profiles))
+    failed_count = status.get("failed", 0)
+
+    m1, m2, m3, m4, m5 = st.columns(5)
+
+    with m1:
+        st.metric("产品总数", total)
+
+    with m2:
+        st.metric("已完成", completed)
+
+    with m3:
+        st.metric("成功", success_count)
+
+    with m4:
+        st.metric("失败", failed_count)
+
+    with m5:
+        st.metric("状态", status_value or "-")
+
+    if total:
+        st.progress(
+            min(completed / total, 1.0),
+            text=f"进度 {completed} / {total}",
+        )
+
+    # --------------------------------------------
+    # 标签页
+    # --------------------------------------------
+
+    tab_status, tab_preview, tab_images, tab_export, tab_diag = st.tabs(
+        [
+            "📊 任务状态",
+            "📝 结果预览",
+            "🖼️ 图片优化",
+            "⬇️ 导出",
+            "🚨 失败诊断",
+        ]
+    )
+
+    # =============================================
+    # 标签页 1：任务状态
+    # =============================================
+
+    with tab_status:
+
+        col1, col2, col3, col4 = st.columns(4)
+
         with col1:
-        
+            if st.button("🔄 刷新任务状态", use_container_width=True):
+                st.session_state.pop(
+                    "current_task",
+                    None
+                )
+                st.rerun()
+
+        with col2:
             if st.button(
-                "暂停任务"
+                "⏸️ 暂停任务",
+                use_container_width=True,
             ):
-        
                 save_control(
                     current_task,
                     "pause"
                 )
-        
                 st.warning(
                     "暂停请求已发送"
                 )
-        
-        
-        
-        with col2:
-        
+
+        with col3:
             if st.button(
-                "继续任务"
+                "▶️ 继续任务",
+                use_container_width=True,
             ):
-        
                 save_control(
                     current_task,
                     "running"
                 )
-        
                 st.success(
                     "继续请求已发送"
                 )
-        
-        
-        
-        with col3:
-        
+
+        with col4:
             if st.button(
-                "取消任务"
+                "⛔ 取消任务",
+                use_container_width=True,
             ):
-        
                 save_control(
                     current_task,
                     "cancel"
                 )
-        
                 st.error(
                     "取消请求已发送"
                 )
-        status_value = status.get(
-            "status",
-            ""
-        )
-
-
-        message = status.get(
-            "message",
-            ""
-        )
-
-
-        completed = status.get(
-            "completed",
-            0
-        )
-
-
-        total = (
-            status.get("total")
-            or
-            status.get("total_products")
-            or
-            0
-        )
-
-
-        success_count = status.get("success", len(profiles))
-        failed_count = status.get("failed", 0)
 
         st.info(
             f"""
-状态：
+    状态：{status_value}
 
-{status_value}
+    消息：{message}
 
+    进度：{completed} / {total}
 
-消息：
-
-{message}
-
-
-进度：
-
-{completed}
-/
-{total}
-
-成功：{success_count}    失败：{failed_count}
-"""
+    成功：{success_count}    失败：{failed_count}
+    """
         )
 
         api_calls = status.get("api_calls", 0)
@@ -736,7 +1092,6 @@ if current_task:
                 f"重试：{api_retries}｜并发：{active_workers}/{max_workers}"
             )
 
-
         if status_value in {"completed", "cancelled", "failed"}:
             st.session_state["task_started"] = False
             if st.button("关闭当前任务", key="close_current_task"):
@@ -745,301 +1100,176 @@ if current_task:
                 st.session_state["task_started"] = False
                 st.rerun()
 
+        if expected_total:
+            if terminal_completed == expected_total:
+                st.caption(
+                    f"结果闭环：{terminal_success} 成功 + "
+                    f"{terminal_failed} 失败 = {expected_total} 总数"
+                )
+            else:
+                st.error(
+                    f"结果未闭环：成功 {terminal_success} + 失败 {terminal_failed} "
+                    f"= {terminal_completed}，但任务总数为 {expected_total}。"
+                )
 
         if status.get(
             "traceback"
         ):
 
-
             st.error(
                 "任务运行错误"
             )
-
 
             st.code(
                 status.get(
                     "traceback"
                 )
             )
-# =====================================================
-# 显示优化结果
-# =====================================================
-
-failed_items = load_failed_items(
-    current_task
-) if current_task else []
-
-if DEBUG_MODE:
-    st.caption(
-        f"DEBUG: success={len(profiles)} / failed={len(failed_items)}"
-    )
-
-
-# =====================================================
-# Title Strategy 测试
-# 临时验证 AI 标题策略能力
-# =====================================================
-
-with st.expander(
-    "Title Strategy 测试"
-):
 
     # =============================================
-    # 必须先确认已经有优化结果
+    # 标签页 2：结果预览
     # =============================================
 
-    if not profiles:
+    with tab_preview:
 
-        st.info(
-            "暂无可测试的产品，请先完成至少 1 个产品的 AI 商品理解。"
-        )
+        if not profiles:
 
-    else:
-
-        # =============================================
-        # 测试产品选择
-        #
-        # 默认：
-        # 有 3 个及以上产品 → 使用第 3 个产品
-        # 不足 3 个产品 → 使用当前最后一个已完成产品
-        #
-        # 这样不会再出现 profiles[2] IndexError。
-        # =============================================
-
-        if len(profiles) >= 3:
-
-            test_index = 2
+            st.info(
+                "暂无可预览的产品，请先完成至少 1 个产品的 AI 商品理解。"
+            )
 
         else:
 
-            test_index = len(profiles) - 1
+            st.success(
+                f"已完成 {len(profiles)} 个产品优化（默认展示前 3 个）"
+            )
 
+            for index, profile in enumerate(
+                profiles[:3]
+            ):
 
-        test_profile = profiles[
-            test_index
-        ]
+                with st.expander(
+                    f"产品 {index + 1}"
+                ):
 
-
-        st.caption(
-            f"当前测试产品：产品 {test_index + 1}"
-        )
-
-
-        if st.button(
-            "生成 Title Strategy",
-            key="title_strategy_test",
-        ):
-
-            try:
-
-                api_key = get_openai_api_key()
-
-
-                if not api_key:
-
-                    st.error(
-                        "未找到 OpenAI API Key"
+                    display_generated_content(
+                        profile
                     )
+
+            # ----------------------------------------
+            # Title Strategy 测试
+            # 临时验证 AI 标题策略能力
+            # ----------------------------------------
+
+            with st.expander(
+                "🧪 Title Strategy 测试"
+            ):
+
+                # 必须先确认已经有优化结果
+                if len(profiles) >= 3:
+
+                    test_index = 2
 
                 else:
 
-                    strategy_result = (
-                        TitleStrategyGenerator.generate(
-                            test_profile,
-                            api_key,
-                        )
-                    )
+                    test_index = len(profiles) - 1
 
 
-                    st.subheader(
-                        "Title Strategy 输出"
-                    )
+                test_profile = profiles[
+                    test_index
+                ]
 
-
-                    st.json(
-                        strategy_result
-                    )
-
-
-            except Exception as exc:
-
-                st.error(
-                    f"Title Strategy 测试失败：{exc}"
+                st.caption(
+                    f"当前测试产品：产品 {test_index + 1}"
                 )
 
-# =====================================================
-# V2.4.4 Failure Observability
-#
-# A failed product must be visible as a terminal result.
-# Do not hide failure diagnostics inside profiles-only JSON.
-# =====================================================
 
-terminal_success = len(profiles)
-terminal_failed = len(failed_items)
-terminal_completed = terminal_success + terminal_failed
+                if st.button(
+                    "生成 Title Strategy",
+                    key="title_strategy_test",
+                ):
 
-if current_task:
-    current_status = load_status(current_task) or {}
-    expected_total = (
-        current_status.get("total")
-        or current_status.get("total_products")
-        or 0
-    )
-else:
-    current_status = {}
-    expected_total = 0
+                    try:
 
-if expected_total:
-    if terminal_completed == expected_total:
-        st.caption(
-            f"结果闭环：{terminal_success} 成功 + "
-            f"{terminal_failed} 失败 = {expected_total} 总数"
-        )
-    else:
-        st.error(
-            f"结果未闭环：成功 {terminal_success} + 失败 {terminal_failed} "
-            f"= {terminal_completed}，但任务总数为 {expected_total}。"
-        )
+                        strategy_api_key = get_openai_api_key()
 
-if failed_items:
-    with st.expander(
-        f"失败产品（{len(failed_items)}）— 点击查看真实错误",
-        expanded=True,
-    ):
-        for failed_index, item in enumerate(failed_items, 1):
-            if not isinstance(item, dict):
-                st.error(f"失败记录 {failed_index}: {item}")
-                continue
 
-            row_index = item.get("source_row_index", "")
-            sku = item.get("sku", "")
-            title = item.get("title", "")
-            error_type = item.get("error_type", "")
-            error = item.get("error", "")
-            attempt = item.get("attempt", item.get("attempts", ""))
-            max_attempts = item.get("max_attempts", "")
+                        if not strategy_api_key:
 
-            st.markdown(
-                f"**失败 {failed_index}｜Excel 行：{row_index or '-'}｜"
-                f"SKU：{sku or '-'}**"
+                            st.error(
+                                "未找到 OpenAI API Key"
+                            )
+
+                        else:
+
+                            strategy_result = (
+                                TitleStrategyGenerator.generate(
+                                    test_profile,
+                                    strategy_api_key,
+                                )
+                            )
+
+
+                            st.subheader(
+                                "Title Strategy 输出"
+                            )
+
+                            st.json(
+                                strategy_result
+                            )
+
+
+                    except Exception as exc:
+
+                        st.error(
+                            f"Title Strategy 测试失败：{exc}"
+                        )
+
+    # =============================================
+    # 标签页 3：图片优化
+    # =============================================
+
+    with tab_images:
+
+        image_results = [
+            (index, profile.get("image_result"))
+            for index, profile in enumerate(
+                profiles,
+                1,
             )
-            if title:
-                st.caption(title)
-            st.code(
-                "\n".join(
-                    [
-                        f"error_type: {error_type or '-'}",
-                        f"error: {error or '-'}",
-                        (
-                            f"attempt: {attempt}/{max_attempts}"
-                            if max_attempts
-                            else f"attempts: {attempt or '-'}"
-                        ),
-                    ]
-                ),
-                language="text",
+            if isinstance(
+                profile,
+                dict,
             )
-
-        failure_report = {
-            "task_id": current_task,
-            "status": current_status,
-            "summary": {
-                "success": terminal_success,
-                "failed": terminal_failed,
-                "completed": terminal_completed,
-                "expected_total": expected_total,
-                "closed": (
-                    terminal_completed == expected_total
-                    if expected_total
-                    else None
-                ),
-            },
-            "failed_items": failed_items,
-        }
-
-        st.download_button(
-            "下载失败诊断 JSON",
-            data=json.dumps(
-                failure_report,
-                ensure_ascii=False,
-                indent=2,
-            ).encode("utf-8"),
-            file_name="failed_items_diagnostic.json",
-            mime="application/json",
-            key="download_failed_diagnostic_json",
-        )
-if profiles:
-
-
-    st.success(
-        f"已完成 {len(profiles)} 个产品优化"
-    )
-
-
-    st.subheader(
-        "AI优化结果预览"
-    )
-
-
-
-    # 默认展示前3个，避免页面卡顿
-
-    for index, profile in enumerate(
-        profiles[:3]
-    ):
-
-
-        with st.expander(
-            f"产品 {index + 1}"
-        ):
-
-
-            display_generated_content(
-                profile
+            and isinstance(
+                profile.get("image_result"),
+                dict,
             )
-
-
-    # =================================================
-    # 图片优化状态
-    #
-    # 图片失败以前完全静默：不写入导出、页面无提示。
-    # 这里把每个产品的图片处理结果显示出来。
-    # =================================================
-
-    image_results = [
-        (index, profile.get("image_result"))
-        for index, profile in enumerate(
-            profiles,
-            1,
-        )
-        if isinstance(
-            profile,
-            dict,
-        )
-        and isinstance(
-            profile.get("image_result"),
-            dict,
-        )
-    ]
-
-    if image_results:
-
-        failed_images = [
-            (index, result)
-            for index, result in image_results
-            if result.get("status") != "success"
         ]
 
-        with st.expander(
-            f"图片优化状态（成功 "
-            f"{len(image_results) - len(failed_images)} / "
-            f"失败 {len(failed_images)}）",
-            expanded=bool(failed_images),
-        ):
+        if not image_results:
+
+            st.info(
+                "本次任务没有图片处理记录：可能未开启「优化首图」，"
+                "或任务尚未处理到图片。开启前需配置 Cloudinary Secrets。"
+            )
+
+        else:
+
+            failed_images = [
+                (index, result)
+                for index, result in image_results
+                if result.get("status") != "success"
+            ]
+
+            st.markdown(
+                f"**图片优化：成功 {len(image_results) - len(failed_images)}"
+                f" / 失败 {len(failed_images)}**"
+            )
 
             for index, result in image_results:
 
-                status = result.get(
+                img_status = result.get(
                     "status",
                     "",
                 )
@@ -1049,19 +1279,25 @@ if profiles:
                     "",
                 )
 
-                if status == "success":
+                if img_status == "success":
 
                     st.markdown(
                         f"✅ 产品 {index}｜{sku or '-'}｜"
                         f"{result.get('transform', '')}"
                     )
 
-                    st.caption(
-                        result.get(
-                            "main_image_optimized",
-                            "",
+                    try:
+                        st.image(
+                            str(result.get("main_image_optimized", "")),
+                            width=260,
                         )
-                    )
+                    except Exception:
+                        st.caption(
+                            result.get(
+                                "main_image_optimized",
+                                "",
+                            )
+                        )
 
                 else:
 
@@ -1074,240 +1310,279 @@ if profiles:
                         "原因："
                         + str(
                             result.get("error")
-                            or status
+                            or img_status
                             or "-"
                         )
                     )
 
+    # =============================================
+    # 标签页 4：导出
+    # =============================================
 
+    with tab_export:
 
-    # =================================================
-    # 导出 JSON
-    # =================================================
+        # ----------------------------------------
+        # AI 优化结果 Excel
+        # ----------------------------------------
 
+        if profiles and uploaded is not None and envelope is not None:
 
-    # Profiles-only JSON is kept for backward compatibility.
-    st.download_button(
+            try:
 
-        "下载 Product Profile JSON",
-
-        data=json.dumps(
-            profiles,
-            ensure_ascii=False,
-            indent=2,
-        ).encode(
-            "utf-8"
-        ),
-
-        file_name=
-        "product_profiles_v2.4.4.json",
-
-        mime=
-        "application/json",
-
-    )
-
-
-    # Complete task diagnostic export:
-    # success + failed + task status.  This is the file to use when
-    # investigating any missing/failed product because profiles-only JSON
-    # intentionally contains successful profiles only.
-    complete_task_report = {
-        "task_id": current_task,
-        "status": current_status,
-        "summary": {
-            "success": len(profiles),
-            "failed": len(failed_items),
-            "completed": len(profiles) + len(failed_items),
-            "expected_total": expected_total,
-            "closed": (
-                len(profiles) + len(failed_items) == expected_total
-                if expected_total
-                else None
-            ),
-        },
-        "profiles": profiles,
-        "failed_items": failed_items,
-    }
-
-    st.download_button(
-        "下载完整任务诊断 JSON",
-        data=json.dumps(
-            complete_task_report,
-            ensure_ascii=False,
-            indent=2,
-        ).encode("utf-8"),
-        file_name="product_task_diagnostic_v2.4.4.json",
-        mime="application/json",
-        key="download_complete_task_diagnostic_json",
-    )
-
-
-
-    # =================================================
-    # 导出 Excel
-    # =================================================
-
-
-    st.subheader(
-        "AI优化结果导出"
-    )
-
-
-    try:
-
-
-       if uploaded is not None:
-
-            optimized_export = ListingExporter.export_unified(
-                envelope.dataframe,
-                profiles,
-            )
-
-
-            if hasattr(
-                optimized_export,
-                "getvalue"
-            ):
-
-
-                optimized_data = (
-                    optimized_export.getvalue()
+                optimized_export = ListingExporter.export_unified(
+                    envelope.dataframe,
+                    profiles,
                 )
 
+                if hasattr(
+                    optimized_export,
+                    "getvalue"
+                ):
 
-            else:
+                    optimized_data = (
+                        optimized_export.getvalue()
+                    )
 
+                else:
 
-                optimized_data = optimized_export
+                    optimized_data = optimized_export
 
+                safe_stem = re.sub(
+                    r"\.xlsx$",
+                    "",
+                    uploaded.name,
+                    flags=re.I,
+                )
 
+                st.download_button(
+                    "⬇️ 导出 AI 优化结果（Excel）",
+                    data=optimized_data,
+                    file_name=
+                    f"{safe_stem}_{VERSION}_AI优化结果.xlsx",
+                    mime=
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary",
+                )
 
-            safe_stem = re.sub(
+                st.caption(
+                    "包含：AI 标题 / 短标题 / 五点 / 详情 / 商品亮点 / 优化首图链接。"
+                    "模板缺少的列会自动补在表格最右侧。"
+                )
 
-                r"\.xlsx$",
+            except Exception as exc:
 
-                "",
+                st.error(
+                    f"生成优化文件失败：{exc}"
+                )
 
-            uploaded.name,
+        elif uploaded is None:
 
-            flags=re.I,
-
-        )
-
-
-
-            st.download_button(
-    
-                "导出 AI 优化结果",
-    
-    
-                data=optimized_data,
-    
-    
-                file_name=
-                f"{safe_stem}_{VERSION}_AI优化结果.xlsx",
-    
-    
-                mime=
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    
-    
-                type="primary",
-    
+            st.warning(
+                "需要重新上传原始 Excel 文件才能导出（导出基于原表格写入）。"
             )
-    
-
-
-    except Exception as exc:
-
-
-        st.error(
-            f"生成优化文件失败：{exc}"
-        )
-
-
-
-# =====================================================
-# 原文件完整性测试
-# =====================================================
-
-
-if uploaded is not None:
-
-
-    st.subheader(
-        "原文件完整性导出"
-    )
-
-
-    try:
-
-
-        unchanged_export = export_unchanged(
-            envelope
-        )
-
-
-        integrity = integrity_report(
-            envelope,
-            unchanged_export,
-        )
-
-
-        if integrity["byte_identical"]:
-
-
-            st.success(
-                "验证通过：原文件完整性保持一致"
-            )
-
-
-
-            safe_stem = re.sub(
-
-                r"\.xlsx$",
-
-                "",
-
-                uploaded.name,
-
-                flags=re.I,
-
-            )
-
-
-
-            st.download_button(
-
-                "导出原文件完整性测试文件",
-
-
-                data=unchanged_export,
-
-
-                file_name=
-                f"{safe_stem}_{VERSION}_原样导出.xlsx",
-
-
-                mime=
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-
-            )
-
 
         else:
 
-
-            st.error(
-                "原文件完整性验证失败"
+            st.info(
+                "暂无优化结果可导出，请先运行任务。"
             )
 
+        st.divider()
 
+        # ----------------------------------------
+        # JSON 导出
+        # ----------------------------------------
 
-    except Exception as exc:
+        if profiles:
 
+            st.markdown("**📄 JSON 导出**")
 
-        st.error(
-            f"完整性测试失败：{exc}"
-        )
+            # Profiles-only JSON is kept for backward compatibility.
+            st.download_button(
+
+                "下载 Product Profile JSON",
+
+                data=json.dumps(
+                    profiles,
+                    ensure_ascii=False,
+                    indent=2,
+                ).encode(
+                    "utf-8"
+                ),
+
+                file_name=
+                "product_profiles_v2.4.4.json",
+
+                mime=
+                "application/json",
+            )
+
+            # Complete task diagnostic export:
+            # success + failed + task status.  This is the file to use when
+            # investigating any missing/failed product because profiles-only JSON
+            # intentionally contains successful profiles only.
+            complete_task_report = {
+                "task_id": current_task,
+                "status": status,
+                "summary": {
+                    "success": len(profiles),
+                    "failed": len(failed_items),
+                    "completed": len(profiles) + len(failed_items),
+                    "expected_total": expected_total,
+                    "closed": (
+                        len(profiles) + len(failed_items) == expected_total
+                        if expected_total
+                        else None
+                    ),
+                },
+                "profiles": profiles,
+                "failed_items": failed_items,
+            }
+
+            st.download_button(
+                "下载完整任务诊断 JSON",
+                data=json.dumps(
+                    complete_task_report,
+                    ensure_ascii=False,
+                    indent=2,
+                ).encode("utf-8"),
+                file_name="product_task_diagnostic_v2.4.4.json",
+                mime="application/json",
+                key="download_complete_task_diagnostic_json",
+            )
+
+        # ----------------------------------------
+        # 原文件完整性测试
+        # ----------------------------------------
+
+        if uploaded is not None and envelope is not None:
+
+            st.divider()
+
+            st.markdown("**🧾 原文件完整性导出**")
+
+            try:
+
+                unchanged_export = export_unchanged(
+                    envelope
+                )
+
+                integrity = integrity_report(
+                    envelope,
+                    unchanged_export,
+                )
+
+                if integrity["byte_identical"]:
+
+                    st.success(
+                        "验证通过：原文件完整性保持一致"
+                    )
+
+                    safe_stem = re.sub(
+                        r"\.xlsx$",
+                        "",
+                        uploaded.name,
+                        flags=re.I,
+                    )
+
+                    st.download_button(
+                        "导出原文件完整性测试文件",
+                        data=unchanged_export,
+                        file_name=
+                        f"{safe_stem}_{VERSION}_原样导出.xlsx",
+                        mime=
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    )
+
+                else:
+
+                    st.error(
+                        "原文件完整性验证失败"
+                    )
+
+            except Exception as exc:
+
+                st.error(
+                    f"完整性测试失败：{exc}"
+                )
+
+    # =============================================
+    # 标签页 5：失败诊断
+    # =============================================
+
+    with tab_diag:
+
+        if not failed_items:
+
+            st.success(
+                "🎉 本次任务没有失败产品。"
+            )
+
+        else:
+
+            st.markdown(
+                f"**失败产品（{len(failed_items)}）— 真实错误如下**"
+            )
+
+            for failed_index, item in enumerate(failed_items, 1):
+                if not isinstance(item, dict):
+                    st.error(f"失败记录 {failed_index}: {item}")
+                    continue
+
+                row_index = item.get("source_row_index", "")
+                sku = item.get("sku", "")
+                title = item.get("title", "")
+                error_type = item.get("error_type", "")
+                error = item.get("error", "")
+                attempt = item.get("attempt", item.get("attempts", ""))
+                max_attempts = item.get("max_attempts", "")
+
+                st.markdown(
+                    f"**失败 {failed_index}｜Excel 行：{row_index or '-'}｜"
+                    f"SKU：{sku or '-'}**"
+                )
+                if title:
+                    st.caption(title)
+                st.code(
+                    "\n".join(
+                        [
+                            f"error_type: {error_type or '-'}",
+                            f"error: {error or '-'}",
+                            (
+                                f"attempt: {attempt}/{max_attempts}"
+                                if max_attempts
+                                else f"attempts: {attempt or '-'}"
+                            ),
+                        ]
+                    ),
+                    language="text",
+                )
+
+            failure_report = {
+                "task_id": current_task,
+                "status": status,
+                "summary": {
+                    "success": terminal_success,
+                    "failed": terminal_failed,
+                    "completed": terminal_completed,
+                    "expected_total": expected_total,
+                    "closed": (
+                        terminal_completed == expected_total
+                        if expected_total
+                        else None
+                    ),
+                },
+                "failed_items": failed_items,
+            }
+
+            st.download_button(
+                "下载失败诊断 JSON",
+                data=json.dumps(
+                    failure_report,
+                    ensure_ascii=False,
+                    indent=2,
+                ).encode("utf-8"),
+                file_name="failed_items_diagnostic.json",
+                mime="application/json",
+                key="download_failed_diagnostic_json",
+            )
