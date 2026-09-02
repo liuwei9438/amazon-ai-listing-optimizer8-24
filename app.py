@@ -21,10 +21,13 @@ from services.config import get_openai_api_key
 
 from services.task_manager import (
     create_task,
+    get_task_dir,
     load_status,
 )
 
 from services.task_control import save_control
+
+from services.json_storage import load_json, save_json
 
 from services.result_storage import (
     load_profiles,
@@ -54,7 +57,7 @@ from analyzer.title_strategy_generator import (
     TitleStrategyGenerator,
 )
 
-VERSION = "V2.5.0-UI-1"
+VERSION = "V2.5.0-UI-2"
 
 
 TASK_RUNNING_STATUS = [
@@ -513,6 +516,11 @@ with st.sidebar:
                 value="gpt-4.1-mini"
             )
 
+            st.caption(
+                "💡 换 DeepSeek：模型填 deepseek-chat，"
+                "并在 Secrets 里加一行 OPENAI_BASE_URL = \"https://api.deepseek.com\""
+            )
+
             # ----------------------------------------
             # 第 3 步：优化模块
             # ----------------------------------------
@@ -786,6 +794,7 @@ st.markdown(
 # =====================================================
 
 profiles = []
+base_profiles = []
 status = None
 
 
@@ -799,9 +808,34 @@ if current_task:
         current_task
     )
 
+    # 重试任务继承：base_profiles.json 保存的是重试前已成功的产品。
+    # 当前任务的 profiles 与之合并后，导出/预览即可同时包含新旧结果。
+    base_path = get_task_dir(current_task) / "base_profiles.json"
+    if base_path.exists():
+        base_profiles = load_json(
+            base_path,
+            default=[],
+        )
+        if not isinstance(base_profiles, list):
+            base_profiles = []
+
+    if base_profiles:
+        merged = {}
+        for item in base_profiles + profiles:
+            if not isinstance(item, dict):
+                continue
+            identity = item.get("source_identity")
+            row_index = (
+                identity.get("source_row_index")
+                if isinstance(identity, dict)
+                else None
+            )
+            merged[row_index if row_index is not None else id(item)] = item
+        profiles = list(merged.values())
+
     if DEBUG_MODE:
         st.caption(
-            f"DEBUG: task={current_task}, success={len(profiles)}"
+            f"DEBUG: task={current_task}, success={len(profiles)}, base={len(base_profiles)}"
         )
 
 
@@ -827,11 +861,14 @@ terminal_completed = terminal_success + terminal_failed
 
 if current_task:
     expected_total = (
-        status.get("total")
-        or
-        status.get("total_products")
-        or
-        0
+        (
+            status.get("total")
+            or
+            status.get("total_products")
+            or
+            0
+        )
+        + len(base_profiles)
     )
 else:
     expected_total = 0
@@ -860,6 +897,13 @@ elif status and status.get("status") in TASK_RUNNING_STATUS:
     hint_html = (
         f"⏳ AI 处理中：{completed_now} / {total_now}，"
         "可以离开页面，稍后回来点「刷新任务状态」。"
+    )
+
+elif status and status.get("status") in {"completed", "cancelled", "failed"} and failed_items:
+
+    hint_html = (
+        f"🔁 有 {len(failed_items)} 个失败产品 → "
+        "切到「🚨 失败诊断」标签页点「重新优化」"
     )
 
 elif status and status.get("status") in {"completed", "cancelled", "failed"} and profiles:
@@ -961,20 +1005,27 @@ if current_task and status:
         ""
     )
 
-    completed = status.get(
-        "completed",
-        0
+    completed = (
+        status.get(
+            "completed",
+            0
+        )
+        + len(base_profiles)
     )
 
     total = (
-        status.get("total")
-        or
-        status.get("total_products")
-        or
-        0
+        (
+            status.get("total")
+            or
+            status.get("total_products")
+            or
+            0
+        )
+        + len(base_profiles)
     )
 
-    success_count = status.get("success", len(profiles))
+    # 成功数直接用合并后的 profiles（含重试任务继承的旧成果）。
+    success_count = len(profiles)
     failed_count = status.get("failed", 0)
 
     m1, m2, m3, m4, m5 = st.columns(5)
@@ -1523,6 +1574,155 @@ if current_task and status:
             st.markdown(
                 f"**失败产品（{len(failed_items)}）— 真实错误如下**"
             )
+
+            # ----------------------------------------
+            # 重新优化失败产品
+            #
+            # 只重跑失败的产品：已成功的不重复调用 AI。
+            # 新任务通过 base_profiles.json 继承旧的成功结果，
+            # 导出时自动合并，不需要手动拼文件。
+            # ----------------------------------------
+
+            task_is_idle = bool(
+                status
+                and status.get("status") not in TASK_RUNNING_STATUS
+            )
+
+            if uploaded is None or envelope is None:
+
+                st.info(
+                    "💡 想重新优化这些失败产品：请在左侧重新上传原 Excel 文件后，"
+                    "这里会出现「重新优化」按钮。"
+                )
+
+            elif not task_is_idle:
+
+                st.caption(
+                    "任务运行中，等任务结束后才能重新优化失败产品。"
+                )
+
+            else:
+
+                if st.button(
+                    f"🔄 重新优化这 {len(failed_items)} 个失败产品",
+                    type="primary",
+                    key="retry_failed_products",
+                ):
+
+                    if not api_key.strip():
+
+                        st.error(
+                            "请先在左侧填写 OpenAI API Key"
+                        )
+
+                    else:
+
+                        failed_rows = {
+                            item.get("source_row_index")
+                            for item in failed_items
+                            if isinstance(item, dict)
+                            and item.get("source_row_index") is not None
+                        }
+
+                        failed_skus = {
+                            str(item.get("sku") or "").strip()
+                            for item in failed_items
+                            if isinstance(item, dict)
+                            and str(item.get("sku") or "").strip()
+                        }
+
+                        retry_records = [
+                            record
+                            for record in envelope.records
+                            if (
+                                getattr(record, "row_number", None) in failed_rows
+                            )
+                            or (
+                                bool(str(getattr(record, "sku") or "").strip())
+                                and str(getattr(record, "sku") or "").strip() in failed_skus
+                            )
+                        ]
+
+                        if not retry_records:
+
+                            st.error(
+                                "无法在当前 Excel 里定位这些失败产品"
+                                "（行号/SKU 对不上）。请确认上传的是原任务用的同一个文件。"
+                            )
+
+                        else:
+
+                            retry_task_id = create_task(
+                                total_products=len(retry_records),
+                                filename=uploaded.name,
+                            )
+
+                            # 继承全部已成功结果（含更早重试继承来的）。
+                            save_json(
+                                get_task_dir(retry_task_id) / "base_profiles.json",
+                                profiles,
+                            )
+
+                            retry_options = {
+
+                                "title":
+                                    enable_title,
+
+                                "short_title":
+                                    enable_short_title,
+
+                                "highlight":
+                                    enable_highlight,
+
+                                "bullet":
+                                    enable_bullet,
+
+                                "description":
+                                    enable_description,
+
+                                "seo":
+                                    enable_seo,
+
+                                "optimize_images":
+                                    enable_images,
+
+                                "max_workers":
+                                    4,
+
+                            }
+
+                            start_worker(
+
+                                retry_records,
+
+                                retry_task_id,
+
+                                api_key,
+
+                                model,
+
+                                retry_options,
+
+                            )
+
+                            save_current_task(
+                                retry_task_id
+                            )
+
+                            st.session_state["task_started"] = True
+                            st.session_state["current_task"] = retry_task_id
+
+                            st.success(
+                                f"重试任务已启动：{retry_task_id}"
+                                f"（本次只重跑 {len(retry_records)} 个失败产品）"
+                            )
+
+                            st.rerun()
+
+                st.caption(
+                    "说明：重试只调用 AI 处理失败的产品，已成功的产品不会重跑、不重复消耗 token；"
+                    "导出的 Excel 会自动合并新旧结果。"
+                )
 
             for failed_index, item in enumerate(failed_items, 1):
                 if not isinstance(item, dict):
