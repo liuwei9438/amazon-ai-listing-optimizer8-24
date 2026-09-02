@@ -8,6 +8,8 @@ from .title_priority_planner_prompt import (
     build_title_priority_planner_prompt,
 )
 
+from services.ai_client import get_openai_base_url
+
 
 class TitlePriorityPlannerError(Exception):
     pass
@@ -66,6 +68,7 @@ class TitlePriorityPlannerGenerator:
 
         client = OpenAI(
             api_key=api_key,
+            base_url=get_openai_base_url() or None,
             timeout=90,
             max_retries=0,
         )
