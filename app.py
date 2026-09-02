@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 
 import pandas as pd
@@ -57,7 +58,7 @@ from analyzer.title_strategy_generator import (
     TitleStrategyGenerator,
 )
 
-VERSION = "V2.5.0-UI-2"
+VERSION = "V2.5.0-UI-3"
 
 
 TASK_RUNNING_STATUS = [
@@ -421,6 +422,7 @@ uploaded = None
 envelope = None
 api_key = ""
 model = "gpt-4.1-mini"
+provider = "OpenAI"
 
 with st.sidebar:
 
@@ -498,10 +500,54 @@ with st.sidebar:
                 unsafe_allow_html=True,
             )
 
+            # ----------------------------------------
+            # AI 服务商选择：OpenAI 官方 / DeepSeek
+            #
+            # 选择结果通过环境变量注入给后台任务线程；
+            # 任务运行中锁定选择，避免中途换服务商导致请求发错地方。
+            # ----------------------------------------
+
+            task_running_now = False
+
+            if current_task:
+                _running_status = load_status(current_task)
+                task_running_now = bool(
+                    _running_status
+                    and _running_status.get("status") in TASK_RUNNING_STATUS
+                )
+
+            provider = st.radio(
+                "AI 服务商",
+                ["OpenAI", "DeepSeek"],
+                index=0,
+                horizontal=True,
+                key="ai_provider",
+                disabled=task_running_now,
+                help="DeepSeek 更便宜、国内直连；OpenAI 为原默认配置。"
+                "任务运行中不可切换。",
+            )
+
+            if provider == "DeepSeek":
+                os.environ["OPENAI_BASE_URL"] = "https://api.deepseek.com"
+            else:
+                os.environ["OPENAI_BASE_URL"] = "https://api.openai.com/v1"
+
+            key_label = (
+                "DeepSeek API Key"
+                if provider == "DeepSeek"
+                else "OpenAI API Key"
+            )
+
+            key_hint = (
+                "到 platform.deepseek.com 充值并创建 Key"
+                if provider == "DeepSeek"
+                else "到 platform.openai.com 充值并创建 Key"
+            )
+
             saved_api_key = get_openai_api_key()
 
             manual_api_key = st.text_input(
-                "OpenAI API Key",
+                key_label,
                 type="password",
             )
 
@@ -511,14 +557,27 @@ with st.sidebar:
                 saved_api_key
             )
 
-            model = st.text_input(
-                "模型",
-                value="gpt-4.1-mini"
+            if not api_key.strip():
+                st.caption(f"💡 {key_hint}")
+
+            # 模型名跟随服务商自动切换（用户自定义过的模型名不会被动）。
+            default_model = (
+                "deepseek-chat"
+                if provider == "DeepSeek"
+                else "gpt-4.1-mini"
             )
 
-            st.caption(
-                "💡 换 DeepSeek：模型填 deepseek-chat，"
-                "并在 Secrets 里加一行 OPENAI_BASE_URL = \"https://api.deepseek.com\""
+            if st.session_state.get("model_input") in (
+                None,
+                "",
+                "gpt-4.1-mini",
+                "deepseek-chat",
+            ):
+                st.session_state["model_input"] = default_model
+
+            model = st.text_input(
+                "模型",
+                key="model_input",
             )
 
             # ----------------------------------------
@@ -884,7 +943,10 @@ if uploaded is None and not current_task:
 
 elif uploaded is not None and not api_key.strip():
 
-    hint_html = "👈 <b>第 2 步：</b>在左侧填写 OpenAI API Key"
+    hint_html = (
+        f"👈 <b>第 2 步：</b>在左侧填写 API Key"
+        f"（当前服务商：{provider}）"
+    )
 
 elif status and status.get("status") in TASK_RUNNING_STATUS:
 
