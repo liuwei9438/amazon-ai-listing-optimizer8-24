@@ -47,6 +47,13 @@ from services.task_worker import (
     start_worker,
 )
 
+from services.user_auth import (
+    is_admin_user,
+    log_user_event,
+    render_sidebar_badge,
+    require_login,
+)
+
 
 from services.listing_exporter import (
     ListingExporter,
@@ -58,7 +65,7 @@ from analyzer.title_strategy_generator import (
     TitleStrategyGenerator,
 )
 
-VERSION = "V2.6.0-EMP-2"
+VERSION = "V2.6.2-EMP"
 
 
 TASK_RUNNING_STATUS = [
@@ -105,7 +112,7 @@ def _read_secrets_flag(name: str) -> bool:
 
 ADMIN_MODE = _read_secrets_flag(
     "ADMIN_MODE"
-)
+) or is_admin_user()
 
 
 def get_saved_provider_key(
@@ -267,6 +274,13 @@ CUSTOM_CSS = """
 """
 
 st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+
+# =====================================================
+# V2.6.2 账号门：Secrets 配置 app_users 后启用
+# =====================================================
+
+require_login()
 
 
 # =====================================================
@@ -517,6 +531,8 @@ with st.sidebar:
         '<div class="side-brand">🛒 Amazon <span>AI</span> Optimizer</div>',
         unsafe_allow_html=True,
     )
+
+    render_sidebar_badge()
 
     # --------------------------------------------
     # 第 1 步：上传 Excel
@@ -940,6 +956,16 @@ with st.sidebar:
                         "请先在环境变量或 Streamlit Secrets 中配置。"
                     )
 
+
+                log_user_event(
+                    "task_start",
+                    task_id=task_id,
+                    rows=len(envelope.records),
+                    model=model,
+                    filename=str(
+                        st.session_state.get("excel_name", "")
+                    ),
+                )
 
                 start_worker(
 
@@ -1407,6 +1433,13 @@ if current_task and status:
 
                         }
 
+                        log_user_event(
+                            "task_retry",
+                            task_id=retry_task_id,
+                            rows=len(retry_records),
+                            model=model,
+                        )
+
                         start_worker(
 
                             retry_records,
@@ -1521,6 +1554,10 @@ if current_task and status:
                     type="primary",
                     key="emp_download_excel",
                     use_container_width=True,
+                    on_click=lambda: log_user_event(
+                        "export",
+                        rows=len(profiles),
+                    ),
                 )
 
                 st.caption(
