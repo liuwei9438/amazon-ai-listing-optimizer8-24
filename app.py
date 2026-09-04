@@ -2,12 +2,14 @@ from __future__ import annotations
 
 
 import hashlib
+import io
 import json
 import os
 import re
 
 import pandas as pd
 import streamlit as st
+from openpyxl import Workbook
 
 
 from core import (
@@ -48,6 +50,8 @@ from services.task_worker import (
 )
 
 from services.user_auth import (
+    current_dept,
+    get_dept_api_key,
     is_admin_user,
     log_user_event,
     render_sidebar_badge,
@@ -65,7 +69,66 @@ from analyzer.title_strategy_generator import (
     TitleStrategyGenerator,
 )
 
-VERSION = "V2.6.2-EMP"
+VERSION = "V2.7.0-EMP"
+
+# 采集插件「发送到优化」复制的数据列头（与插件导出 Excel 完全一致）
+COLLECTOR_HEADERS = [
+    "父SKU(必填)", "SKU", "库存", "币种", "成本价(必填)", "运费",
+    "材料", "包装材料", "语言", "标题(必填)", "颜色",
+    "要点1", "要点2", "要点3", "要点4", "要点5",
+    "简介", "产品图", "简介图", "参考网址",
+]
+
+
+class _PastedFile:
+    """把粘贴数据包装成 file_uploader 返回的文件对象。"""
+
+    def __init__(self, name: str, data: bytes):
+        self.name = name
+        self._data = data
+
+    def getvalue(self) -> bytes:
+        return self._data
+
+
+def _pasted_text_to_xlsx(text: str):
+    """把插件复制的 JSON 转成内存 xlsx（复用 read_workbook 全链路）。
+
+    返回 (bytes, None) 或 (None, 错误信息)。
+    """
+    text = str(text or "").strip()
+    if not text:
+        return None, "请先粘贴内容"
+
+    try:
+        data = json.loads(text)
+    except Exception:
+        return None, "粘贴的内容不是有效 JSON（请用插件面板的「发送到优化」按钮复制）"
+
+    rows = data.get("rows") if isinstance(data, dict) else data
+    if not isinstance(rows, list) or not rows:
+        return None, "粘贴内容里没有产品行"
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "导入产品模板"
+    sheet.append(COLLECTOR_HEADERS)
+
+    kept = 0
+    for row in rows[:2000]:
+        if not isinstance(row, dict):
+            continue
+        sheet.append(
+            [str(row.get(header, "") or "") for header in COLLECTOR_HEADERS]
+        )
+        kept += 1
+
+    if not kept:
+        return None, "粘贴内容里没有可识别的产品行"
+
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    return buffer.getvalue(), None
 
 
 TASK_RUNNING_STATUS = [
@@ -549,12 +612,49 @@ with st.sidebar:
         key="main_excel_uploader"
     )
 
+    # --------------------------------------------
+    # 粘贴导入：采集插件「发送到优化」→ 这里 Ctrl+V
+    # --------------------------------------------
+    if uploaded is None and st.session_state.get("paste_bytes"):
+        uploaded = _PastedFile(
+            "采集插件粘贴.xlsx",
+            st.session_state["paste_bytes"],
+        )
+
+    with st.expander("📋 从采集插件粘贴（免导出 Excel）"):
+        paste_text = st.text_area(
+            "在采集插件面板点「发送到优化」，然后回到这里粘贴（Ctrl+V）",
+            key="paste_box",
+            height=110,
+        )
+        paste_col1, paste_col2 = st.columns(2)
+        if paste_col1.button(
+            "解析粘贴数据",
+            key="parse_paste_btn",
+            use_container_width=True,
+        ):
+            paste_xlsx, paste_error = _pasted_text_to_xlsx(paste_text)
+            if paste_error:
+                st.session_state.pop("paste_bytes", None)
+                st.error(paste_error)
+            else:
+                st.session_state["paste_bytes"] = paste_xlsx
+                st.rerun()
+        if paste_col2.button(
+            "清除粘贴",
+            key="clear_paste_btn",
+            use_container_width=True,
+        ):
+            st.session_state.pop("paste_bytes", None)
+            st.rerun()
+
     if uploaded is None:
         # 文件被移除后主动释放解析缓存，避免 Session 长期保留整份工作簿对象。
         st.session_state.pop("excel_fingerprint", None)
         st.session_state.pop("excel_envelope", None)
         st.session_state.pop("excel_bytes", None)
         st.session_state.pop("excel_name", None)
+        st.session_state.pop("paste_bytes", None)
 
 
     if uploaded is not None:
@@ -666,11 +766,25 @@ with st.sidebar:
 
             else:
 
-                # 员工模式：密钥由管理员配置在 Secrets 里，
-                # 页面上不出现输入框，员工全程接触不到密钥。
+                # 员工模式密钥来源优先级：
+                # 本部门 Key（总号在看板自助填写）> Secrets 全局 Key > 手动输入兜底。
                 api_key = saved_api_key
+                api_source = "global"
 
-                if api_key:
+                emp_dept = current_dept()
+                if emp_dept:
+                    dept_key = get_dept_api_key(emp_dept)
+                    if dept_key:
+                        api_key = dept_key
+                        api_source = "dept"
+
+                if api_source == "dept":
+
+                    st.success(
+                        f"✅ API 已配置（{emp_dept} 部门 Key）"
+                    )
+
+                elif api_key:
 
                     st.success(
                         "✅ API 已配置"
