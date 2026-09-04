@@ -49,14 +49,35 @@ from services.task_worker import (
     start_worker,
 )
 
-from services.user_auth import (
-    current_dept,
-    get_dept_api_key,
-    is_admin_user,
-    log_user_event,
-    render_sidebar_badge,
-    require_login,
-)
+try:
+    from services.user_auth import (
+        current_dept,
+        get_dept_api_key,
+        is_admin_user,
+        log_user_event,
+        render_sidebar_badge,
+        require_login,
+    )
+except BaseException as _ua_err:
+    # 临时诊断：把真实报错显示在页面上（排查完会删掉这段）
+    import os as _os
+    import sys as _sys
+    import streamlit as _st
+    try:
+        _st.set_page_config(page_title="优化程序")
+    except Exception:
+        pass
+    _st.write("Python:", _sys.version)
+    _st.write("Streamlit:", _st.__version__)
+    _p = "services/user_auth.py"
+    _st.write(
+        "user_auth 存在:",
+        _os.path.isfile(_p),
+        "大小:",
+        _os.path.getsize(_p) if _os.path.isfile(_p) else "-",
+    )
+    _st.exception(_ua_err)
+    _st.stop()
 
 
 from services.listing_exporter import (
