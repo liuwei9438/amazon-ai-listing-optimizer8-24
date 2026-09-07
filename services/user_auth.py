@@ -14,7 +14,7 @@ import streamlit as st
 
 
 # =====================================================
-# V2.7.0 账号门 + 部门（防外传白嫖 / 一套账号管两个软件）
+# V2.7.1 账号门 + 小组（防外传白嫖 / 一套账号管两个软件）
 #
 # 两种验证后端，Secrets 里配哪种就用哪种：
 #
@@ -31,9 +31,10 @@ import streamlit as st
 #
 # 两种都不配 = 不启用登录门（开发/内网行为）。
 #
-# 部门：Worker 侧账号带 dept / head 字段；本部门 API Key
-# 由部门总号在 看板(Worker地址/dashboard) 自助填写，
-# get_dept_api_key() 供 app.py 在员工模式下取 Key。
+# 小组：Worker 侧账号带 dept / head（组长）字段；本组 API Key
+# 由组长在 小组看板(Worker地址/dashboard) 自助填写并选择属于
+# OpenAI 还是 DeepSeek；get_dept_key_info() 供 app.py 在员工模式
+# 下取 Key + 服务商（组员侧自动锁定服务商，防发错家全部 401）。
 #
 # 按账号记账：本地 tasks/usage_log.jsonl + 上报 Worker 部门动态。
 # =====================================================
@@ -194,25 +195,28 @@ def _worker_login(
     return "denied", data
 
 
-def get_dept_api_key(dept: str) -> str:
-    """取本部门的 API Key（总号在看板上自助填写的那把）。
+def get_dept_key_info(dept: str):
+    """取本小组的 API Key 和服务商，返回 (key, provider)。
 
+    组长在小组看板上自助填写，保存时选了这把 Key 属于
+    OpenAI 还是 DeepSeek，provider 就是那个选择
+    （"openai" / "deepseek"）。Key 被清空时 provider 也为空。
     需要 Secrets 同时配 auth_server + auth_admin_key。
-    取不到（没配/没部门/网络问题）返回空串，调用方回退全局 Key。
+    取不到（没配/没组/网络问题）返回 ("", "")。
     每个 Streamlit 会话只取一次。
     """
     dept = str(dept or "").strip().lower()
     if not dept:
-        return ""
+        return "", ""
 
     cache = st.session_state.get("_dept_key_cache")
     if cache and cache[0] == dept:
-        return cache[1]
+        return cache[1], cache[2]
 
     server = _worker_server()
     admin_key = _secrets_str("auth_admin_key")
     if not server or not admin_key:
-        return ""
+        return "", ""
 
     data = _worker_post(
         server,
@@ -225,10 +229,26 @@ def get_dept_api_key(dept: str) -> str:
         timeout=6,
     )
     key = ""
+    provider = ""
     if isinstance(data, dict) and data.get("ok"):
         key = str(data.get("key") or "").strip()
+        if key:
+            provider = (
+                "deepseek"
+                if str(
+                    data.get("provider") or ""
+                ).strip().lower()
+                == "deepseek"
+                else "openai"
+            )
 
-    st.session_state["_dept_key_cache"] = (dept, key)
+    st.session_state["_dept_key_cache"] = (dept, key, provider)
+    return key, provider
+
+
+def get_dept_api_key(dept: str) -> str:
+    """兼容旧调用：只取小组 Key 本身。"""
+    key, _provider = get_dept_key_info(dept)
     return key
 
 
@@ -475,8 +495,8 @@ def render_sidebar_badge() -> None:
 
     marks = []
     if current_dept():
-        head_mark = " · 总号" if is_dept_head() else ""
-        marks.append(f" · {current_dept()}部{head_mark}")
+        head_mark = " · 组长" if is_dept_head() else ""
+        marks.append(f" · {current_dept()}组{head_mark}")
     if is_admin_user():
         marks.append(" · 管理员")
 
