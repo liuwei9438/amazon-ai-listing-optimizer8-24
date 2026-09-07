@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 
+import base64
 import hashlib
+import hmac as _hmac
 import json
 import secrets as _pysecrets
 import time
@@ -14,6 +16,10 @@ import streamlit as st
 
 
 # =====================================================
+# V2.7.2 登录态持久化：登录成功后把会话（HMAC 签名，7 天有效）写进
+# 页面地址 ?wzauth=…，刷新/重开浏览器自动恢复，不再一刷新就掉登录。
+# 退出请点「切换账号」（会清掉地址栏 token）。
+#
 # V2.7.1 账号门 + 小组（防外传白嫖 / 一套账号管两个软件）
 #
 # 两种验证后端，Secrets 里配哪种就用哪种：
@@ -48,6 +54,13 @@ HASH_ITERATIONS = 260_000
 # 连续失败 5 次后锁定 60 秒（同一浏览器会话内，本地计数）。
 MAX_FAILS_BEFORE_LOCK = 5
 LOCK_SECONDS = 60
+
+# V2.7.2 登录态 7 天免刷新：登录成功后把会话（HMAC 签名）写进
+# 页面地址 ?wzauth=…，刷新/重开浏览器时验签恢复，不再一刷新就掉登录。
+# 签名密钥只用服务器端 Secrets（auth_admin_key；本地账号模式用账号
+# 表哈希派生），token 无法伪造。带 token 的链接等同于登录态，勿外发。
+SESSION_QUERY_KEY = "wzauth"
+SESSION_MAX_AGE_SECONDS = 7 * 86400
 
 # 优化程序事件 → Worker 部门动态里的事件名
 WORKER_EVENT_MAP = {
@@ -346,6 +359,145 @@ def log_user_event(event: str, **fields) -> None:
         pass
 
 
+def _session_secret() -> str:
+    """会话签名密钥：优先 Secrets 的 auth_admin_key；没配时用本地
+    账号表哈希派生。两种部署都能签名，密钥永远不出服务器。"""
+    secret = _secrets_str("auth_admin_key")
+    if secret:
+        return secret
+    users = _load_users()
+    if users:
+        material = "|".join(
+            f"{name}:{users[name]}" for name in sorted(users)
+        )
+        return hashlib.sha256(
+            material.encode("utf-8")
+        ).hexdigest()
+    return ""
+
+
+def _b64encode(raw: bytes) -> str:
+    return (
+        base64.urlsafe_b64encode(raw)
+        .decode("ascii")
+        .rstrip("=")
+    )
+
+
+def _b64decode(text: str) -> bytes:
+    padding = "=" * (-len(text) % 4)
+    return base64.urlsafe_b64decode(text + padding)
+
+
+def _sign_session(payload: dict) -> str:
+    """payload -> body.sig（HMAC-SHA256）。没有密钥时返回空串。"""
+    secret = _session_secret()
+    if not secret:
+        return ""
+    body = _b64encode(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+            sort_keys=True,
+        ).encode("utf-8")
+    )
+    digest = _hmac.new(
+        secret.encode("utf-8"),
+        body.encode("ascii"),
+        hashlib.sha256,
+    ).digest()
+    return f"{body}.{_b64encode(digest)}"
+
+
+def _read_session_token() -> str:
+    try:
+        return str(
+            st.query_params.get(SESSION_QUERY_KEY, "")
+            or ""
+        )
+    except Exception:
+        return ""
+
+
+def _drop_session_token() -> None:
+    try:
+        if SESSION_QUERY_KEY in st.query_params:
+            del st.query_params[SESSION_QUERY_KEY]
+    except Exception:
+        pass
+
+
+def _persist_session() -> None:
+    """登录成功后把会话写进 URL（7 天有效）。失败不影响登录。"""
+    if not current_user():
+        return
+    payload = {
+        "u": current_user(),
+        "d": current_dept(),
+        "h": is_dept_head(),
+        "t": str(
+            st.session_state.get("auth_token", "") or ""
+        ),
+        "x": int(
+            time.time() + SESSION_MAX_AGE_SECONDS
+        ),
+    }
+    token = _sign_session(payload)
+    if not token:
+        return
+    try:
+        st.query_params[SESSION_QUERY_KEY] = token
+    except Exception:
+        pass
+
+
+def _restore_session() -> bool:
+    """从 URL 恢复登录态（刷新/重开浏览器后免再登录）。
+
+    验签 + 过期检查；无效/过期 token 顺手从地址栏清掉。
+    """
+    if current_user():
+        return True
+    token = _read_session_token()
+    if not token:
+        return False
+
+    payload = None
+    secret = _session_secret()
+    if secret and token.count(".") == 1:
+        body, sig = token.split(".")
+        try:
+            expected = _b64encode(
+                _hmac.new(
+                    secret.encode("utf-8"),
+                    body.encode("ascii"),
+                    hashlib.sha256,
+                ).digest()
+            )
+            if _pysecrets.compare_digest(sig, expected):
+                data = json.loads(
+                    _b64decode(body).decode("utf-8")
+                )
+                if (
+                    isinstance(data, dict)
+                    and int(data.get("x") or 0)
+                    > time.time()
+                ):
+                    payload = data
+        except Exception:
+            payload = None
+
+    if payload is None:
+        _drop_session_token()
+        return False
+
+    st.session_state["auth_user"] = str(payload.get("u") or "")
+    st.session_state["auth_dept"] = str(payload.get("d") or "")
+    st.session_state["auth_head"] = bool(payload.get("h"))
+    st.session_state["auth_token"] = str(payload.get("t") or "")
+    return bool(current_user())
+
+
 def _locked_out() -> bool:
     fails = int(
         st.session_state.get("auth_fails", 0) or 0
@@ -371,6 +523,8 @@ def _mark_success(user: str, data: dict) -> None:
     )
     st.session_state["auth_fails"] = 0
     st.session_state.pop("auth_locked_at", None)
+    # V2.7.2：登录成功即写入 URL 会话，刷新不掉线。
+    _persist_session()
 
 
 def _mark_fail() -> None:
@@ -480,6 +634,10 @@ def require_login() -> None:
     if current_user():
         return
 
+    # V2.7.2：刷新/重开浏览器时先尝试从 URL 恢复登录态。
+    if _restore_session():
+        return
+
     _render_login_page(users, server)
     st.stop()
 
@@ -516,6 +674,8 @@ def render_sidebar_badge() -> None:
         unsafe_allow_html=True,
     )
     if st.button("切换账号", use_container_width=True):
+        # V2.7.2：退出时把 URL 里的会话 token 一并清掉。
+        _drop_session_token()
         for name in (
             "auth_user",
             "auth_dept",
