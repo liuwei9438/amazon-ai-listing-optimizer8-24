@@ -52,7 +52,7 @@ from services.task_worker import (
 try:
     from services.user_auth import (
         current_dept,
-        get_dept_api_key,
+        get_dept_key_info,
         is_admin_user,
         log_user_event,
         render_sidebar_badge,
@@ -90,7 +90,7 @@ from analyzer.title_strategy_generator import (
     TitleStrategyGenerator,
 )
 
-VERSION = "V2.7.0-EMP"
+VERSION = "V2.7.1-EMP"
 
 # 采集插件「发送到优化」复制的数据列头（与插件导出 Excel 完全一致）
 COLLECTOR_HEADERS = [
@@ -740,16 +740,36 @@ with st.sidebar:
                     and _running_status.get("status") in TASK_RUNNING_STATUS
                 )
 
-            provider = st.radio(
-                "AI 服务商",
-                ["OpenAI", "DeepSeek"],
-                index=0,
-                horizontal=True,
-                key="ai_provider",
-                disabled=task_running_now,
-                help="DeepSeek 更便宜、国内直连；OpenAI 为原默认配置。"
-                "任务运行中不可切换。",
+            # 小组 Key 优先：组长在看板上选了 Key 属于哪家，
+            # 组员侧自动锁定同一家服务商（防 Key 发错家全部 401）。
+            emp_dept = "" if ADMIN_MODE else current_dept()
+            dept_key, dept_provider = (
+                get_dept_key_info(emp_dept)
+                if emp_dept
+                else ("", "")
             )
+
+            if dept_key:
+                provider = (
+                    "DeepSeek"
+                    if dept_provider == "deepseek"
+                    else "OpenAI"
+                )
+                st.caption(
+                    f"🔒 AI 服务商：{provider}"
+                    "（本组统一，由组长设置）"
+                )
+            else:
+                provider = st.radio(
+                    "AI 服务商",
+                    ["OpenAI", "DeepSeek"],
+                    index=0,
+                    horizontal=True,
+                    key="ai_provider",
+                    disabled=task_running_now,
+                    help="DeepSeek 更便宜、国内直连；OpenAI 为原默认配置。"
+                    "任务运行中不可切换。",
+                )
 
             if provider == "DeepSeek":
                 os.environ["OPENAI_BASE_URL"] = "https://api.deepseek.com"
@@ -787,22 +807,20 @@ with st.sidebar:
 
             else:
 
-                # 员工模式密钥来源优先级：
-                # 本部门 Key（总号在看板自助填写）> Secrets 全局 Key > 手动输入兜底。
-                api_key = saved_api_key
-                api_source = "global"
-
-                emp_dept = current_dept()
-                if emp_dept:
-                    dept_key = get_dept_api_key(emp_dept)
-                    if dept_key:
-                        api_key = dept_key
-                        api_source = "dept"
+                # 员工模式密钥来源：
+                # 本组 Key（组长看板自助填写）优先；没设组 Key 时
+                # 用 Secrets 全局 Key，再没有就显示输入框手动填。
+                if dept_key:
+                    api_key = dept_key
+                    api_source = "dept"
+                else:
+                    api_key = saved_api_key
+                    api_source = "global"
 
                 if api_source == "dept":
 
                     st.success(
-                        f"✅ API 已配置（{emp_dept} 部门 Key）"
+                        f"✅ API 已配置（{emp_dept} 小组 Key）"
                     )
 
                 elif api_key:
@@ -1347,9 +1365,9 @@ if not current_task and not profiles:
             "（标题 / 短标题 / 五点 / 亮点 / 详情 / 首图），"
             "点「开始 AI 商品理解」。"
             if ADMIN_MODE
-            else "选好 AI 服务商（不确定就用默认），"
-            "点「开始 AI 商品理解」。"
-            "API 已由管理员配置，无需填写密钥。"
+            else "API Key 由组长在小组看板统一配置，"
+            "无需自己填写密钥；"
+            "点「开始 AI 商品理解」即可。"
         )
         st.markdown(
             f"""
