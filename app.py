@@ -90,7 +90,7 @@ from analyzer.title_strategy_generator import (
     TitleStrategyGenerator,
 )
 
-VERSION = "V2.7.1-EMP"
+VERSION = "V2.7.2-EMP"
 
 # 采集插件「发送到优化」复制的数据列头（与插件导出 Excel 完全一致）
 COLLECTOR_HEADERS = [
@@ -617,6 +617,23 @@ with st.sidebar:
     )
 
     render_sidebar_badge()
+
+    # V2.7.2 修复“上传按钮点了没反应”：页面与服务器之间的长连接
+    # 闲置久了会悄悄断开（尤其任务进行中页面长时间不动、或页面放一
+    # 阵子再回来），界面看着正常但点什么都没反应，只能 F5。这里加
+    # 一个隐形心跳：每 30 秒自动轻跳一次保持连接活跃，断了也会立刻
+    # 触发自动重连。旧版 Streamlit 没有 fragment 时自动跳过。
+    _wz_fragment = getattr(st, "fragment", None) or getattr(
+        st, "experimental_fragment", None
+    )
+    if _wz_fragment is not None:
+        try:
+            @_wz_fragment(run_every=30)
+            def _wz_heartbeat():
+                st.empty()
+            _wz_heartbeat()
+        except Exception:
+            pass
 
     # --------------------------------------------
     # 第 1 步：上传 Excel
