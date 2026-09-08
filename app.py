@@ -57,6 +57,7 @@ try:
         log_user_event,
         render_sidebar_badge,
         require_login,
+        sync_session_cookie,
     )
 except BaseException as _ua_err:
     # 临时诊断：把真实报错显示在页面上（排查完会删掉这段）
@@ -90,7 +91,7 @@ from analyzer.title_strategy_generator import (
     TitleStrategyGenerator,
 )
 
-VERSION = "V2.7.2-EMP"
+VERSION = "V2.7.3-EMP"
 
 # 采集插件「发送到优化」复制的数据列头（与插件导出 Excel 完全一致）
 COLLECTOR_HEADERS = [
@@ -365,6 +366,9 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 # =====================================================
 
 require_login()
+
+# V2.7.3：登录态写 Cookie（新标签页/采集插件打开的页面自动恢复登录）
+sync_session_cookie()
 
 
 # =====================================================
