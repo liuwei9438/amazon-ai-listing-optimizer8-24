@@ -427,6 +427,86 @@ def _drop_session_token() -> None:
         pass
 
 
+def _read_cookie_token() -> str:
+    """从浏览器 Cookie 读会话 token（全浏览器共享，跨标签页有效）。"""
+    cookies = getattr(
+        getattr(st, "context", None), "cookies", None
+    )
+    if cookies is None:
+        return ""
+    try:
+        return str(
+            cookies.get(SESSION_QUERY_KEY, "") or ""
+        )
+    except Exception:
+        return ""
+
+
+def _render_cookie_script(
+    action: str, token: str = ""
+) -> None:
+    """注入一行 JS 写/清 Cookie。Streamlit 没有写 Cookie 的
+    Python API，用 0 高度组件执行 document.cookie。"""
+    try:
+        from streamlit.components.v1 import (
+            html as _st_html,
+        )
+    except Exception:
+        return
+    if action == "set":
+        # token 只含 URL 安全字符（base64url + '.'），无需转义
+        script = (
+            f"document.cookie = '{SESSION_QUERY_KEY}="
+            f"{token}; Max-Age="
+            f"{SESSION_MAX_AGE_SECONDS}"
+            f"; Path=/; SameSite=Lax';"
+        )
+    else:
+        script = (
+            f"document.cookie = '{SESSION_QUERY_KEY}="
+            f"; Max-Age=0; Path=/; SameSite=Lax';"
+        )
+    try:
+        _st_html(
+            f"<script>{script}</script>",
+            height=0,
+        )
+    except Exception:
+        pass
+
+
+def sync_session_cookie() -> None:
+    """登录后把会话 token 写进 Cookie（每个会话只写一次），
+    新开的标签页（含采集插件「打开优化页面」）自动恢复登录；
+    未登录但 Cookie 还在时顺手清掉。app.py 在登录门之后调用。
+    """
+    if not _session_secret():
+        return
+    if current_user():
+        if st.session_state.get("_wz_cookie_written"):
+            return
+        payload = {
+            "u": current_user(),
+            "d": current_dept(),
+            "h": is_dept_head(),
+            "t": str(
+                st.session_state.get("auth_token", "")
+                or ""
+            ),
+            "x": int(
+                time.time() + SESSION_MAX_AGE_SECONDS
+            ),
+        }
+        token = _sign_session(payload)
+        if not token:
+            return
+        st.session_state["_wz_cookie_written"] = True
+        _render_cookie_script("set", token)
+    else:
+        if _read_cookie_token():
+            _render_cookie_script("clear")
+
+
 def _persist_session() -> None:
     """登录成功后把会话写进 URL（7 天有效）。失败不影响登录。"""
     if not current_user():
@@ -458,7 +538,8 @@ def _restore_session() -> bool:
     """
     if current_user():
         return True
-    token = _read_session_token()
+    # 优先 URL 参数；没有再试 Cookie（新标签页/别的标签页登录过）。
+    token = _read_session_token() or _read_cookie_token()
     if not token:
         return False
 
