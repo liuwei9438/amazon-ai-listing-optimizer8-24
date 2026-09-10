@@ -208,6 +208,34 @@ def _worker_login(
     return "denied", data
 
 
+# 总后台优化设置缓存：5 分钟内不重复请求；
+# 服务器不可达时返回默认值（开），绝不影响优化程序使用。
+_OPT_CFG_TTL = 300.0
+_opt_cfg_cache = {"at": 0.0, "val": {"desc_to_ai": True}}
+
+
+def get_opt_config() -> dict:
+    """读总后台「优化设置」（目前只有 desc_to_ai：
+    详情描述是否参与 AI 优化。关 = 简介不进 AI，由程序本地过滤）。"""
+    import time as _time
+
+    now = _time.time()
+    if now - _opt_cfg_cache["at"] < _OPT_CFG_TTL:
+        return _opt_cfg_cache["val"]
+
+    server = _worker_server()
+    if server:
+        data = _worker_post(server, "/opt_config", {})
+        if data.get("ok"):
+            val = {"desc_to_ai": data.get("desc_to_ai", True) is not False}
+            _opt_cfg_cache.update(at=now, val=val)
+            return val
+
+    # 失败也记时间：避免每次交互都去打一台连不上的服务器
+    _opt_cfg_cache["at"] = now
+    return _opt_cfg_cache["val"]
+
+
 def get_dept_key_info(dept: str):
     """取本小组的 API Key 和服务商，返回 (key, provider)。
 
