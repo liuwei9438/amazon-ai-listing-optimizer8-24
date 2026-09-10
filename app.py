@@ -94,7 +94,7 @@ from analyzer.title_strategy_generator import (
     TitleStrategyGenerator,
 )
 
-VERSION = "V2.7.6-EMP"
+VERSION = "V2.7.7-EMP"
 
 # 采集插件「发送到优化」复制的数据列头（与插件导出 Excel 完全一致）
 COLLECTOR_HEADERS = [
@@ -400,6 +400,44 @@ if current_task:
 
 
 # =====================================================
+# V2.7.7 刷新恢复：任务开始时把上传的原表存进任务目录
+# （tasks/<任务ID>/source.xlsx）。刷新/重开浏览器后这里
+# 自动读回来，表格和「下载优化结果」按钮不再消失，
+# 员工不用重新上传原文件。
+# =====================================================
+
+if current_task and not st.session_state.get("excel_envelope"):
+    _src_path = get_task_dir(current_task) / "source.xlsx"
+    if _src_path.exists():
+        try:
+            _name_path = get_task_dir(current_task) / "source_name.txt"
+            _src_name = (
+                _name_path.read_text(encoding="utf-8").strip()
+                or "恢复的Excel.xlsx"
+            )
+            _src_bytes = _src_path.read_bytes()
+            st.session_state["excel_name"] = _src_name
+            st.session_state["excel_bytes"] = _src_bytes
+            st.session_state["excel_fingerprint"] = hashlib.sha1(
+                _src_bytes
+            ).hexdigest()
+            st.session_state["excel_envelope"] = read_workbook(
+                _src_name,
+                _src_bytes,
+            )
+            st.session_state["excel_restored"] = True
+        except Exception:
+            for _key in (
+                "excel_name",
+                "excel_bytes",
+                "excel_fingerprint",
+                "excel_envelope",
+                "excel_restored",
+            ):
+                st.session_state.pop(_key, None)
+
+
+# =====================================================
 # v2.7.4：详情描述开关 = 关 时的本地处理
 #
 # 总后台把「详情描述参与AI优化」关掉后：
@@ -698,6 +736,20 @@ with st.sidebar:
         uploaded = _PastedFile(
             "采集插件粘贴.xlsx",
             st.session_state["paste_bytes"],
+        )
+
+    # V2.7.7：刷新后从任务目录恢复的原表兜底（等同重新上传）。
+    if (
+        uploaded is None
+        and current_task
+        and st.session_state.get("excel_bytes")
+    ):
+        uploaded = _PastedFile(
+            str(
+                st.session_state.get("excel_name")
+                or "恢复的Excel.xlsx"
+            ),
+            st.session_state["excel_bytes"],
         )
 
     with st.expander("📋 从采集插件粘贴（免导出 Excel）"):
@@ -1197,6 +1249,22 @@ with st.sidebar:
                     task_id
                 )
 
+                # V2.7.7：原表存进任务目录，刷新页面后自动恢复。
+                try:
+                    _task_dir = get_task_dir(task_id)
+                    _task_dir.mkdir(parents=True, exist_ok=True)
+                    (_task_dir / "source.xlsx").write_bytes(excel_bytes)
+                    (_task_dir / "source_name.txt").write_text(
+                        str(
+                            st.session_state.get(
+                                "excel_name", uploaded.name
+                            )
+                        ),
+                        encoding="utf-8",
+                    )
+                except Exception:
+                    pass
+
 
 
                 options = {
@@ -1690,6 +1758,25 @@ if current_task and status:
                             profiles,
                         )
 
+                        # V2.7.7：重试任务目录也存一份原表（刷新恢复用）。
+                        try:
+                            _retry_dir = get_task_dir(retry_task_id)
+                            _retry_dir.mkdir(parents=True, exist_ok=True)
+                            (_retry_dir / "source.xlsx").write_bytes(
+                                st.session_state.get("excel_bytes")
+                                or excel_bytes
+                            )
+                            (_retry_dir / "source_name.txt").write_text(
+                                str(
+                                    st.session_state.get(
+                                        "excel_name", uploaded.name
+                                    )
+                                ),
+                                encoding="utf-8",
+                            )
+                        except Exception:
+                            pass
+
                         retry_options = {
 
                             "title":
@@ -1791,6 +1878,16 @@ if current_task and status:
                     clear_current_task()
                     st.session_state.pop("current_task", None)
                     st.session_state["task_started"] = False
+                    # V2.7.7：清掉刷新恢复进来的旧表，避免开新任务时
+                    # 旧文件悄悄跟着（员工自己上传的不受影响）。
+                    if st.session_state.pop("excel_restored", False):
+                        for _key in (
+                            "excel_bytes",
+                            "excel_name",
+                            "excel_fingerprint",
+                            "excel_envelope",
+                        ):
+                            st.session_state.pop(_key, None)
                     st.rerun()
 
         # v2.7.4：任务运行中给员工暂停/继续/取消按钮。
@@ -2011,6 +2108,15 @@ if current_task and status:
                 clear_current_task()
                 st.session_state.pop("current_task", None)
                 st.session_state["task_started"] = False
+                # V2.7.7：同员工模式——关闭任务时清掉恢复进来的旧表。
+                if st.session_state.pop("excel_restored", False):
+                    for _key in (
+                        "excel_bytes",
+                        "excel_name",
+                        "excel_fingerprint",
+                        "excel_envelope",
+                    ):
+                        st.session_state.pop(_key, None)
                 st.rerun()
 
         if expected_total:
