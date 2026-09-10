@@ -94,7 +94,7 @@ from analyzer.title_strategy_generator import (
     TitleStrategyGenerator,
 )
 
-VERSION = "V2.7.4-EMP"
+VERSION = "V2.7.5-EMP"
 
 # 采集插件「发送到优化」复制的数据列头（与插件导出 Excel 完全一致）
 COLLECTOR_HEADERS = [
@@ -1255,7 +1255,7 @@ st.markdown(
     <div class="app-hero">
         <div class="hero-title">🛒 Amazon AI Listing Optimizer</div>
         <div class="hero-sub">AI 生成标题 · 短标题 · 五点 · 详情 · 商品亮点 · 首图优化</div>
-        <span class="version-pill">V2.7.4{" · 管理模式" if ADMIN_MODE else " · 基础版"}</span>
+        <span class="version-pill">{VERSION}{" · 管理模式" if ADMIN_MODE else " · 基础版"}</span>
     </div>
     """,
     unsafe_allow_html=True,
