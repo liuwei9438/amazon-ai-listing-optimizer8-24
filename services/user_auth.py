@@ -208,32 +208,80 @@ def _worker_login(
     return "denied", data
 
 
-# 总后台优化设置缓存：5 分钟内不重复请求；
-# 服务器不可达时返回默认值（开），绝不影响优化程序使用。
+# 总后台优化设置缓存：5 分钟内不重复请求；按账号分开存
+# （不同小组权限不同，不能共用一条缓存）；
+# 服务器不可达时返回上次已知值/默认值，绝不影响优化程序使用。
 _OPT_CFG_TTL = 300.0
-_opt_cfg_cache = {"at": 0.0, "val": {"desc_to_ai": True}}
+_OPT_MODULE_KEYS = (
+    "title",
+    "short_title",
+    "highlight",
+    "bullet",
+    "description",
+    "seo",
+)
+_opt_cfg_cache: dict = {}  # 账号 -> {"at": 秒, "val": dict}
+
+
+def _default_opt_config() -> dict:
+    return {
+        "desc_to_ai": True,
+        "modules": {key: True for key in _OPT_MODULE_KEYS},
+    }
 
 
 def get_opt_config() -> dict:
-    """读总后台「优化设置」（目前只有 desc_to_ai：
-    详情描述是否参与 AI 优化。关 = 简介不进 AI，由程序本地过滤）。"""
+    """读总后台优化设置 + 本小组的模块权限（worker v10）。
+
+    返回 {"desc_to_ai": bool, "modules": {...六个模块布尔值}}。
+    带登录令牌请求 /opt_config，Worker 按登录人的小组返回
+    modules；没登录/没小组/连不上 = 全部默认开（fail-open）。
+    """
     import time as _time
 
+    user = current_user()
+    entry = _opt_cfg_cache.get(user)
     now = _time.time()
-    if now - _opt_cfg_cache["at"] < _OPT_CFG_TTL:
-        return _opt_cfg_cache["val"]
+    if entry and now - entry["at"] < _OPT_CFG_TTL:
+        return entry["val"]
 
     server = _worker_server()
     if server:
-        data = _worker_post(server, "/opt_config", {})
+        token = str(
+            st.session_state.get("auth_token", "") or ""
+        )
+        data = _worker_post(
+            server,
+            "/opt_config",
+            {"token": token},
+        )
         if data.get("ok"):
-            val = {"desc_to_ai": data.get("desc_to_ai", True) is not False}
-            _opt_cfg_cache.update(at=now, val=val)
+            raw = data.get("modules")
+            raw = raw if isinstance(raw, dict) else {}
+            val = {
+                "desc_to_ai": data.get(
+                    "desc_to_ai", True
+                )
+                is not False,
+                "modules": {
+                    key: raw.get(key) is not False
+                    for key in _OPT_MODULE_KEYS
+                },
+            }
+            _opt_cfg_cache[user] = {"at": now, "val": val}
             return val
 
-    # 失败也记时间：避免每次交互都去打一台连不上的服务器
-    _opt_cfg_cache["at"] = now
-    return _opt_cfg_cache["val"]
+    # 失败也记时间：避免每次交互都去打一台连不上的服务器；
+    # 有上次的值就沿用（按账号），没有就用默认全开。
+    if entry:
+        _opt_cfg_cache[user] = {
+            "at": now,
+            "val": entry["val"],
+        }
+        return entry["val"]
+    val = _default_opt_config()
+    _opt_cfg_cache[user] = {"at": now, "val": val}
+    return val
 
 
 def get_dept_key_info(dept: str):
