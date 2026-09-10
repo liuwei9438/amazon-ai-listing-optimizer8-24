@@ -51,6 +51,93 @@ class ListingExporter:
     )
 
     # =====================================================
+    # V2.7.5 导出统一模板
+    #
+    # 无论上传的 Excel 是什么格式（采集插件 20 列模板、粘贴导入、
+    # 或第三方工具导出的 id/标题/要点/描述 等自定义列），导出结果
+    # 一律按采集插件的 20 列「导入产品模板」布局输出：
+    #   - 已有同名列原样保留；
+    #   - 缺失的模板列用常见别名补上（标题→标题(必填)、描述→简介、
+    #     成本价→成本价(必填)、商品图→产品图、单列要点→按行拆成要点1-5）；
+    #   - 仍没有的模板列置空补齐；
+    #   - 上传文件里的其他列（如 id）跟在模板列后面，数据不丢。
+    # =====================================================
+
+    TEMPLATE_COLUMNS = [
+        "父SKU(必填)", "SKU", "库存", "币种", "成本价(必填)", "运费",
+        "材料", "包装材料", "语言", "标题(必填)", "颜色",
+        "要点1", "要点2", "要点3", "要点4", "要点5",
+        "简介", "产品图", "简介图", "参考网址",
+    ]
+
+    TEMPLATE_ALIASES = {
+        "父SKU(必填)": ("父SKU", "父sku"),
+        "成本价(必填)": ("成本价",),
+        "材料": ("材质",),
+        "标题(必填)": ("标题", "title"),
+        "简介": ("描述", "详情", "详情描述", "description"),
+        "产品图": ("商品图", "主图", "图片"),
+        "参考网址": ("链接", "网址", "url", "URL"),
+    }
+
+    # 整列“要点”没有拆成 要点1-5 时的单列别名。
+    SINGLE_BULLET_ALIASES = ("要点", "卖点", "五点描述", "五点")
+
+    @classmethod
+    def _split_bullet_line(cls, value, index: int) -> str:
+        if value is None or (isinstance(value, float) and pd.isna(value)):
+            return ""
+        lines = [ln.strip() for ln in str(value).splitlines() if ln.strip()]
+        return lines[index] if index < len(lines) else ""
+
+    @classmethod
+    def _normalize_to_template(cls, frame: pd.DataFrame) -> pd.DataFrame:
+        """把任意上传格式统一成采集插件导出的 20 列模板布局。"""
+        existing = list(frame.columns)
+
+        # 模板列 -> 使用的源列（先精确同名，再按别名）。
+        source_of: dict[str, str] = {}
+        used: set[str] = set()
+        for target in cls.TEMPLATE_COLUMNS:
+            if target in existing:
+                source_of[target] = target
+                used.add(target)
+                continue
+            for alias in cls.TEMPLATE_ALIASES.get(target, ()):
+                if alias in existing and alias not in used:
+                    source_of[target] = alias
+                    used.add(alias)
+                    break
+
+        normalized = pd.DataFrame(index=frame.index)
+        for target in cls.TEMPLATE_COLUMNS:
+            src = source_of.get(target)
+            normalized[target] = frame[src] if src is not None else ""
+
+        # 要点1-5 整列都没有时，把单列「要点」按换行拆成五列。
+        if not any(("要点%d" % i) in source_of for i in range(1, 6)):
+            single = next(
+                (
+                    c for c in cls.SINGLE_BULLET_ALIASES
+                    if c in existing and c not in used
+                ),
+                None,
+            )
+            if single is not None:
+                used.add(single)
+                for i in range(1, 6):
+                    normalized["要点%d" % i] = frame[single].map(
+                        lambda v, idx=i - 1: cls._split_bullet_line(v, idx)
+                    )
+
+        # 上传文件里的其他列跟在模板列后面，数据不丢。
+        for col in existing:
+            if col not in used and col not in normalized.columns:
+                normalized[col] = frame[col]
+
+        return normalized
+
+    # =====================================================
     # V2.6 导出前文本清洗
     #
     # 所有 AI 文案写入 Excel 前的最后关口，集中处理两类
@@ -980,7 +1067,9 @@ class ListingExporter:
         if not isinstance(profiles, list):
             raise TypeError("profiles 必须是 list")
 
-        result = dataframe.copy()
+        # V2.7.5：先统一成采集插件的 20 列模板布局再写 AI 结果，
+        # 这样无论上传什么格式，导出文件都是同一个「导入产品模板」。
+        result = cls._normalize_to_template(dataframe)
         sku_column = cls.find_dataframe_sku_column(result)
         title_column = cls.find_title_column(result)
         description_column = cls.find_description_column(result)
