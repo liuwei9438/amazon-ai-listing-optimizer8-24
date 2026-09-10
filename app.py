@@ -94,7 +94,7 @@ from analyzer.title_strategy_generator import (
     TitleStrategyGenerator,
 )
 
-VERSION = "V2.7.5-EMP"
+VERSION = "V2.7.6-EMP"
 
 # 采集插件「发送到优化」复制的数据列头（与插件导出 Excel 完全一致）
 COLLECTOR_HEADERS = [
@@ -768,11 +768,17 @@ with st.sidebar:
 
         if envelope is not None:
 
-            # v2.7.4：总后台「详情描述参与AI优化」开关。
-            # 关 = 简介完全不进 AI；表格简介列换成本地过滤后的原文。
-            desc_to_ai = get_opt_config().get("desc_to_ai", True)
-            st.session_state["desc_to_ai"] = desc_to_ai
-            if not desc_to_ai:
+            # v2.7.4/v2.7.6：总后台设置（Worker /opt_config，带登录令牌）——
+            # desc_to_ai：详情描述是否参与 AI 优化（全局开关）；
+            # modules：本小组可优化的模块（/manage 小组权限，worker v10）。
+            opt_cfg = get_opt_config()
+            st.session_state["desc_to_ai"] = opt_cfg.get(
+                "desc_to_ai", True
+            )
+            st.session_state["perm_modules"] = opt_cfg.get(
+                "modules", {}
+            )
+            if not opt_cfg.get("desc_to_ai", True):
                 envelope = _apply_desc_off(envelope)
 
             st.success(
@@ -1045,6 +1051,51 @@ with st.sidebar:
                 # 员工模式默认不优化图片（避免未配置 Cloudinary 时
                 # 全部图片失败的困扰）。
                 enable_images = False
+
+            # v2.7.6：本小组的优化模块权限（总后台 /manage 设置，
+            # worker v10）。只锁员工模式；没设置过的小组=全开，
+            # 行为与旧版一致。
+            if not ADMIN_MODE:
+                perm = st.session_state.get(
+                    "perm_modules", {}
+                )
+                if perm and not any(perm.values()):
+                    # 防御：六个模块全关时按全开处理，
+                    # 别让员工跑了任务却什么都没生成。
+                    perm = {}
+                if perm and any(
+                    v is False for v in perm.values()
+                ):
+                    enable_title = perm.get("title", True)
+                    enable_short_title = perm.get(
+                        "short_title", True
+                    )
+                    enable_highlight = perm.get(
+                        "highlight", True
+                    )
+                    enable_bullet = perm.get("bullet", True)
+                    enable_description = perm.get(
+                        "description", True
+                    )
+                    enable_seo = perm.get("seo", True)
+                    _names = []
+                    if enable_title:
+                        _names.append("标题")
+                    if enable_short_title:
+                        _names.append("短标题")
+                    if enable_highlight:
+                        _names.append("商品亮点")
+                    if enable_bullet:
+                        _names.append("五点")
+                    if enable_description:
+                        _names.append("详情")
+                    if enable_seo:
+                        _names.append("SEO关键词")
+                    st.caption(
+                        "🔒 本组可优化："
+                        + "、".join(_names)
+                        + "（总后台设置）"
+                    )
 
             # v2.7.4：总后台关了「详情描述参与AI优化」时，
             # 管理员勾选/员工默认值都强制不再让 AI 重写简介。
