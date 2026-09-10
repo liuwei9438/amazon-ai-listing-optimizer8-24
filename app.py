@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+from dataclasses import replace
 
 import pandas as pd
 import streamlit as st
@@ -17,6 +18,7 @@ from core import (
     export_unchanged,
     integrity_report,
 )
+from core.description_filter import clean_description
 
 
 from services.config import get_openai_api_key
@@ -53,6 +55,7 @@ try:
     from services.user_auth import (
         current_dept,
         get_dept_key_info,
+        get_opt_config,
         is_admin_user,
         log_user_event,
         render_sidebar_badge,
@@ -91,7 +94,7 @@ from analyzer.title_strategy_generator import (
     TitleStrategyGenerator,
 )
 
-VERSION = "V2.7.3-EMP"
+VERSION = "V2.7.4-EMP"
 
 # 采集插件「发送到优化」复制的数据列头（与插件导出 Excel 完全一致）
 COLLECTOR_HEADERS = [
@@ -394,6 +397,40 @@ if current_task:
         st.session_state.pop("current_task", None)
         st.session_state["task_started"] = False
         current_task = ""
+
+
+# =====================================================
+# v2.7.4：详情描述开关 = 关 时的本地处理
+#
+# 总后台把「详情描述参与AI优化」关掉后：
+#   - 记录里的 description 置空 → 简介完全不进 AI（省 token）
+#   - 表格简介列 = 程序本地过滤后的原文（去掉卖家自夸/服务承诺/
+#     物流/促销/评价/参数噪音/网页杂项等与产品无关的行）
+# 导出时简介列保留的是过滤后的文字，AI 不再重写。
+# =====================================================
+
+
+def _apply_desc_off(envelope):
+    desc_col = envelope.fields.description
+    dataframe = envelope.dataframe
+    if desc_col and desc_col in dataframe.columns:
+        dataframe = dataframe.copy()
+        dataframe[desc_col] = dataframe[desc_col].map(
+            lambda v: clean_description("" if pd.isna(v) else v)
+        )
+    new_records = []
+    for rec in envelope.records:
+        raw = dict(rec.raw_data)
+        if desc_col:
+            raw[desc_col] = ""
+        new_records.append(
+            replace(rec, description="", raw_data=raw)
+        )
+    return replace(
+        envelope,
+        dataframe=dataframe,
+        records=tuple(new_records),
+    )
 
 
 # =====================================================
@@ -731,6 +768,13 @@ with st.sidebar:
 
         if envelope is not None:
 
+            # v2.7.4：总后台「详情描述参与AI优化」开关。
+            # 关 = 简介完全不进 AI；表格简介列换成本地过滤后的原文。
+            desc_to_ai = get_opt_config().get("desc_to_ai", True)
+            st.session_state["desc_to_ai"] = desc_to_ai
+            if not desc_to_ai:
+                envelope = _apply_desc_off(envelope)
+
             st.success(
                 f"读取成功："
                 f"{len(envelope.records)} 个产品"
@@ -1002,6 +1046,15 @@ with st.sidebar:
                 # 全部图片失败的困扰）。
                 enable_images = False
 
+            # v2.7.4：总后台关了「详情描述参与AI优化」时，
+            # 管理员勾选/员工默认值都强制不再让 AI 重写简介。
+            if not st.session_state.get("desc_to_ai", True):
+                enable_description = False
+                st.caption(
+                    "🔒 详情描述不参与 AI 优化（总后台设置）："
+                    "简介 = 本地过滤后的原文，不消耗 token。"
+                )
+
             # ----------------------------------------
             # 第 4 步：开始任务
             # ----------------------------------------
@@ -1049,6 +1102,12 @@ with st.sidebar:
                 if current_status.get(
                     "status"
                 ) in TASK_RUNNING_STATUS:
+
+                    button_disabled = True
+
+                # v2.7.4：暂停中的任务也不许再点「开始」，
+                # 否则会开第二个任务和暂停中的任务抢着跑。
+                if current_status.get("status") == "paused":
 
                     button_disabled = True
 
@@ -1196,7 +1255,7 @@ st.markdown(
     <div class="app-hero">
         <div class="hero-title">🛒 Amazon AI Listing Optimizer</div>
         <div class="hero-sub">AI 生成标题 · 短标题 · 五点 · 详情 · 商品亮点 · 首图优化</div>
-        <span class="version-pill">V2.6.0{" · 管理模式" if ADMIN_MODE else " · 基础版"}</span>
+        <span class="version-pill">V2.7.4{" · 管理模式" if ADMIN_MODE else " · 基础版"}</span>
     </div>
     """,
     unsafe_allow_html=True,
@@ -1502,6 +1561,7 @@ if current_task and status:
         task_is_idle = bool(
             status
             and status.get("status") not in TASK_RUNNING_STATUS
+            and status.get("status") != "paused"   # v2.7.4：暂停中同样不许开重试任务
         )
 
         if uploaded is None or envelope is None:
@@ -1682,11 +1742,54 @@ if current_task and status:
                     st.session_state["task_started"] = False
                     st.rerun()
 
+        # v2.7.4：任务运行中给员工暂停/继续/取消按钮。
+        # 暂停 = 运行中的产品先安全跑完，不再提交新产品；
+        # 取消 = 剩余产品不再处理，已完成的结果保留可下载。
+        if status_value in TASK_RUNNING_STATUS or status_value == "paused":
+
+            ctl1, ctl2, ctl3 = st.columns(3)
+
+            with ctl1:
+                if st.button(
+                    "⏸️ 暂停",
+                    use_container_width=True,
+                    key="emp_pause",
+                    disabled=status_value == "paused",
+                ):
+                    save_control(current_task, "pause")
+                    st.rerun()
+
+            with ctl2:
+                if st.button(
+                    "▶️ 继续",
+                    use_container_width=True,
+                    key="emp_resume",
+                    disabled=status_value != "paused",
+                ):
+                    save_control(current_task, "running")
+                    st.rerun()
+
+            with ctl3:
+                if st.button(
+                    "⛔ 取消任务",
+                    use_container_width=True,
+                    key="emp_cancel",
+                ):
+                    save_control(current_task, "cancel")
+                    st.rerun()
+
         if status_value in TASK_RUNNING_STATUS:
 
             st.info(
                 "⏳ AI 正在处理，不用一直开着页面；"
                 "稍后回来点「刷新进度」即可。"
+            )
+
+        elif status_value == "paused":
+
+            st.info(
+                "⏸️ 任务已暂停：点「▶️ 继续」恢复处理，"
+                "或点「⛔ 取消任务」放弃剩余产品（已完成的结果保留）。"
             )
 
         elif status_value in {"completed", "cancelled", "failed"} and not profiles:
