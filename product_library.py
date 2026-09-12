@@ -157,6 +157,127 @@ def to_xlsx_bytes(frame: pd.DataFrame) -> bytes:
     return buffer.getvalue()
 
 
+def merge_frames(old, new):
+    """多文件累积导入：新表出现过的 SKU，旧表同名行让位（新覆盖旧）。
+
+    新表索引整体错开，行号永不撞车 —— 已编辑标记、翻页状态都不乱。
+    """
+    if old is None or old.empty:
+        return new
+    new_skus = set()
+    if "SKU" in new.columns:
+        new_skus = {text_value(v) for v in new["SKU"].tolist() if text_value(v)}
+    if new_skus and "SKU" in old.columns:
+        keep = [
+            i for i, v in old["SKU"].items()
+            if not text_value(v) or text_value(v) not in new_skus
+        ]
+        old = old.loc[keep]
+    offset = (int(old.index.max()) + 1) if len(old) else 0
+    shifted = new.copy()
+    shifted.index = range(offset, offset + len(shifted))
+    return normalize_dataframe(pd.concat([old, shifted]))
+
+
+def missing_flags(row) -> list:
+    """缺什么一眼看到：无图 / 缺标题 / 缺要点 / 缺简介 / 缺价格。"""
+    flags = []
+    if not display_images(row.get("产品图")):
+        flags.append("无图")
+    if not text_value(row.get("标题(必填)")):
+        flags.append("缺标题")
+    for label, column in (("缺要点", "要点1"), ("缺简介", "简介")):
+        if column in row.index and not text_value(row.get(column)):
+            flags.append(label)
+    if not text_value(row.get("成本价(必填)")):
+        flags.append("缺价格")
+    return flags
+
+
+# 标题体检词表：能借优化程序的品牌词库就借，借不到用同内容兜底
+try:
+    from compliance.brand_protection import DEFAULT_BRANDS, PROHIBITED_TERMS
+except BaseException:  # noqa: BLE001  词库文件不在也不影响主流程
+    DEFAULT_BRANDS = {
+        "LG", "Dyson", "Epson", "Samsung", "Bosch", "Philips", "Whirlpool",
+    }
+    PROHIBITED_TERMS = {
+        "original", "genuine", "official", "oem",
+        "authentic", "best seller", "#1", "premium quality",
+    }
+
+
+def _terms_regex(terms):
+    """词表 → 正则：前后都不能是字母数字（#1 这种带符号的也判得准）。"""
+    parts = [
+        r"(?<!\w)" + re.escape(term) + r"(?!\w)"
+        for term in sorted(terms, key=len, reverse=True)
+    ]
+    if not parts:
+        return re.compile(r"(?!x)x")  # 空词表：永不匹配
+    return re.compile("|".join(parts), re.IGNORECASE)
+
+
+_BRAND_RE = _terms_regex(DEFAULT_BRANDS)
+_PROHIBITED_RE = _terms_regex(PROHIBITED_TERMS)
+
+
+def title_issues(title) -> list:
+    """标题体检：超长 / 几乎全大写 / 品牌词 / 违禁词。纯规则，不调 AI。"""
+    text = text_value(title)
+    if not text:
+        return []
+    issues = []
+    if len(text) > 200:
+        issues.append(f"超长：{len(text)}/200 字符")
+    letters = [c for c in text if c.isalpha()]
+    if letters and sum(1 for c in letters if c.isupper()) / len(letters) > 0.8:
+        issues.append("几乎全大写")
+    if _BRAND_RE.search(text):
+        issues.append("含品牌词，建议改成 Compatible with XX")
+    if _PROHIBITED_RE.search(text):
+        issues.append("含违禁词（best seller / #1 / OEM 等）")
+    return issues
+
+
+def arrange_indices(frame, indices, filter_mode, sort_mode, edited) -> list:
+    """搜索命中后，再按 筛选/排序 整理显示顺序（只动顺序，不动数据）。"""
+    picked = list(indices)
+    if filter_mode == "只看无图":
+        picked = [
+            i for i in picked
+            if not display_images(
+                frame.at[i, "产品图"] if "产品图" in frame.columns else ""
+            )
+        ]
+    elif filter_mode == "只看缺字段":
+        picked = [i for i in picked if missing_flags(frame.loc[i])]
+    elif filter_mode == "只看已编辑":
+        picked = [i for i in picked if i in edited]
+
+    if sort_mode in ("价格从低到高", "价格从高到低"):
+        prices = {}
+        for i in picked:
+            try:
+                prices[i] = float(frame.at[i, "成本价(必填)"])
+            except (KeyError, TypeError, ValueError):
+                prices[i] = float("nan")
+        reverse = sort_mode == "价格从高到低"
+
+        def _key(i):
+            value = prices[i]
+            if math.isnan(value):
+                return (1, 0.0)  # 没价格的一律垫底
+            return (0, -value if reverse else value)
+
+        picked.sort(key=_key)
+    elif sort_mode == "缺字段在前":
+        picked.sort(key=lambda i: not missing_flags(frame.loc[i]))
+    elif sort_mode == "最近编辑在前":
+        picked.sort(key=lambda i: i not in edited)
+    return picked
+
+
 # =====================================================
 # 应用主体
 # =====================================================
@@ -179,7 +300,7 @@ except BaseException as auth_error:
     st.stop()
 
 
-VERSION = "V1.0.2"
+VERSION = "V1.1"
 
 st.set_page_config(
     page_title="产品资料库",
@@ -249,6 +370,13 @@ CUSTOM_CSS = """
     background: #FF9900; color: #232F3E;
     border-radius: 999px; padding: 0 6px;
     font-size: 10.5px; font-weight: 700;
+}
+.p-flags { margin-top: 5px; line-height: 1.9; }
+.p-flag {
+    background: #fdecea; color: #B12704;
+    border-radius: 4px; padding: 1px 5px;
+    font-size: 10px; font-weight: 600;
+    display: inline-block; margin-right: 4px;
 }
 .page-info { text-align: center; padding-top: 8px; color: #5b6b7a; font-size: 13px; }
 .detail-pos { padding-top: 8px; color: #37475A; font-weight: 600; font-size: 14px; text-align: center; }
@@ -355,29 +483,33 @@ with st.sidebar:
     if uploaded is not None:
         data = uploaded.getvalue()
         fingerprint = hashlib.sha1(data).hexdigest()
-        if st.session_state.get("lib_fp") != fingerprint:
-            # 新文件（或文件内容变了）：重新解析，编辑状态清零。
+        seen = st.session_state.get("lib_fps") or set()
+        if fingerprint not in seen:
+            # 没见过的新文件：解析后并进资料库（同名 SKU 新的覆盖旧的）。
             try:
                 frame = normalize_dataframe(
                     pd.read_excel(io.BytesIO(data))
                 )
             except Exception as exc:
                 lib_error = f"读取文件失败：{exc}"
-                for key in ("lib_fp", "lib_df", "lib_edited", "lib_name"):
-                    st.session_state.pop(key, None)
             else:
                 if frame.empty or not looks_like_product_table(frame):
                     lib_error = (
                         "这不是优化程序导出的表格"
                         "（没找到模板列，如 标题(必填) / 产品图 / SKU）。"
                     )
-                    for key in ("lib_fp", "lib_df", "lib_edited", "lib_name"):
-                        st.session_state.pop(key, None)
                 else:
-                    st.session_state["lib_fp"] = fingerprint
-                    st.session_state["lib_df"] = frame
-                    st.session_state["lib_edited"] = set()
-                    st.session_state["lib_name"] = uploaded.name
+                    st.session_state["lib_df"] = merge_frames(
+                        st.session_state.get("lib_df"), frame
+                    )
+                    st.session_state["lib_edited"] = (
+                        st.session_state.get("lib_edited") or set()
+                    )
+                    seen.add(fingerprint)
+                    st.session_state["lib_fps"] = seen
+                    files = st.session_state.get("lib_files") or []
+                    files.append(str(uploaded.name))
+                    st.session_state["lib_files"] = files
                     st.session_state["lib_page"] = 1
                     st.session_state.pop("view_idx", None)
                     log_user_event(
@@ -385,18 +517,13 @@ with st.sidebar:
                         rows=len(frame),
                         filename=str(uploaded.name),
                     )
-    else:
-        # 文件被移除后才清状态（注入的测试/恢复状态不受影响）。
-        if st.session_state.get("lib_fp"):
-            for key in (
-                "lib_fp", "lib_df", "lib_edited", "lib_name", "view_idx",
-            ):
-                st.session_state.pop(key, None)
 
     df = st.session_state.get("lib_df")
 
     if df is not None:
-        st.success(f"已导入：{len(df)} 个产品")
+        files = st.session_state.get("lib_files") or []
+        note = f"（累计 {len(files)} 个文件）" if len(files) > 1 else ""
+        st.success(f"已导入：{len(df)} 个产品{note}")
 
         st.markdown(
             '<div class="side-step">2️⃣ 导出 Excel</div>',
@@ -426,9 +553,17 @@ with st.sidebar:
         if edited_count:
             st.caption(f"✏️ 本次已编辑 {edited_count} 个产品")
 
+        if st.button("🗑 清空资料库（重新开始）"):
+            for key in (
+                "lib_fp", "lib_fps", "lib_df", "lib_edited", "lib_files",
+                "lib_page", "lib_last_query", "view_idx",
+            ):
+                st.session_state.pop(key, None)
+            st.rerun()
+
     st.caption(
-        "V1 说明：导入 → 查看/编辑 → 导出，一次会话内完成；"
-        "数据不保存到服务器，改完记得导出。"
+        "V1 说明：可连续导入多个表格自动合并（按 SKU 去重，新的覆盖旧的）；"
+        "数据只在本次会话里，改完记得导出。"
     )
 
 
@@ -515,6 +650,22 @@ with size_col:
         key="lib_page_size",
     )
 
+# ---- 筛选 / 排序 ----
+
+filter_col, sort_col = st.columns(2)
+with filter_col:
+    filter_mode = st.selectbox(
+        "筛选",
+        ["全部", "只看无图", "只看缺字段", "只看已编辑"],
+        key="lib_filter",
+    )
+with sort_col:
+    sort_mode = st.selectbox(
+        "排序",
+        ["默认顺序", "价格从低到高", "价格从高到低", "缺字段在前", "最近编辑在前"],
+        key="lib_sort",
+    )
+
 # 搜索词变了 → 回到第 1 页。
 if query != st.session_state.get("lib_last_query", ""):
     st.session_state["lib_last_query"] = query
@@ -535,8 +686,9 @@ if query.strip():
     indices = [idx for idx in indices if _hit(idx)]
 
 edited_rows = st.session_state.get("lib_edited") or set()
+indices = arrange_indices(df, indices, filter_mode, sort_mode, edited_rows)
 st.markdown(
-    f"**共 {len(df)} 个产品** · 搜索到 {len(indices)} 个 · "
+    f"**共 {len(df)} 个产品** · 当前显示 {len(indices)} 个 · "
     f"✏️ 已编辑 {len(edited_rows)} 个"
 )
 
@@ -587,6 +739,27 @@ def _safe_image(url: str):
         st.image(str(url), **_IMAGE_WIDTH_KWARGS)
     except Exception:
         st.caption("🖼️ 该图片链接无法显示")
+
+
+def _gallery(frame, idx, column, images):
+    """图廊 + 单图删除：删完立刻写回单元格（导出的 Excel 同步少图）。"""
+    gallery = st.columns(min(len(images), CARDS_PER_ROW))
+    for i, url in enumerate(images):
+        with gallery[i % len(gallery)]:
+            _safe_image(url)
+            st.markdown(f"[↗ 原图{i + 1}]({html_escape(str(url))})")
+            if st.button("🗑 删掉此图", key=f"del_{column}_{idx}_{i}"):
+                frame.at[idx, column] = " | ".join(
+                    u for j, u in enumerate(images) if j != i
+                )
+                edited = st.session_state.get("lib_edited") or set()
+                edited.add(idx)
+                st.session_state["lib_edited"] = edited
+                log_user_event(
+                    "lib_img_del",
+                    sku=text_value(frame.at[idx, "SKU"]) if "SKU" in frame.columns else "",
+                )
+                st.rerun()
 
 
 def _form_field(idx, row, column: str):
@@ -654,30 +827,27 @@ def render_detail(frame: pd.DataFrame, idx, visible_indices):
             unsafe_allow_html=True,
         )
 
-    # ---- 图片 ----
+    # ---- 图片（图廊里可单张删除，删完立刻写回） ----
     st.markdown("#### 🖼️ 产品图")
     images = display_images(row.get("产品图"))
     if images:
-        gallery = st.columns(min(len(images), CARDS_PER_ROW))
-        for i, url in enumerate(images):
-            with gallery[i % len(gallery)]:
-                _safe_image(url)
-                st.markdown(f"[↗ 原图{i + 1}]({html_escape(str(url))})")
+        _gallery(frame, idx, "产品图", images)
     else:
         st.caption("（无图片链接）")
 
     intro_images = display_images(row.get("简介图"))
     if intro_images:
         st.markdown("#### 📷 简介图")
-        gallery = st.columns(min(len(intro_images), CARDS_PER_ROW))
-        for i, url in enumerate(intro_images):
-            with gallery[i % len(gallery)]:
-                _safe_image(url)
-                st.markdown(f"[↗ 原图{i + 1}]({html_escape(str(url))})")
+        _gallery(frame, idx, "简介图", intro_images)
 
     reference = text_value(row.get("参考网址"))
     if reference.startswith("http"):
         st.markdown(f"🔗 [打开参考网页]({html_escape(reference)})")
+
+    # ---- 体检：缺字段 + 标题风险（纯规则，不调 AI） ----
+    checkups = title_issues(row.get("标题(必填)")) + missing_flags(row)
+    if checkups:
+        st.warning("⚠️ 体检提醒：" + "；".join(checkups))
 
     # ---- 编辑表单 ----
     st.markdown("#### ✏️ 编辑信息（改完点底部「保存修改」）")
@@ -797,6 +967,10 @@ def render_grid(frame: pd.DataFrame, visible_indices):
                 ' <span class="p-badge">已编辑</span>'
                 if idx in edited else ""
             )
+            flags_html = "".join(
+                f'<span class="p-flag">{html_escape(flag)}</span>'
+                for flag in missing_flags(row)[:3]
+            )
             title = text_value(row.get("标题(必填)")) or "（无标题）"
             st.markdown(
                 f"""
@@ -804,6 +978,7 @@ def render_grid(frame: pd.DataFrame, visible_indices):
                     <div class="p-price">{price_display(row)}</div>
                     <div class="p-title">{html_escape(title)}</div>
                     <div class="p-sku">SKU：{html_escape(text_value(row.get("SKU"))) or "-"}{badge}</div>
+                    <div class="p-flags">{flags_html}</div>
                 </div>
                 """,
                 unsafe_allow_html=True,
