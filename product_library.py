@@ -13,6 +13,7 @@ from __future__ import annotations
 # =====================================================
 
 import hashlib
+import inspect
 import io
 import math
 import re
@@ -178,7 +179,7 @@ except BaseException as auth_error:
     st.stop()
 
 
-VERSION = "V1.0.1"
+VERSION = "V1.0.2"
 
 st.set_page_config(
     page_title="产品资料库",
@@ -562,10 +563,28 @@ BASIC_FIELD_ORDER = [
 ]
 
 
+def _image_width_kwargs() -> dict:
+    """st.image 自适应宽度参数：新版叫 use_container_width，
+    云端 1.39 旧版叫 use_column_width —— 传错名字会直接 TypeError，
+    当前版本能认哪个就传哪个（都认不出就不传）。"""
+    try:
+        params = inspect.signature(st.image).parameters
+    except (TypeError, ValueError):
+        return {}
+    if "use_container_width" in params:
+        return {"use_container_width": True}
+    if "use_column_width" in params:
+        return {"use_column_width": True}
+    return {}
+
+
+_IMAGE_WIDTH_KWARGS = _image_width_kwargs()
+
+
 def _safe_image(url: str):
     """渲染图片，异常时降级成提示（单张坏图不拖垮整个页面）。"""
     try:
-        st.image(str(url), use_container_width=True)
+        st.image(str(url), **_IMAGE_WIDTH_KWARGS)
     except Exception:
         st.caption("🖼️ 该图片链接无法显示")
 
