@@ -73,6 +73,21 @@ def split_images(value) -> list:
     return [part for part in re.split(r"[\s,;|]+", text) if part]
 
 
+def display_images(value) -> list:
+    """可直接渲染的图片链接：// 开头补全 https:，非 http(s) 杂项忽略。
+
+    速卖通等页面抓下来的地址常是 //ae01.alicdn.com/...（不带协议），
+    直接交给 st.image 会被当成"本地文件"打开而报错，这里统一修好。
+    """
+    result = []
+    for token in split_images(value):
+        if token.startswith("//"):
+            token = "https:" + token
+        if token.lower().startswith(("http://", "https://")):
+            result.append(token)
+    return result
+
+
 def normalize_dataframe(frame: pd.DataFrame) -> pd.DataFrame:
     """列排序：模板列在前（模板顺序）→ 已知附加列 → 其余列殿后（数据不丢）。"""
     result = frame.copy().dropna(how="all")
@@ -163,7 +178,7 @@ except BaseException as auth_error:
     st.stop()
 
 
-VERSION = "V1.0"
+VERSION = "V1.0.1"
 
 st.set_page_config(
     page_title="产品资料库",
@@ -547,6 +562,14 @@ BASIC_FIELD_ORDER = [
 ]
 
 
+def _safe_image(url: str):
+    """渲染图片，异常时降级成提示（单张坏图不拖垮整个页面）。"""
+    try:
+        st.image(str(url), use_container_width=True)
+    except Exception:
+        st.caption("🖼️ 该图片链接无法显示")
+
+
 def _form_field(idx, row, column: str):
     """渲染一个编辑控件（图片列一行一链接，其余按单行/多行）。"""
     key = f"fld_{idx}_{column}"
@@ -614,23 +637,23 @@ def render_detail(frame: pd.DataFrame, idx, visible_indices):
 
     # ---- 图片 ----
     st.markdown("#### 🖼️ 产品图")
-    images = split_images(row.get("产品图"))
+    images = display_images(row.get("产品图"))
     if images:
         gallery = st.columns(min(len(images), CARDS_PER_ROW))
         for i, url in enumerate(images):
             with gallery[i % len(gallery)]:
-                st.image(str(url), use_container_width=True)
+                _safe_image(url)
                 st.markdown(f"[↗ 原图{i + 1}]({html_escape(str(url))})")
     else:
         st.caption("（无图片链接）")
 
-    intro_images = split_images(row.get("简介图"))
+    intro_images = display_images(row.get("简介图"))
     if intro_images:
         st.markdown("#### 📷 简介图")
         gallery = st.columns(min(len(intro_images), CARDS_PER_ROW))
         for i, url in enumerate(intro_images):
             with gallery[i % len(gallery)]:
-                st.image(str(url), use_container_width=True)
+                _safe_image(url)
                 st.markdown(f"[↗ 原图{i + 1}]({html_escape(str(url))})")
 
     reference = text_value(row.get("参考网址"))
@@ -743,9 +766,9 @@ def render_grid(frame: pd.DataFrame, visible_indices):
     for pos, idx in enumerate(page_indices):
         row = frame.loc[idx]
         with columns[pos % CARDS_PER_ROW]:
-            images = split_images(row.get("产品图"))
+            images = display_images(row.get("产品图"))
             if images:
-                st.image(str(images[0]), use_container_width=True)
+                _safe_image(images[0])
             else:
                 st.markdown(
                     '<div class="p-ph">🖼️<br>无图片</div>',
