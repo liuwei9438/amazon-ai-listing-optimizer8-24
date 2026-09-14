@@ -94,7 +94,7 @@ from analyzer.title_strategy_generator import (
     TitleStrategyGenerator,
 )
 
-VERSION = "V2.7.7-EMP"
+VERSION = "V2.7.8-EMP"
 
 # 采集插件「发送到优化」复制的数据列头（与插件导出 Excel 完全一致）
 COLLECTOR_HEADERS = [
@@ -203,6 +203,18 @@ ADMIN_MODE = _read_secrets_flag(
 ) or is_admin_user()
 
 
+# AI 服务商清单和各家在 Secrets 里的密钥名。
+# 智谱GLM（open.bigmodel.cn）走 OpenAI 兼容协议，和 DeepSeek 同一条
+# chat/completions 通道，只是端点/密钥/默认模型不同。
+AI_PROVIDERS = ["OpenAI", "DeepSeek", "智谱GLM"]
+
+PROVIDER_SECRET_NAMES = {
+    "OpenAI": "OPENAI_API_KEY",
+    "DeepSeek": "DEEPSEEK_API_KEY",
+    "智谱GLM": "ZHIPU_API_KEY",
+}
+
+
 def get_saved_provider_key(
     provider_name: str,
 ) -> str:
@@ -212,10 +224,8 @@ def get_saved_provider_key(
     401 密钥错误，导致整个任务全部失败。配错了宁可显示输入框。
     """
 
-    name = (
-        "DEEPSEEK_API_KEY"
-        if provider_name == "DeepSeek"
-        else "OPENAI_API_KEY"
+    name = PROVIDER_SECRET_NAMES.get(
+        provider_name, "OPENAI_API_KEY"
     )
 
     try:
@@ -232,15 +242,13 @@ def get_saved_provider_key(
 def get_other_provider_key(
     provider_name: str,
 ) -> str:
-    """对方服务商的密钥——只用来判断"是不是配错了家"，不拿来用。"""
+    """别家服务商的密钥——只用来判断"是不是配错了家"，不拿来用。"""
 
-    other = (
-        "OpenAI"
-        if provider_name == "DeepSeek"
-        else "DeepSeek"
-    )
+    for other in AI_PROVIDERS:
+        if other != provider_name and get_saved_provider_key(other):
+            return get_saved_provider_key(other)
 
-    return get_saved_provider_key(other)
+    return ""
 
 
 # =====================================================
@@ -848,7 +856,7 @@ with st.sidebar:
             )
 
             # ----------------------------------------
-            # AI 服务商选择：OpenAI 官方 / DeepSeek
+            # AI 服务商选择：OpenAI 官方 / DeepSeek / 智谱GLM
             #
             # 选择结果通过环境变量注入给后台任务线程；
             # 任务运行中锁定选择，避免中途换服务商导致请求发错地方。
@@ -885,28 +893,37 @@ with st.sidebar:
             else:
                 provider = st.radio(
                     "AI 服务商",
-                    ["OpenAI", "DeepSeek"],
+                    AI_PROVIDERS,
                     index=0,
                     horizontal=True,
                     key="ai_provider",
                     disabled=task_running_now,
-                    help="DeepSeek 更便宜、国内直连；OpenAI 为原默认配置。"
+                    help="DeepSeek 更便宜、国内直连；智谱GLM 用智谱账号"
+                    "（先扣新用户免费额度）；OpenAI 为原默认配置。"
                     "任务运行中不可切换。",
                 )
 
             if provider == "DeepSeek":
                 os.environ["OPENAI_BASE_URL"] = "https://api.deepseek.com"
+            elif provider == "智谱GLM":
+                os.environ["OPENAI_BASE_URL"] = (
+                    "https://open.bigmodel.cn/api/paas/v4"
+                )
             else:
                 os.environ["OPENAI_BASE_URL"] = "https://api.openai.com/v1"
 
             key_label = (
-                "DeepSeek API Key"
+                "智谱 API Key"
+                if provider == "智谱GLM"
+                else "DeepSeek API Key"
                 if provider == "DeepSeek"
                 else "OpenAI API Key"
             )
 
             key_hint = (
-                "到 platform.deepseek.com 充值并创建 Key"
+                "到 open.bigmodel.cn 控制台「API Keys」创建 Key"
+                if provider == "智谱GLM"
+                else "到 platform.deepseek.com 充值并创建 Key"
                 if provider == "DeepSeek"
                 else "到 platform.openai.com 充值并创建 Key"
             )
@@ -965,10 +982,8 @@ with st.sidebar:
                     # 避免以为已配置、实际全任务 401 失败。
                     if get_other_provider_key(provider):
 
-                        needed = (
-                            "DEEPSEEK_API_KEY"
-                            if provider == "DeepSeek"
-                            else "OPENAI_API_KEY"
+                        needed = PROVIDER_SECRET_NAMES.get(
+                            provider, "OPENAI_API_KEY"
                         )
 
                         st.caption(
@@ -986,6 +1001,8 @@ with st.sidebar:
             default_model = (
                 "deepseek-chat"
                 if provider == "DeepSeek"
+                else "glm-4.6"
+                if provider == "智谱GLM"
                 else "gpt-4.1-mini"
             )
 
@@ -994,6 +1011,7 @@ with st.sidebar:
                 "",
                 "gpt-4.1-mini",
                 "deepseek-chat",
+                "glm-4.6",
             ):
                 st.session_state["model_input"] = default_model
 
