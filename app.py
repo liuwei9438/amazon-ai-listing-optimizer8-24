@@ -94,7 +94,7 @@ from analyzer.title_strategy_generator import (
     TitleStrategyGenerator,
 )
 
-VERSION = "V2.7.8-EMP"
+VERSION = "V2.7.9-EMP"
 
 # 采集插件「发送到优化」复制的数据列头（与插件导出 Excel 完全一致）
 COLLECTOR_HEADERS = [
@@ -1309,8 +1309,9 @@ with st.sidebar:
                         enable_images,
 
                     # Internal safe default for product-level concurrency.
+                    # 智谱GLM 免费额度限速严（并发 3 就 429 全挂），串行跑。
                     "max_workers":
-                        4,
+                        1 if provider == "智谱GLM" else 4,
 
                 }
 
@@ -1819,7 +1820,7 @@ if current_task and status:
                                 enable_images,
 
                             "max_workers":
-                                4,
+                                1 if provider == "智谱GLM" else 4,
 
                         }
 
