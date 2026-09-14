@@ -94,7 +94,7 @@ from analyzer.title_strategy_generator import (
     TitleStrategyGenerator,
 )
 
-VERSION = "V2.7.10-EMP"
+VERSION = "V2.7.11-EMP"
 
 # 采集插件「发送到优化」复制的数据列头（与插件导出 Excel 完全一致）
 COLLECTOR_HEADERS = [
@@ -204,14 +204,13 @@ ADMIN_MODE = _read_secrets_flag(
 
 
 # AI 服务商清单和各家在 Secrets 里的密钥名。
-# 智谱GLM（open.bigmodel.cn）走 OpenAI 兼容协议，和 DeepSeek 同一条
-# chat/completions 通道，只是端点/密钥/默认模型不同。
-AI_PROVIDERS = ["OpenAI", "DeepSeek", "智谱GLM"]
+# V2.7.11：智谱GLM 已移除——免费额度按分钟限流太严（429 要求控制
+# 请求频率），串行+节流+长等待重试后单个产品仍要磨很久，先只留两家。
+AI_PROVIDERS = ["OpenAI", "DeepSeek"]
 
 PROVIDER_SECRET_NAMES = {
     "OpenAI": "OPENAI_API_KEY",
     "DeepSeek": "DEEPSEEK_API_KEY",
-    "智谱GLM": "ZHIPU_API_KEY",
 }
 
 
@@ -856,7 +855,7 @@ with st.sidebar:
             )
 
             # ----------------------------------------
-            # AI 服务商选择：OpenAI 官方 / DeepSeek / 智谱GLM
+            # AI 服务商选择：OpenAI 官方 / DeepSeek
             #
             # 选择结果通过环境变量注入给后台任务线程；
             # 任务运行中锁定选择，避免中途换服务商导致请求发错地方。
@@ -898,32 +897,23 @@ with st.sidebar:
                     horizontal=True,
                     key="ai_provider",
                     disabled=task_running_now,
-                    help="DeepSeek 更便宜、国内直连；智谱GLM 用智谱账号"
-                    "（先扣新用户免费额度）；OpenAI 为原默认配置。"
-                    "任务运行中不可切换。",
+                    help="DeepSeek 更便宜、国内直连；"
+                    "OpenAI 为原默认配置。任务运行中不可切换。",
                 )
 
             if provider == "DeepSeek":
                 os.environ["OPENAI_BASE_URL"] = "https://api.deepseek.com"
-            elif provider == "智谱GLM":
-                os.environ["OPENAI_BASE_URL"] = (
-                    "https://open.bigmodel.cn/api/paas/v4"
-                )
             else:
                 os.environ["OPENAI_BASE_URL"] = "https://api.openai.com/v1"
 
             key_label = (
-                "智谱 API Key"
-                if provider == "智谱GLM"
-                else "DeepSeek API Key"
+                "DeepSeek API Key"
                 if provider == "DeepSeek"
                 else "OpenAI API Key"
             )
 
             key_hint = (
-                "到 open.bigmodel.cn 控制台「API Keys」创建 Key"
-                if provider == "智谱GLM"
-                else "到 platform.deepseek.com 充值并创建 Key"
+                "到 platform.deepseek.com 充值并创建 Key"
                 if provider == "DeepSeek"
                 else "到 platform.openai.com 充值并创建 Key"
             )
@@ -1001,8 +991,6 @@ with st.sidebar:
             default_model = (
                 "deepseek-chat"
                 if provider == "DeepSeek"
-                else "glm-4.6"
-                if provider == "智谱GLM"
                 else "gpt-4.1-mini"
             )
 
@@ -1011,7 +999,6 @@ with st.sidebar:
                 "",
                 "gpt-4.1-mini",
                 "deepseek-chat",
-                "glm-4.6",
             ):
                 st.session_state["model_input"] = default_model
 
@@ -1309,9 +1296,7 @@ with st.sidebar:
                         enable_images,
 
                     # Internal safe default for product-level concurrency.
-                    # 智谱GLM 免费额度限速严（并发 3 就 429 全挂），串行跑。
-                    "max_workers":
-                        1 if provider == "智谱GLM" else 4,
+                    "max_workers": 4,
 
                 }
 
@@ -1819,8 +1804,7 @@ if current_task and status:
                             "optimize_images":
                                 enable_images,
 
-                            "max_workers":
-                                1 if provider == "智谱GLM" else 4,
+                            "max_workers": 4,
 
                         }
 
