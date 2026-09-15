@@ -94,7 +94,7 @@ from analyzer.title_strategy_generator import (
     TitleStrategyGenerator,
 )
 
-VERSION = "V2.7.11-EMP"
+VERSION = "V2.8.0"
 
 # 采集插件「发送到优化」复制的数据列头（与插件导出 Excel 完全一致）
 COLLECTOR_HEADERS = [
@@ -1383,6 +1383,44 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
+
+
+# =====================================================
+# V2.8 1688 找货页（仅管理员账号显示入口；员工界面不变）
+# =====================================================
+
+try:
+    from services.sourcing import (
+        render_sourcing_page,
+        sourcing_allowed,
+    )
+
+    _SRC_PAGE_OK = sourcing_allowed()
+
+except Exception as _src_err:
+    _SRC_PAGE_OK = False
+    if ADMIN_MODE:
+        st.error(f"找货模块加载失败：{_src_err}")
+
+if _SRC_PAGE_OK:
+    _page_choice = st.radio(
+        "功能区",
+        ["🛒 Listing 优化", "🔎 1688 找货"],
+        horizontal=True,
+        key="wz_main_page",
+        label_visibility="collapsed",
+    )
+
+    if "找货" in str(_page_choice):
+        render_sourcing_page(
+            envelope=envelope,
+            uploaded_name=str(
+                st.session_state.get("excel_name", "")
+            ),
+            api_key=api_key,
+            model=model,
+        )
+        st.stop()
 
 
 # =====================================================
