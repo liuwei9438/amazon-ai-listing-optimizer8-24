@@ -94,7 +94,7 @@ from analyzer.title_strategy_generator import (
     TitleStrategyGenerator,
 )
 
-VERSION = "V2.8.0"
+VERSION = "V2.9.0"
 
 # 采集插件「发送到优化」复制的数据列头（与插件导出 Excel 完全一致）
 COLLECTOR_HEADERS = [
@@ -1402,10 +1402,32 @@ except Exception as _src_err:
     if ADMIN_MODE:
         st.error(f"找货模块加载失败：{_src_err}")
 
+# V2.9 产品库（仅管理员）：永久产品库 + 找货结果自动挂产品
+try:
+    from services.product_lib import (
+        productlib_allowed,
+        render_product_library,
+    )
+
+    _PRODLIB_PAGE_OK = productlib_allowed()
+
+except Exception as _prodlib_err:
+    _PRODLIB_PAGE_OK = False
+    if ADMIN_MODE:
+        st.error(f"产品库模块加载失败：{_prodlib_err}")
+
+_page_options = ["🛒 Listing 优化"]
+
 if _SRC_PAGE_OK:
+    _page_options.append("🔎 1688 找货")
+
+if _PRODLIB_PAGE_OK:
+    _page_options.append("📚 产品库")
+
+if len(_page_options) > 1:
     _page_choice = st.radio(
         "功能区",
-        ["🛒 Listing 优化", "🔎 1688 找货"],
+        _page_options,
         horizontal=True,
         key="wz_main_page",
         label_visibility="collapsed",
@@ -1417,6 +1439,13 @@ if _SRC_PAGE_OK:
             uploaded_name=str(
                 st.session_state.get("excel_name", "")
             ),
+            api_key=api_key,
+            model=model,
+        )
+        st.stop()
+
+    if "产品库" in str(_page_choice):
+        render_product_library(
             api_key=api_key,
             model=model,
         )
