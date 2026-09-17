@@ -354,6 +354,17 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 # V2.6.2 账号门：Secrets 配置 app_users 后启用
 # =====================================================
 
+# V2.11.1：登录页右下角固定版本角标——未登录页面原本看不到版本号，
+# 云端部署有没有更新没法一眼确认；角标只在未登录时显示（登录后有
+# 顶部横幅的版本标签，不重复）。
+if not st.session_state.get("auth_user"):
+    st.markdown(
+        f'<div style="position:fixed;right:14px;bottom:12px;z-index:9999;'
+        f'background:#232F3E;color:#FF9900;font-size:12px;font-weight:700;'
+        f'border-radius:999px;padding:3px 12px;">{VERSION}</div>',
+        unsafe_allow_html=True,
+    )
+
 require_login()
 
 # V2.7.3：登录态写 Cookie（新标签页/采集插件打开的页面自动恢复登录）
