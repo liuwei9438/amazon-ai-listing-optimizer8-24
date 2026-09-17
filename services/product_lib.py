@@ -461,14 +461,20 @@ def _paste_to_dataframe(text: str):
     return pd.DataFrame(records, columns=_COLLECTOR_HEADERS), None
 
 
-def _prod_upsert(products: list, by: str) -> dict:
-    """分块调 /prod_upsert（每块 50 个，Worker 单次上限 100）。"""
+def _prod_upsert(products: list, by: str, progress=None) -> dict:
+    """分块调 /prod_upsert，progress(完成数, 总数) 每块回调一次。
+
+    Worker 免费版单次调用最多 50 次 KV 子操作（每次读写都算）：
+    一块 20 个产品 = 1 读索引 + 20 读 + 20 写 + 1 存索引 = 42 次，
+    稳在限内；块超过约 24 个就会中途报 Too many subrequests。
+    """
     added = 0
     updated = 0
     total = 0
+    n = len(products)
 
-    for start in range(0, len(products), 50):
-        chunk = products[start:start + 50]
+    for start in range(0, n, 20):
+        chunk = products[start:start + 20]
 
         data = src_api(
             "/prod_upsert",
@@ -483,7 +489,38 @@ def _prod_upsert(products: list, by: str) -> dict:
         updated += int(data.get("updated", 0))
         total = int(data.get("total", 0))
 
+        if progress:
+            try:
+                progress(min(start + len(chunk), n), n)
+            except Exception:
+                pass
+
     return {"added": added, "updated": updated, "total": total}
+
+
+def _prod_write(
+    path: str,
+    field: str,
+    values: list,
+    timeout: int = 60,
+    label: str = "写入失败",
+) -> None:
+    """批量写产品库（改分类/删产品/回写最佳供应商）分块提交。
+
+    和 _prod_upsert 同理：一块 20 条 ≈ 42 次 KV 子操作，
+    不超过 Worker 免费版单次 50 次的上限。失败抛 RuntimeError。
+    """
+    for start in range(0, len(values), 20):
+        chunk = values[start:start + 20]
+
+        resp = src_api(
+            path,
+            _pl_payload({field: chunk}),
+            timeout=timeout,
+        )
+
+        if not resp.get("ok"):
+            raise RuntimeError(str(resp.get("error") or label))
 
 
 # =====================================================
@@ -740,6 +777,13 @@ def _render_import(src_key: str, index: dict) -> None:
             hide_index=True,
         )
 
+        if len(products) > 800:
+            st.caption(
+                "⚠️ 一次导入超过 800 个产品：KV 免费档每天共 1000 次写入，"
+                "这次会占用大部分额度；如中途报配额错误，明早 8 点后"
+                "重新导入同一份 Excel 即可（已导入的自动算更新，不重复）。"
+            )
+
         if st.button(
             f"✅ 导入产品库（{len(products)} 个产品）",
             type="primary",
@@ -751,6 +795,10 @@ def _render_import(src_key: str, index: dict) -> None:
                 result = _prod_upsert(
                     products,
                     _current_user()[:32] or "optimizer",
+                    progress=lambda done, total: bar.progress(
+                        done / total if total else 1.0,
+                        f"导入产品库… {done} / {total}",
+                    ),
                 )
 
             except Exception as exc:
@@ -1371,16 +1419,13 @@ def _finalize_batch(src_key: str, record: dict) -> int:
         )
 
     if updates:
-        resp = src_api(
+        # 分块写（免费版 Worker 单次最多 50 次子操作）
+        _prod_write(
             "/prod_best_set",
-            _pl_payload({"updates": updates}),
-            timeout=60,
+            "updates",
+            updates,
+            label="保存最佳供应商失败",
         )
-
-        if not resp.get("ok"):
-            raise RuntimeError(
-                str(resp.get("error") or "保存最佳供应商失败")
-            )
 
     return len(updates)
 
@@ -1670,30 +1715,29 @@ def _render_table(src_key: str) -> None:
 
     if updates:
         try:
-            resp = src_api(
+            # 分块写（免费版 Worker 单次最多 50 次子操作）
+            _prod_write(
                 "/prod_update",
-                _pl_payload({"updates": updates}),
-                timeout=60,
+                "updates",
+                updates,
+                label="保存修改失败",
             )
 
-            if resp.get("ok"):
-                by_pid = {u["pid"]: u for u in updates}
-                session_index = st.session_state.get("prodlib_index")
+            by_pid = {u["pid"]: u for u in updates}
+            session_index = st.session_state.get("prodlib_index")
 
-                if isinstance(session_index, dict):
-                    for it in session_index.get("items", []):
-                        change = by_pid.get(it.get("pid"))
+            if isinstance(session_index, dict):
+                for it in session_index.get("items", []):
+                    change = by_pid.get(it.get("pid"))
 
-                        if change:
-                            it["kw"] = change["kw"]
-                            it["cat"] = change["cat"]
+                    if change:
+                        it["kw"] = change["kw"]
+                        it["cat"] = change["cat"]
 
-                st.toast(f"✅ 已保存 {len(updates)} 处修改")
-                st.rerun()
+            st.toast(f"✅ 已保存 {len(updates)} 处修改")
+            st.rerun()
 
-                return
-
-            st.error(f"保存修改失败：{resp.get('error')}")
+            return
 
         except Exception as exc:
             st.error(f"保存修改失败：{exc}")
@@ -1804,17 +1848,12 @@ def _render_table(src_key: str) -> None:
 
                 else:
                     try:
-                        src_api(
+                        # 分块写（免费版 Worker 单次最多 50 次子操作）
+                        _prod_write(
                             "/prod_update",
-                            _pl_payload(
-                                {
-                                    "updates": [
-                                        {"pid": p, "cat": name}
-                                        for p in sel_pids
-                                    ]
-                                }
-                            ),
-                            timeout=60,
+                            "updates",
+                            [{"pid": p, "cat": name} for p in sel_pids],
+                            label="设置失败",
                         )
                         st.session_state.pop("prodlib_cat_panel", None)
                         _refresh_index(src_key)
@@ -1844,11 +1883,8 @@ def _render_table(src_key: str) -> None:
             use_container_width=True,
         ):
             try:
-                src_api(
-                    "/prod_del",
-                    _pl_payload({"pids": sel_pids}),
-                    timeout=60,
-                )
+                # 分块删（免费版 Worker 单次最多 50 次子操作）
+                _prod_write("/prod_del", "pids", sel_pids, label="删除失败")
                 st.session_state.pop("prodlib_del_panel", None)
                 _refresh_index(src_key)
                 st.toast(f"🗑 已删除 {len(sel_pids)} 个产品")
