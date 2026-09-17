@@ -2,7 +2,7 @@ from __future__ import annotations
 
 
 # =====================================================
-# V2.9 产品库（优化程序端，仅管理员）
+# V2.10 产品库（优化程序端，仅管理员）
 #
 # 永久产品库：产品存在 Worker KV（prod:<pid>），Streamlit 重启
 # 也不丢。核心能力：
@@ -10,15 +10,19 @@ from __future__ import annotations
 #      变体行挂在产品下；重复导入 = 合并更新，不重复建条
 #   ② 管理：分类筛选 / 标题·SKU·型号搜索 / 状态计数
 #      （待找货 / 已找到 / 没找到）/ 搜索词和分类表格里直接改
-#   ③ 找货：勾选 N 个（或整分类筛完全导出）→ AI 转中文搜索词
-#      → 建任务带 pid → 老板插件跑 1688 → Worker 把结果永久挂到
-#      产品记录（保留最近 5 轮，含找货时间）→ 这里算匹配分并
-#      保存最佳供应商 → 状态变 ✅已找到
+#   ③ 找货（V2.10 并入本页，独立找货页已删）：勾选 N 个 →
+#      「一键找供应商」自动 AI 转中文搜索词 → 建任务带 pid →
+#      老板插件自动接单跑 1688 → Worker 把结果永久挂到产品记录
+#      （保留最近 5 轮，含找货时间）→ 这里算匹配分并保存最佳
+#      供应商 → 状态变 ✅已找到
 #   ④ 重新找货：换个日子核价，历史轮次都留着
 #   ⑤ 导出：产品 + 采购五列 的 Excel
 #
-# 与「1688 找货」页并存：那一页是 Excel 快速通道，这一页是
-# 长期台账。复用 sourcing 的打分 / AI 转换 / 轮询逻辑。
+# V2.11 产品归属：每个员工自己的库（登录 token 鉴权；总后台
+# 「开找货」= 产品库+找货权限）；管理员可看「全部产品」（只读）
+# 或某个人的库（只读）。写操作永远只落自己的库。
+#
+# 复用 sourcing 的打分 / AI 转换 / 轮询逻辑。
 # =====================================================
 
 
@@ -48,7 +52,6 @@ from services.sourcing import (
     prefetch_phashes,
     score_candidate,
     src_api,
-    sourcing_allowed,
 )
 
 
@@ -77,18 +80,118 @@ _COLLECTOR_HEADERS = [
 
 
 def productlib_allowed() -> bool:
-    """产品库入口权限 = 找货（管理员账号；没配登录的本地开发放行）。"""
-    return sourcing_allowed()
+    """产品库入口：登录账号要开找货权限（总后台「开找货」）；
+    管理员（app_admins）始终可见；没配登录的本地开发放行。"""
+    try:
+        from services.user_auth import current_user
+
+        me = str(current_user() or "")
+
+    except Exception:
+        me = ""
+
+    if not me:
+        return True  # 没配登录（本地开发）
+
+    if _pl_is_admin():
+        return True
+
+    return bool(st.session_state.get("auth_src"))
+
+
+def _pl_is_admin() -> bool:
+    try:
+        from services.user_auth import is_admin_user
+
+        return bool(is_admin_user())
+
+    except Exception:
+        return False
+
+
+def _admin_key() -> str:
+    """总管理密钥（优化程序 Secrets 的 auth_admin_key；只有管理员带）。"""
+    try:
+        return str(st.secrets["auth_admin_key"] or "").strip()
+
+    except Exception:
+        return ""
+
+
+def _prod_auth() -> dict:
+    """V2.11 产品库请求的鉴权：优先登录账号 token（各人自己的库）；
+    没登录（本地开发）退回找货密钥（旧全局库）。"""
+    token = str(st.session_state.get("auth_token") or "")
+
+    if token:
+        payload = {"token": token}
+
+        if _pl_is_admin() and _admin_key():
+            payload["admin_key"] = _admin_key()
+
+        return payload
+
+    return {"key": get_src_key()}
+
+
+def _scope_owner() -> str:
+    """管理员当前查看的范围："" = 自己的库；"all" = 全部（只读）；
+    "<账号>" = 看某个人的（只读）。非管理员恒为 ""。"""
+    if not _pl_is_admin():
+        return ""
+
+    return str(st.session_state.get("prodlib_scope_owner") or "")
+
+
+def _pl_payload(extra: dict | None = None, scoped: bool = False) -> dict:
+    """产品库请求的公共载荷。scoped=True（/prod_list）时带上管理员
+    当前查看的范围；写操作一律走自己的库（别人的库在前端只读）。"""
+    payload = _prod_auth()
+
+    if scoped:
+        scope = _scope_owner()
+
+        if scope == "all":
+            payload["scope"] = "all"
+
+        elif scope:
+            payload["owner"] = scope
+
+    if extra:
+        payload.update(extra)
+
+    return payload
+
+
+def _pid_owner(pid: str) -> str:
+    """取产品详情时它在谁的库（管理员看「全部产品」按索引归属取；
+    自己的库返回 ""）。"""
+    scope = _scope_owner()
+
+    if scope != "all":
+        return scope
+
+    for it in (st.session_state.get("prodlib_index") or {}).get("items") or []:
+        if str(it.get("pid")) == str(pid):
+            return str(it.get("owner") or "")
+
+    return ""
 
 
 def _refresh_index(src_key: str) -> dict:
-    """从 Worker 拉产品库索引（精简列表 + 分类 + 状态计数）存进会话。"""
-    data = src_api("/prod_list", {"key": src_key}, timeout=40)
+    """从 Worker 拉产品库索引（V2.11 按登录账号 / 管理员选的范围）。"""
+    data = src_api("/prod_list", _pl_payload(scoped=True), timeout=40)
 
     if not data.get("ok"):
         raise RuntimeError(str(data.get("error") or "读取产品库失败"))
 
     st.session_state["prodlib_index"] = data
+
+    # scope=all 的响应带全部库主名单（给「看谁的库」下拉用）
+    if data.get("owners"):
+        st.session_state["prodlib_all_owners"] = [
+            str(o) for o in data.get("owners") or [] if str(o or "").strip()
+        ]
 
     return data
 
@@ -129,6 +232,8 @@ def _save_pl_batches(batches: list) -> None:
 
 
 def _append_pl_batch(record: dict) -> None:
+    # V2.11：记是谁建的批次（各人只看自己的进行中批次）
+    record["user"] = _current_user() or ""
     batches = _load_pl_batches()
     batches.insert(0, record)
     _save_pl_batches(batches)
@@ -148,15 +253,30 @@ def _set_pl_flag(batch_id: str, flag: str, value=True) -> None:
 
 
 def _pending_batch_id() -> str | None:
-    """进行中的产品库批次：会话里的优先，否则最近一个没收尾的。"""
+    """进行中的产品库批次：会话里的优先，否则最近一个没收尾的。
+    V2.11：各人只认自己建的批次；旧记录（没记 user）只有管理员能接。"""
     active = st.session_state.get("prodlib_active")
 
     if active:
         return str(active)
 
+    me = _current_user() or ""
+    admin = _pl_is_admin()
+
     for record in _load_pl_batches():
-        if record.get("batch_id") and not record.get("finalized") and not record.get("abandoned"):
-            return str(record.get("batch_id"))
+        if not (
+            record.get("batch_id")
+            and not record.get("finalized")
+            and not record.get("abandoned")
+        ):
+            continue
+
+        owner = str(record.get("user") or "")
+
+        if not admin and (owner or me) and owner != me:
+            continue
+
+        return str(record.get("batch_id"))
 
     return None
 
@@ -343,7 +463,6 @@ def _paste_to_dataframe(text: str):
 
 def _prod_upsert(products: list, by: str) -> dict:
     """分块调 /prod_upsert（每块 50 个，Worker 单次上限 100）。"""
-    key = get_src_key()
     added = 0
     updated = 0
     total = 0
@@ -353,7 +472,7 @@ def _prod_upsert(products: list, by: str) -> dict:
 
         data = src_api(
             "/prod_upsert",
-            {"key": key, "by": by, "products": chunk},
+            _pl_payload({"by": by, "products": chunk}),
             timeout=60,
         )
 
@@ -457,7 +576,7 @@ def _export_products(items: list) -> io.BytesIO:
 
 
 def render_product_library(api_key: str, model: str) -> None:
-    """产品库主页面（仅管理员，见 productlib_allowed）。"""
+    """产品库主页面（管理员 + 开了找货权限的账号，见 productlib_allowed）。"""
     st.markdown(
         """
         <div class="hint-bar">
@@ -469,12 +588,21 @@ def render_product_library(api_key: str, model: str) -> None:
         unsafe_allow_html=True,
     )
 
+    # V2.11：管理员可切换看谁的库（自己的可操作，别人的只读）
+    if _pl_is_admin():
+        _render_scope_selector()
+
     src_key = get_src_key()
 
-    if not src_key:
+    # V2.11：登录账号走 token，不需要 SRC_KEY；只拦没登录又没配密钥的
+    if (
+        not str(st.session_state.get("auth_token") or "")
+        and not src_key
+    ):
         st.warning(
             "还没配置找货密钥：管理后台（Worker /manage）点「生成找货密钥」，"
-            "再把密钥填进优化程序 Secrets 的 SRC_KEY。产品库和找货共用这把密钥。"
+            "再把密钥填进优化程序 Secrets 的 SRC_KEY。"
+            "（登录账号使用产品库不需要密钥，这条只影响没登录的本地开发。）"
         )
 
         return
@@ -488,12 +616,44 @@ def render_product_library(api_key: str, model: str) -> None:
     _render_detail(src_key)
 
 
+def _render_scope_selector() -> None:
+    """管理员看谁的库：自己的 / 全部产品（只读）/ 某个员工（只读）。"""
+    owners = st.session_state.get("prodlib_all_owners") or []
+    options = ["", "all"] + [
+        str(o)
+        for o in owners
+        if str(o or "").strip() and str(o) not in ("", "all")
+    ]
+    labels = {"": "我的库", "all": "全部产品（只读）"}
+
+    current = _scope_owner()
+
+    if current not in options:
+        current = ""
+
+    pick = st.selectbox(
+        "看谁的库",
+        options,
+        index=options.index(current),
+        format_func=lambda v: labels.get(v, f"@{v} 的库（只读）"),
+        key="prodlib_scope_pick",
+    )
+
+    if pick != _scope_owner():
+        st.session_state["prodlib_scope_owner"] = pick
+        st.session_state.pop("prodlib_index", None)
+        st.rerun()
+
+
 # -----------------------------------------------------
 # ① 导入
 # -----------------------------------------------------
 
 
 def _render_import(src_key: str, index: dict) -> None:
+    if _scope_owner():
+        return  # 只读视图（别人的库）：导入只进自己的库
+
     items = index.get("items") or []
 
     with st.expander(
@@ -622,6 +782,9 @@ def _render_import(src_key: str, index: dict) -> None:
 
 
 def _render_sourcing_panel(src_key: str, api_key: str, model: str) -> None:
+    if _scope_owner():
+        return  # 只读视图：找货只对自己的库发起
+
     if not st.session_state.get("prodlib_src_panel"):
         return
 
@@ -639,112 +802,67 @@ def _render_sourcing_panel(src_key: str, api_key: str, model: str) -> None:
 
         return
 
+    convert_key = "prodlib_convert"
+
     with st.expander(
         f"🔍 给 {len(products)} 个产品找供应商（1688）",
         expanded=True,
     ):
-        mode = st.radio(
-            "找货粒度",
-            [
-                "整品找（推荐：1 个产品 1 个任务）",
-                "按变体分别找（变体是不同零件时用，各自带图搜）",
-            ],
-            key="prodlib_mode",
-        )
+        with st.expander("⚙ 高级选项（按变体找 / 修改搜索词）"):
+            mode = st.radio(
+                "找货粒度",
+                [
+                    "整品找（推荐：1 个产品 1 个任务）",
+                    "按变体分别找（变体是不同零件时用，各自带图搜）",
+                ],
+                key="prodlib_mode",
+            )
 
-        per_variant = str(mode).startswith("按变体")
+            per_variant = str(mode).startswith("按变体")
 
-        # ---- AI 转换：只转还没有中文搜索词的 ----
-        convert_key = "prodlib_convert"
+            convert_map = st.session_state.get(convert_key) or {}
 
-        convert_map = st.session_state.get(convert_key) or {}
+            # ---- 搜索词微调（留空的点按钮时自动 AI 转换） ----
+            edit_rows = []
 
-        need_convert = [
-            it
-            for it in products
-            if not str(it.get("kw") or "").strip()
-            and str(it.get("pid")) not in convert_map
-        ]
+            for it in products:
+                conv = convert_map.get(str(it.get("pid"))) or {}
+                title = str(it.get("title") or "")
 
-        has_key = bool(str(api_key or "").strip())
+                edit_rows.append(
+                    {
+                        "pid": str(it.get("pid")),
+                        "SKU": str(it.get("sku") or "")[:20],
+                        "标题": title[:36],
+                        "搜索词": str(
+                            conv.get("kw") or it.get("kw") or ""
+                        )[:60],
+                        "型号": str(
+                            conv.get("model")
+                            or it.get("model")
+                            or fallback_model(title)
+                        )[:60],
+                        "品牌": str(conv.get("brand") or "")[:30],
+                    }
+                )
 
-        if not has_key:
             st.caption(
-                "💡 左侧没配 AI Key：可以跳过 AI，用现有搜索词/英文标题建任务"
-                "（英文标题在 1688 效果差，建议先在表格里手填中文搜索词）。"
+                "搜索词可以直接改；留空的会在点「一键找供应商」时自动用 AI 转好。"
             )
 
-        elif need_convert:
-            if st.button(
-                f"🤖 AI 转换搜索词（{len(need_convert)} 个还没搜索词的）",
-                type="primary",
-                key="pl_convert_btn",
-            ):
-                bar = st.progress(0.0, "AI 转换中…")
-                converted = None
-
-                try:
-                    converted = convert_search_terms(
-                        [it.get("title") or "" for it in need_convert],
-                        api_key,
-                        model,
-                    )
-
-                except Exception as exc:
-                    st.error(f"AI 转换失败：{exc}")
-
-                finally:
-                    bar.empty()
-
-                if converted is not None:
-                    merged = dict(convert_map)
-
-                    for it, entry in zip(need_convert, converted):
-                        merged[str(it.get("pid"))] = entry
-
-                    st.session_state[convert_key] = merged
-
-        convert_map = st.session_state.get(convert_key) or {}
-
-        # ---- 搜索词微调 ----
-        edit_rows = []
-
-        for it in products:
-            conv = convert_map.get(str(it.get("pid"))) or {}
-            title = str(it.get("title") or "")
-
-            edit_rows.append(
-                {
-                    "pid": str(it.get("pid")),
-                    "SKU": str(it.get("sku") or "")[:20],
-                    "标题": title[:36],
-                    "搜索词": str(
-                        conv.get("kw") or it.get("kw") or ""
-                    )[:60],
-                    "型号": str(
-                        conv.get("model")
-                        or it.get("model")
-                        or fallback_model(title)
-                    )[:60],
-                    "品牌": str(conv.get("brand") or "")[:30],
-                }
+            kw_edited = st.data_editor(
+                pd.DataFrame(edit_rows),
+                key="pl_kw_editor",
+                num_rows="fixed",
+                use_container_width=True,
+                hide_index=True,
+                disabled=["pid", "SKU", "标题"],
             )
 
-        st.caption("搜索词可以直接改，改完再创建任务：")
-
-        kw_edited = st.data_editor(
-            pd.DataFrame(edit_rows),
-            key="pl_kw_editor",
-            num_rows="fixed",
-            use_container_width=True,
-            hide_index=True,
-            disabled=["pid", "SKU", "标题"],
-        )
-
-        act_a, act_b = st.columns(2)
+        act_a, act_b = st.columns([3, 1])
 
         create_clicked = act_a.button(
-            f"📨 创建找货任务（{len(products)} 个产品）",
+            f"🚀 一键找供应商（{len(products)} 个产品）",
             type="primary",
             key="pl_create_btn",
             use_container_width=True,
@@ -759,12 +877,90 @@ def _render_sourcing_panel(src_key: str, api_key: str, model: str) -> None:
             return
 
         if create_clicked:
-            _create_product_batch(
+            _one_click_create(
                 src_key,
+                api_key,
+                model,
                 products,
                 kw_edited,
                 per_variant,
             )
+
+
+def _one_click_create(
+    src_key: str,
+    api_key: str,
+    model: str,
+    products: list,
+    kw_frame: pd.DataFrame,
+    per_variant: bool,
+) -> None:
+    """一键找供应商：没中文搜索词的先自动 AI 转换，然后直接建任务。"""
+    records = kw_frame.to_dict("records")
+
+    need_convert = [
+        it
+        for rec, it in zip(records, products)
+        if not str(rec.get("搜索词") or "").strip()
+        and not str(it.get("kw") or "").strip()
+    ]
+
+    converted = None
+
+    if need_convert and str(api_key or "").strip():
+        with st.spinner(
+            f"🤖 AI 转中文搜索词（{len(need_convert)} 个）…"
+        ):
+            try:
+                converted = convert_search_terms(
+                    [it.get("title") or "" for it in need_convert],
+                    api_key,
+                    model,
+                )
+
+            except Exception as exc:
+                converted = None
+                st.warning(
+                    f"AI 转换失败，这次先用英文标题跑：{exc}"
+                )
+
+    elif need_convert:
+        st.caption(
+            "💡 左侧没配 AI Key：没搜索词的这次用英文标题先跑"
+            "（英文在 1688 效果差，之后可在表格里补中文再重找）。"
+        )
+
+    if converted:
+        merged = dict(st.session_state.get("prodlib_convert") or {})
+
+        for it, entry in zip(need_convert, converted):
+            merged[str(it.get("pid"))] = entry
+
+        st.session_state["prodlib_convert"] = merged
+
+        conv_by_pid = {
+            str(it.get("pid")): entry
+            for it, entry in zip(need_convert, converted)
+        }
+
+        for rec, it in zip(records, products):
+            entry = conv_by_pid.get(str(it.get("pid")))
+
+            if entry and not str(rec.get("搜索词") or "").strip():
+                rec["搜索词"] = str(entry.get("kw") or "")[:60]
+
+                if not str(rec.get("型号") or "").strip():
+                    rec["型号"] = str(entry.get("model") or "")[:60]
+
+                if not str(rec.get("品牌") or "").strip():
+                    rec["品牌"] = str(entry.get("brand") or "")[:30]
+
+    _create_product_batch(
+        src_key,
+        products,
+        pd.DataFrame(records),
+        per_variant,
+    )
 
 
 def _create_product_batch(
@@ -790,7 +986,10 @@ def _create_product_batch(
             pid = str(it.get("pid"))
 
             try:
-                data = src_api("/prod_list", {"key": src_key, "pid": pid})
+                data = src_api(
+                    "/prod_list",
+                    _pl_payload({"pid": pid}),
+                )
 
                 if data.get("ok") and data.get("product"):
                     full_records[pid] = data["product"]
@@ -886,12 +1085,13 @@ def _create_product_batch(
     try:
         data = src_api(
             "/src_task_add",
-            {
-                "key": get_src_key(),
-                "by": _current_user()[:32] or "optimizer",
-                "note": f"产品库 {len(tasks)} 个",
-                "tasks": tasks,
-            },
+            _pl_payload(
+                {
+                    "by": _current_user()[:32] or "optimizer",
+                    "note": f"产品库 {len(tasks)} 个",
+                    "tasks": tasks,
+                }
+            ),
             timeout=60,
         )
 
@@ -957,7 +1157,7 @@ def _render_active_batch(src_key: str) -> None:
     try:
         data = src_api(
             "/src_tasks_view",
-            {"key": src_key, "batch_id": batch_id, "with_results": False},
+            _pl_payload({"batch_id": batch_id, "with_results": False}),
         )
 
     except Exception as exc:
@@ -987,8 +1187,8 @@ def _render_active_batch(src_key: str) -> None:
         _render_live(src_key, batch_id)
 
         st.info(
-            "打开老板 Chrome 的采集插件点「开始找货」，插件自动认领执行；"
-            "这里每 20 秒自动刷新。"
+            "老板 Chrome 的插件保持开启就行（v5.1 起自动接单：每分钟检查一次"
+            "队列，有任务自动执行）；这里每 20 秒自动刷新。"
         )
 
         if st.button(
@@ -1056,11 +1256,7 @@ def _render_live(src_key: str, batch_id: str) -> None:
         try:
             data = src_api(
                 "/src_tasks_view",
-                {
-                    "key": src_key,
-                    "batch_id": batch_id,
-                    "with_results": False,
-                },
+                _pl_payload({"batch_id": batch_id, "with_results": False}),
             )
 
             live_counts = (
@@ -1104,11 +1300,9 @@ def _finalize_batch(src_key: str, record: dict) -> int:
     """批次跑完后：拉结果 → 算匹配分 → 最佳供应商写回产品。"""
     data = src_api(
         "/src_tasks_view",
-        {
-            "key": src_key,
-            "batch_id": record.get("batch_id"),
-            "with_results": True,
-        },
+        _pl_payload(
+            {"batch_id": record.get("batch_id"), "with_results": True}
+        ),
         timeout=40,
     )
 
@@ -1179,7 +1373,7 @@ def _finalize_batch(src_key: str, record: dict) -> int:
     if updates:
         resp = src_api(
             "/prod_best_set",
-            {"key": src_key, "updates": updates},
+            _pl_payload({"updates": updates}),
             timeout=60,
         )
 
@@ -1201,6 +1395,10 @@ def _render_table(src_key: str) -> None:
     items = index.get("items") or []
     cats = list(index.get("cats") or [])
     counts = index.get("counts") or {}
+
+    # V2.11：只读视图（别人的库 / 全部产品）
+    read_only = bool(_scope_owner())
+    show_owner = _scope_owner() == "all"
 
     if any(not str(it.get("cat") or "").strip() for it in items):
         if "未分类" not in cats:
@@ -1335,6 +1533,21 @@ def _render_table(src_key: str) -> None:
 
         return
 
+    # ---- 勾选状态：会话里存 pid 集合，跨页 / 翻页保留 ----
+    sel_state_key = "prodlib_selected"
+
+    valid_pids = {str(it.get("pid")) for it in filtered}
+
+    try:
+        selected = set(
+            st.session_state.get(sel_state_key) or []
+        ) & valid_pids
+
+    except Exception:
+        selected = set()
+
+    page_pid_set = {str(it.get("pid")) for it in page_items}
+
     rows_src = []
     row_pids = []
 
@@ -1343,7 +1556,12 @@ def _render_table(src_key: str) -> None:
 
         rows_src.append(
             {
-                "选": False,
+                **({} if read_only else {"选": str(it.get("pid")) in selected}),
+                **(
+                    {"归属": str(it.get("owner") or "—")[:16]}
+                    if show_owner
+                    else {}
+                ),
                 "图": str(it.get("img") or ""),
                 "标题": str(it.get("title") or "")[:60],
                 "型号": str(it.get("model") or "")[:20],
@@ -1361,18 +1579,41 @@ def _render_table(src_key: str) -> None:
         )
         row_pids.append(str(it.get("pid")))
 
-    editor_key = (
-        f"prodlib_editor_{page}_{status_code}_{cat_choice}_{needle}"
-    )
+    if read_only:
+        st.caption("👁 只读视图 — 要操作产品请切回自己的库。")
+
+    else:
+        sel_bar1, sel_bar2, sel_bar3 = st.columns([1, 1, 2])
+
+        if sel_bar1.button(
+            "☑ 全选本页",
+            key="pl_sel_all",
+            use_container_width=True,
+        ):
+            st.session_state[sel_state_key] = sorted(selected | page_pid_set)
+            st.rerun()
+
+            return
+
+        if sel_bar2.button(
+            "✖ 清空勾选",
+            key="pl_sel_none",
+            use_container_width=True,
+        ):
+            st.session_state[sel_state_key] = []
+            st.rerun()
+
+            return
+
+        sel_bar3.caption(f"已勾选 **{len(selected)}** 个（跨页保留）")
 
     edited = st.data_editor(
         pd.DataFrame(rows_src),
-        key=editor_key,
         num_rows="fixed",
         hide_index=True,
         use_container_width=True,
         height=min(38 * len(rows_src) + 60, 640),
-        disabled=[
+        disabled=True if read_only else [
             "图", "标题", "型号", "变体", "状态",
             "最佳供应商", "采购链接", "找货时间",
         ],
@@ -1403,6 +1644,17 @@ def _render_table(src_key: str) -> None:
     except Exception:
         edited_rows = []
 
+    # ---- 本页勾选写回会话（其他页的保留；只读视图不碰勾选） ----
+    if not read_only:
+        page_checked = {
+            pid
+            for ed_row, pid in zip(edited_rows, row_pids)
+            if bool(ed_row.get("选"))
+        }
+
+        selected = (selected - page_pid_set) | page_checked
+        st.session_state[sel_state_key] = sorted(selected)
+
     # ---- 表格里改的 搜索词/分类 自动保存 ----
     updates = []
 
@@ -1420,7 +1672,7 @@ def _render_table(src_key: str) -> None:
         try:
             resp = src_api(
                 "/prod_update",
-                {"key": src_key, "updates": updates},
+                _pl_payload({"updates": updates}),
                 timeout=60,
             )
 
@@ -1446,37 +1698,39 @@ def _render_table(src_key: str) -> None:
         except Exception as exc:
             st.error(f"保存修改失败：{exc}")
 
-    sel_pids = [
-        pid
-        for src_row, ed_row, pid in zip(rows_src, edited_rows, row_pids)
-        if bool(ed_row.get("选"))
-    ]
+    sel_pids = sorted(selected)
 
     n_sel = len(sel_pids)
 
-    b1, b2, b3, b4 = st.columns(4)
+    src_btn = cat_btn = del_btn = False
 
-    src_btn = b1.button(
-        f"🔍 找供应商（{n_sel}）",
-        type="primary",
-        key="pl_src_btn",
-        use_container_width=True,
-        disabled=not n_sel,
-    )
+    if read_only:
+        b4 = st.columns(1)[0]
 
-    cat_btn = b2.button(
-        f"🏷 设分类（{n_sel}）",
-        key="pl_cat_btn",
-        use_container_width=True,
-        disabled=not n_sel,
-    )
+    else:
+        b1, b2, b3, b4 = st.columns(4)
 
-    del_btn = b3.button(
-        f"🗑 删除（{n_sel}）",
-        key="pl_del_btn",
-        use_container_width=True,
-        disabled=not n_sel,
-    )
+        src_btn = b1.button(
+            f"🔍 找供应商（{n_sel}）",
+            type="primary",
+            key="pl_src_btn",
+            use_container_width=True,
+            disabled=not n_sel,
+        )
+
+        cat_btn = b2.button(
+            f"🏷 设分类（{n_sel}）",
+            key="pl_cat_btn",
+            use_container_width=True,
+            disabled=not n_sel,
+        )
+
+        del_btn = b3.button(
+            f"🗑 删除（{n_sel}）",
+            key="pl_del_btn",
+            use_container_width=True,
+            disabled=not n_sel,
+        )
 
     export_items = (
         [it for it in filtered if str(it.get("pid")) in set(sel_pids)]
@@ -1552,13 +1806,14 @@ def _render_table(src_key: str) -> None:
                     try:
                         src_api(
                             "/prod_update",
-                            {
-                                "key": src_key,
-                                "updates": [
-                                    {"pid": p, "cat": name}
-                                    for p in sel_pids
-                                ],
-                            },
+                            _pl_payload(
+                                {
+                                    "updates": [
+                                        {"pid": p, "cat": name}
+                                        for p in sel_pids
+                                    ]
+                                }
+                            ),
                             timeout=60,
                         )
                         st.session_state.pop("prodlib_cat_panel", None)
@@ -1591,7 +1846,7 @@ def _render_table(src_key: str) -> None:
             try:
                 src_api(
                     "/prod_del",
-                    {"key": src_key, "pids": sel_pids},
+                    _pl_payload({"pids": sel_pids}),
                     timeout=60,
                 )
                 st.session_state.pop("prodlib_del_panel", None)
@@ -1613,6 +1868,9 @@ def _render_table(src_key: str) -> None:
 
 
 def _render_detail(src_key: str) -> None:
+    # V2.11：只读视图（别人的库）— 能看能算分，不能改不能重找
+    ro = bool(_scope_owner())
+
     index = st.session_state.get("prodlib_index") or {}
     items = index.get("items") or []
 
@@ -1640,7 +1898,10 @@ def _render_detail(src_key: str) -> None:
     pid = str(it.get("pid"))
 
     try:
-        data = src_api("/prod_list", {"key": src_key, "pid": pid})
+        data = src_api(
+            "/prod_list",
+            _pl_payload({"pid": pid, "owner": _pid_owner(pid)}),
+        )
 
     except Exception as exc:
         st.error(f"读取产品失败：{exc}")
@@ -1702,6 +1963,7 @@ def _render_detail(src_key: str) -> None:
                 value=str(rec.get("kw") or ""),
                 key=f"pl_d_kw_{pid}",
                 max_chars=60,
+                disabled=ro,
             )
 
         with e2:
@@ -1710,6 +1972,7 @@ def _render_detail(src_key: str) -> None:
                 value=str(rec.get("cat") or ""),
                 key=f"pl_d_cat_{pid}",
                 max_chars=40,
+                disabled=ro,
             )
 
         with e3:
@@ -1721,6 +1984,7 @@ def _render_detail(src_key: str) -> None:
                 index=["wait", "found", "none"].index(status_now),
                 format_func=lambda s: _STATUS_LABELS.get(s, s),
                 key=f"pl_d_st_{pid}",
+                disabled=ro,
             )
 
         with e4:
@@ -1730,21 +1994,23 @@ def _render_detail(src_key: str) -> None:
                 "💾 保存",
                 key=f"pl_d_save_{pid}",
                 use_container_width=True,
+                disabled=ro,
             ):
                 try:
                     src_api(
                         "/prod_update",
-                        {
-                            "key": src_key,
-                            "updates": [
-                                {
-                                    "pid": pid,
-                                    "kw": new_kw.strip(),
-                                    "cat": new_cat.strip(),
-                                    "status": new_status,
-                                }
-                            ],
-                        },
+                        _pl_payload(
+                            {
+                                "updates": [
+                                    {
+                                        "pid": pid,
+                                        "kw": new_kw.strip(),
+                                        "cat": new_cat.strip(),
+                                        "status": new_status,
+                                    }
+                                ]
+                            }
+                        ),
                         timeout=30,
                     )
                     _refresh_index(src_key)
@@ -1902,39 +2168,40 @@ def _render_detail(src_key: str) -> None:
                         if part_text:
                             st.caption(f"分项：{part_text}")
 
-                        if st.button(
+                        if not ro and st.button(
                             "⭐ 保存为最佳供应商",
                             key=f"pl_round_best_{pid}_{ri}",
                         ):
                             try:
                                 src_api(
                                     "/prod_best_set",
-                                    {
-                                        "key": src_key,
-                                        "updates": [
-                                            {
-                                                "pid": pid,
-                                                "best": {
-                                                    "score": str(
-                                                        chosen["score"]
-                                                    ),
-                                                    "url": _buy_url(cand),
-                                                    "price": str(
-                                                        cand.get("price") or ""
-                                                    ),
-                                                    "moq": str(
-                                                        cand.get("moq") or ""
-                                                    ),
-                                                    "company": str(
-                                                        cand.get("company") or ""
-                                                    ),
-                                                    "img": str(
-                                                        cand.get("img") or ""
-                                                    ),
-                                                },
-                                            }
-                                        ],
-                                    },
+                                    _pl_payload(
+                                        {
+                                            "updates": [
+                                                {
+                                                    "pid": pid,
+                                                    "best": {
+                                                        "score": str(
+                                                            chosen["score"]
+                                                        ),
+                                                        "url": _buy_url(cand),
+                                                        "price": str(
+                                                            cand.get("price") or ""
+                                                        ),
+                                                        "moq": str(
+                                                            cand.get("moq") or ""
+                                                        ),
+                                                        "company": str(
+                                                            cand.get("company") or ""
+                                                        ),
+                                                        "img": str(
+                                                            cand.get("img") or ""
+                                                        ),
+                                                    },
+                                                }
+                                            ]
+                                        }
+                                    ),
                                     timeout=30,
                                 )
                                 _refresh_index(src_key)
@@ -1961,7 +2228,7 @@ def _render_detail(src_key: str) -> None:
                         hide_index=True,
                     )
 
-        if st.button(
+        if not ro and st.button(
             "🔍 重新找货（这个产品）",
             key=f"pl_d_resrc_{pid}",
             type="primary",
