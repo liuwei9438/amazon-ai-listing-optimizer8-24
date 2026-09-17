@@ -856,7 +856,10 @@ def _render_sourcing_panel(src_key: str, api_key: str, model: str) -> None:
         f"🔍 给 {len(products)} 个产品找供应商（1688）",
         expanded=True,
     ):
-        with st.expander("⚙ 高级选项（按变体找 / 修改搜索词）"):
+        # V2.11.2：这里原来也是 st.expander —— 折叠面板套折叠面板会被
+        # Streamlit 直接抛异常（Expanders may not be nested），换成边框容器。
+        with st.container(border=True):
+            st.caption("⚙ 高级选项（按变体找 / 修改搜索词）")
             mode = st.radio(
                 "找货粒度",
                 [
@@ -2101,7 +2104,9 @@ def _render_detail(src_key: str) -> None:
                     + f" · {len(results)} 个候选"
                 )
 
-                with st.expander(label):
+                # V2.11.2：同上，外层产品详情已是 expander，轮次改用边框容器
+                with st.container(border=True):
+                    st.caption("🕒 " + label)
                     if not results:
                         st.caption("这轮没有找到结果。")
 

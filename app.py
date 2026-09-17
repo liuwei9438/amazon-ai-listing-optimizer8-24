@@ -73,7 +73,7 @@ from analyzer.title_strategy_generator import (
     TitleStrategyGenerator,
 )
 
-VERSION = "V2.11.1"
+VERSION = "V2.11.2"
 
 # 采集插件「发送到优化」复制的数据列头（与插件导出 Excel 完全一致）
 COLLECTOR_HEADERS = [
@@ -354,12 +354,14 @@ st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 # V2.6.2 账号门：Secrets 配置 app_users 后启用
 # =====================================================
 
-# V2.11.1：登录页右下角固定版本角标——未登录页面原本看不到版本号，
+# V2.11.1：登录页固定版本角标——未登录页面原本看不到版本号，
 # 云端部署有没有更新没法一眼确认；角标只在未登录时显示（登录后有
 # 顶部横幅的版本标签，不重复）。
+# V2.11.2：挪到左下角——右下角会被 Streamlit 自己的「Manage app」
+# 按钮盖住，总账号永远看不到角标，白白误判成「没部署」。
 if not st.session_state.get("auth_user"):
     st.markdown(
-        f'<div style="position:fixed;right:14px;bottom:12px;z-index:9999;'
+        f'<div style="position:fixed;left:14px;bottom:12px;z-index:9999;'
         f'background:#232F3E;color:#FF9900;font-size:12px;font-weight:700;'
         f'border-radius:999px;padding:3px 12px;">{VERSION}</div>',
         unsafe_allow_html=True,
