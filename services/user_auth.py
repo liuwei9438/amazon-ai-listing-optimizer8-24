@@ -569,6 +569,9 @@ def sync_session_cookie() -> None:
                 st.session_state.get("auth_token", "")
                 or ""
             ),
+            "s": bool(
+                st.session_state.get("auth_src")
+            ),
             "x": int(
                 time.time() + SESSION_MAX_AGE_SECONDS
             ),
@@ -594,6 +597,7 @@ def _persist_session() -> None:
         "t": str(
             st.session_state.get("auth_token", "") or ""
         ),
+        "s": bool(st.session_state.get("auth_src")),
         "x": int(
             time.time() + SESSION_MAX_AGE_SECONDS
         ),
@@ -652,6 +656,8 @@ def _restore_session() -> bool:
     st.session_state["auth_dept"] = str(payload.get("d") or "")
     st.session_state["auth_head"] = bool(payload.get("h"))
     st.session_state["auth_token"] = str(payload.get("t") or "")
+    # V2.11：恢复会话时带回找货权限（旧 token 没有这字段 = 没有）
+    st.session_state["auth_src"] = bool(payload.get("s"))
     return bool(current_user())
 
 
@@ -678,6 +684,8 @@ def _mark_success(user: str, data: dict) -> None:
     st.session_state["auth_token"] = str(
         data.get("token") or ""
     )
+    # V2.11：找货/产品库权限（worker /login 响应的 src 字段）
+    st.session_state["auth_src"] = bool(data.get("src"))
     st.session_state["auth_fails"] = 0
     st.session_state.pop("auth_locked_at", None)
     # V2.7.2：登录成功即写入 URL 会话，刷新不掉线。
