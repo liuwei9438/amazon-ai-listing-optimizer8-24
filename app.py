@@ -51,37 +51,16 @@ from services.task_worker import (
     start_worker,
 )
 
-try:
-    from services.user_auth import (
-        current_dept,
-        get_dept_key_info,
-        get_opt_config,
-        is_admin_user,
-        log_user_event,
-        render_sidebar_badge,
-        require_login,
-        sync_session_cookie,
-    )
-except BaseException as _ua_err:
-    # 临时诊断：把真实报错显示在页面上（排查完会删掉这段）
-    import os as _os
-    import sys as _sys
-    import streamlit as _st
-    try:
-        _st.set_page_config(page_title="优化程序")
-    except Exception:
-        pass
-    _st.write("Python:", _sys.version)
-    _st.write("Streamlit:", _st.__version__)
-    _p = "services/user_auth.py"
-    _st.write(
-        "user_auth 存在:",
-        _os.path.isfile(_p),
-        "大小:",
-        _os.path.getsize(_p) if _os.path.isfile(_p) else "-",
-    )
-    _st.exception(_ua_err)
-    _st.stop()
+from services.user_auth import (
+    current_dept,
+    get_dept_key_info,
+    get_opt_config,
+    is_admin_user,
+    log_user_event,
+    render_sidebar_badge,
+    require_login,
+    sync_session_cookie,
+)
 
 
 from services.listing_exporter import (
@@ -94,7 +73,7 @@ from analyzer.title_strategy_generator import (
     TitleStrategyGenerator,
 )
 
-VERSION = "V2.9.0"
+VERSION = "V2.11.0"
 
 # 采集插件「发送到优化」复制的数据列头（与插件导出 Excel 完全一致）
 COLLECTOR_HEADERS = [
@@ -1389,20 +1368,9 @@ st.markdown(
 # V2.8 1688 找货页（仅管理员账号显示入口；员工界面不变）
 # =====================================================
 
-try:
-    from services.sourcing import (
-        render_sourcing_page,
-        sourcing_allowed,
-    )
-
-    _SRC_PAGE_OK = sourcing_allowed()
-
-except Exception as _src_err:
-    _SRC_PAGE_OK = False
-    if ADMIN_MODE:
-        st.error(f"找货模块加载失败：{_src_err}")
-
-# V2.9 产品库（仅管理员）：永久产品库 + 找货结果自动挂产品
+# V2.10 产品库：永久产品库 + 找货（唯一入口，原「1688 找货」独立页已删）。
+# V2.11：每员工自己的库（总后台「开找货」= 产品库权限）；管理员
+# 可看「全部产品」（只读）或指定人的库（只读）。
 try:
     from services.product_lib import (
         productlib_allowed,
@@ -1418,9 +1386,6 @@ except Exception as _prodlib_err:
 
 _page_options = ["🛒 Listing 优化"]
 
-if _SRC_PAGE_OK:
-    _page_options.append("🔎 1688 找货")
-
 if _PRODLIB_PAGE_OK:
     _page_options.append("📚 产品库")
 
@@ -1432,17 +1397,6 @@ if len(_page_options) > 1:
         key="wz_main_page",
         label_visibility="collapsed",
     )
-
-    if "找货" in str(_page_choice):
-        render_sourcing_page(
-            envelope=envelope,
-            uploaded_name=str(
-                st.session_state.get("excel_name", "")
-            ),
-            api_key=api_key,
-            model=model,
-        )
-        st.stop()
 
     if "产品库" in str(_page_choice):
         render_product_library(
