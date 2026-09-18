@@ -31,6 +31,7 @@ import io
 import json
 import math
 import re
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -1235,6 +1236,22 @@ def _render_active_batch(src_key: str) -> None:
         return
 
     batches = data.get("batches") or []
+
+    # V2.11.4：批次刚创建就查时，Cloudflare KV 可能还没同步到当前
+    # 边缘节点（读旧缓存返回空）。等 3 秒重试一次再下结论，免得刚
+    # 点完「一键找供应商」就误报「查不到批次」吓到用户。
+    if not batches:
+        time.sleep(3)
+
+        try:
+            data = src_api(
+                "/src_tasks_view",
+                _pl_payload({"batch_id": batch_id, "with_results": False}),
+            )
+            batches = (data.get("batches") or []) if data.get("ok") else []
+
+        except Exception:
+            pass
 
     if not batches:
         st.warning("Worker 上查不到这个批次（可能已被后台删除）。")
