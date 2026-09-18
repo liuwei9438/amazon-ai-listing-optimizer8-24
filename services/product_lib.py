@@ -860,6 +860,19 @@ def _render_sourcing_panel(src_key: str, api_key: str, model: str) -> None:
         # Streamlit 直接抛异常（Expanders may not be nested），换成边框容器。
         with st.container(border=True):
             st.caption("⚙ 高级选项（按变体找 / 修改搜索词）")
+
+            # V2.11.3：产品库页通常没在侧栏上传 Excel，app.py 的 API
+            # 配置块包在「已上传」分支里不会渲染，传进来的 api_key 是
+            # 空串——AI 转中文搜索词会静默跳过，全部英文标题直发
+            # 1688（基本都「关键词无结果」）。这里兜底：没 Key 就地
+            # 给输入框，填了照常走转换（管理员 / 员工通用）。
+            if not str(api_key or "").strip():
+                api_key = st.text_input(
+                    "AI API Key（转中文搜索词用；不填就直接用英文标题找）",
+                    type="password",
+                    key="pl_panel_api_key",
+                ).strip()
+
             mode = st.radio(
                 "找货粒度",
                 [
