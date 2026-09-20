@@ -884,22 +884,26 @@ def _render_sourcing_panel(src_key: str, api_key: str, model: str) -> None:
 
             # V2.11.5：三层漏斗的视觉终审（可选）。填了 GLM 等多模态
             # Key，收尾时 AI 看图终审前 3 名候选；不填只用本地评分。
-            with st.expander("🔎 视觉核验（可选：AI 看图终审同款）"):
-                st.caption(
-                    "OpenAI 兼容多模态接口，默认智谱 glm-4.5v；"
-                    "Key 也可配在 Secrets 的 ZHIPU_API_KEY 里。"
-                    "不填 = 只用本地评分（数量否决 + 颜色 + 图片相似度）。"
-                )
-                st.text_input(
-                    "视觉 API Key",
-                    type="password",
-                    key="pl_vision_key",
-                )
-                st.text_input(
-                    "视觉模型",
-                    value="glm-4.5v",
-                    key="pl_vision_model",
-                )
+            # V2.11.6：这里不能 st.expander——外层找货面板已是
+            # expander，套着会被 Streamlit 抛 StreamlitAPIException
+            # （云端实测崩溃），和上面高级选项换成边框容器同一教训。
+            st.caption("🔎 视觉核验（可选：AI 看图终审同款）")
+            st.caption(
+                "OpenAI 兼容多模态接口，默认智谱 glm-4.5v；"
+                "Key 也可配在 Secrets 的 ZHIPU_API_KEY 里。"
+                "不填 = 只用本地评分（数量否决 + 颜色 + 图片相似度）。"
+            )
+            vk_col, vm_col = st.columns(2)
+            vk_col.text_input(
+                "视觉 API Key",
+                type="password",
+                key="pl_vision_key",
+            )
+            vm_col.text_input(
+                "视觉模型",
+                value="glm-4.5v",
+                key="pl_vision_model",
+            )
 
             mode = st.radio(
                 "找货粒度",
