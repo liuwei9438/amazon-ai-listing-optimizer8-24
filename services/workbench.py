@@ -429,7 +429,10 @@ def _start_optimize(
         return
 
     if not str(api_key or "").strip():
-        st.error("请先在左侧配置 AI API Key")
+        st.error(
+            "还没配置 AI：员工请联系组长在小组看板填写 Key；"
+            "管理员在左侧「AI 配置」里填写。"
+        )
 
         return
 
@@ -599,7 +602,8 @@ def _render_task_card(api_key: str, model: str, options: dict) -> None:
             st.rerun()
 
     with c1:
-        st.caption(f"任务 {task_id}")
+        if _pl_is_admin():
+            st.caption(f"任务 {task_id}")
 
     if state in TASK_RUNNING_STATUS or state == "paused":
         if total:
@@ -1667,11 +1671,18 @@ def _render_wb_detail(src_key: str) -> None:
             )
 
             if img:
-                st.image(
-                    img,
-                    width=200,
-                    caption="优化首图" if opt.get("image") else "产品主图",
-                )
+                try:
+                    st.image(
+                        img,
+                        width=200,
+                        caption=(
+                            "优化首图"
+                            if opt.get("image")
+                            else "产品主图"
+                        ),
+                    )
+                except Exception:
+                    st.caption("（图片链接打不开）")
 
         with col_b:
             st.markdown(
@@ -1683,10 +1694,15 @@ def _render_wb_detail(src_key: str) -> None:
             )
 
             if opt:
-                st.caption(
-                    f"上次优化：{_fmt_ms(opt.get('at'))}"
-                    f"（任务 {str(opt.get('task_id') or '')[:18]}）"
-                )
+                _when = f"上次优化：{_fmt_ms(opt.get('at'))}"
+
+                if _pl_is_admin():
+                    _when += (
+                        f"（任务 "
+                        f"{str(opt.get('task_id') or '')[:18]}）"
+                    )
+
+                st.caption(_when)
 
         if opt:
             st.markdown("##### 🤖 AI 优化结果")
