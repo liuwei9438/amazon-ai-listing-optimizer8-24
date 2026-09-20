@@ -28,10 +28,7 @@ from services.user_auth import (
 )
 
 
-from image.image_storage import cloudinary_ready
-
-
-VERSION = "V2.12.1"
+VERSION = "V2.13.0"
 
 TASK_RUNNING_STATUS = [
     "created",
@@ -131,16 +128,14 @@ CUSTOM_CSS = """
 <style>
 .stApp { background: #f6f7f9; }
 
-/* ---- 顶部横幅 ---- */
-.app-hero {
-    background: linear-gradient(120deg, #232F3E 0%, #37475A 78%);
-    color: #ffffff;
-    padding: 26px 32px 22px 32px;
-    border-radius: 16px;
-    margin-bottom: 14px;
+/* ---- 页头（V2.13.0 一行极简）---- */
+.page-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 2px 2px 12px 2px;
 }
-.hero-title { font-size: 30px; font-weight: 800; letter-spacing: 0.5px; }
-.hero-sub { color: #d5dbd1; margin-top: 6px; font-size: 14px; }
+.page-title { font-size: 22px; font-weight: 800; color: #232F3E; }
 .version-pill {
     display: inline-block;
     background: #FF9900;
@@ -328,27 +323,8 @@ with st.sidebar:
 
     if ADMIN_MODE:
 
-        # ---- 管理员：配置收进折叠面板 ----
-        st.markdown(
-            '<div class="side-step"><span class="step-badge">1</span> AI 配置</div>',
-            unsafe_allow_html=True,
-        )
-
-        saved_any = (
-            get_saved_provider_key("OpenAI")
-            or get_saved_provider_key("DeepSeek")
-        )
-
-        st.caption(
-            "✅ Key 已配置（Secrets），展开可改"
-            if saved_any
-            else "⚠️ 还没配 Key，展开填写"
-        )
-
-        with st.expander(
-            "服务商 / Key / 模型",
-            expanded=not saved_any,
-        ):
+        # ---- 管理员：所有配置收进默认收起的设置面板 ----
+        with st.expander("⚙️ AI 设置", expanded=False):
             provider = st.radio(
                 "AI 服务商",
                 AI_PROVIDERS,
@@ -464,89 +440,81 @@ with st.sidebar:
         )
         st.session_state["model_input"] = model
 
-        if api_key:
-            st.caption(f"✅ AI 已配置（{provider}）")
-        else:
-            api_key = ""
-            st.caption(
-                "⚠️ 还没配置 AI：请联系组长在小组看板填写 API Key"
-            )
+        # 没配置时不在侧栏显示任何提示——点「🚀 AI 优化」时的
+        # 报错会指路找组长（_start_optimize），侧栏保持零内容。
 
     # --------------------------------------------
-    # 第 2 步：优化模块（仅管理员模式显示）
+    # 优化模块（V2.13.0：收进管理员折叠面板）
     #
     # 员工模式用默认值：全文字模块开、图片关。
     # --------------------------------------------
 
     if ADMIN_MODE:
 
-        st.markdown(
-            '<div class="side-step"><span class="step-badge">2</span> 优化模块</div>',
-            unsafe_allow_html=True,
-        )
+        with st.expander("🧩 优化模块", expanded=False):
 
-        quick_a, quick_b, quick_c = st.columns(3)
+            quick_a, quick_b, quick_c = st.columns(3)
 
-        if quick_a.button("全选", key="quick_select_all", use_container_width=True):
-            for key in MODULE_ALL_KEYS:
-                st.session_state[key] = True
-            st.rerun()
+            if quick_a.button("全选", key="quick_select_all", use_container_width=True):
+                for key in MODULE_ALL_KEYS:
+                    st.session_state[key] = True
+                st.rerun()
 
-        if quick_b.button("仅文字", key="quick_text_only", use_container_width=True):
-            for key in MODULE_TEXT_KEYS:
-                st.session_state[key] = True
-            st.session_state["enable_images"] = False
-            st.rerun()
+            if quick_b.button("仅文字", key="quick_text_only", use_container_width=True):
+                for key in MODULE_TEXT_KEYS:
+                    st.session_state[key] = True
+                st.session_state["enable_images"] = False
+                st.rerun()
 
-        if quick_c.button("清空", key="quick_clear_all", use_container_width=True):
-            for key in MODULE_ALL_KEYS:
-                st.session_state[key] = False
-            st.rerun()
+            if quick_c.button("清空", key="quick_clear_all", use_container_width=True):
+                for key in MODULE_ALL_KEYS:
+                    st.session_state[key] = False
+                st.rerun()
 
-        enable_title = st.checkbox(
-            "优化标题",
-            True,
-            key="enable_title",
-        )
+            enable_title = st.checkbox(
+                "优化标题",
+                True,
+                key="enable_title",
+            )
 
-        enable_short_title = st.checkbox(
-            "优化短标题",
-            True,
-            key="enable_short_title",
-        )
+            enable_short_title = st.checkbox(
+                "优化短标题",
+                True,
+                key="enable_short_title",
+            )
 
-        enable_highlight = st.checkbox(
-            "优化商品亮点",
-            True,
-            key="enable_highlight",
-        )
+            enable_highlight = st.checkbox(
+                "优化商品亮点",
+                True,
+                key="enable_highlight",
+            )
 
-        enable_bullet = st.checkbox(
-            "优化五点描述",
-            True,
-            key="enable_bullet",
-        )
+            enable_bullet = st.checkbox(
+                "优化五点描述",
+                True,
+                key="enable_bullet",
+            )
 
-        enable_description = st.checkbox(
-            "优化详情描述",
-            True,
-            key="enable_description",
-        )
+            enable_description = st.checkbox(
+                "优化详情描述",
+                True,
+                key="enable_description",
+            )
 
-        enable_seo = st.checkbox(
-            "优化SEO关键词",
-            True,
-            key="enable_seo",
-        )
+            enable_seo = st.checkbox(
+                "优化SEO关键词",
+                True,
+                key="enable_seo",
+            )
 
-        enable_images = st.checkbox(
-            "优化首图（V1.3.2 稳定基线）",
-            False,
-            key="enable_images",
-            help="仅优化第一张主图；其他图片保留。图片失败不会影响文字优化结果。"
-            "需要配置 Cloudinary Secrets（CLOUDINARY_CLOUD_NAME / API_KEY / API_SECRET），"
-            "否则图片上传会失败。",
-        )
+            enable_images = st.checkbox(
+                "优化首图（V1.3.2 稳定基线）",
+                False,
+                key="enable_images",
+                help="仅优化第一张主图；其他图片保留。图片失败不会影响文字优化结果。"
+                "需要配置 Cloudinary Secrets（CLOUDINARY_CLOUD_NAME / API_KEY / API_SECRET），"
+                "否则图片上传会失败。",
+            )
 
     else:
 
@@ -577,24 +545,10 @@ with st.sidebar:
             enable_seo = perm.get("seo", True)
 
     # 总后台关了「详情描述参与AI优化」时，管理员/员工都不再让
-    # AI 重写简介（简介=本地过滤后的原文，省 token）。
+    # AI 重写简介（简介=本地过滤后的原文，省 token；V2.13.0 起
+    # 静默生效，不在侧栏显示提示）。
     if not st.session_state.get("desc_to_ai", True):
         enable_description = False
-
-        if ADMIN_MODE:
-            st.caption(
-                "🔒 详情描述不参与 AI 优化（总后台设置）："
-                "简介 = 本地过滤后的原文，不消耗 token。"
-            )
-
-    # 首图优化依赖 Cloudinary；缺配置只提醒管理员（员工无法处理）。
-    if ADMIN_MODE and enable_images and not cloudinary_ready():
-        st.caption(
-            "⚠️ 已开启首图优化，但未配置 Cloudinary Secrets"
-            "（CLOUDINARY_CLOUD_NAME / CLOUDINARY_API_KEY / "
-            "CLOUDINARY_API_SECRET）。图片上传都会失败，"
-            "文字优化不受影响。"
-        )
 
 # =====================================================
 # 页面主体：横幅 + 一体工作台
@@ -602,10 +556,9 @@ with st.sidebar:
 
 st.markdown(
     f"""
-    <div class="app-hero">
-        <div class="hero-title">📦 我的产品 · AI Listing 工作台</div>
-        <div class="hero-sub">导入产品库 · 勾选 AI 优化（标题 / 短标题 / 五点 / 详情 / 亮点 / SEO）· 结果挂产品 · 一键导出</div>
-        <span class="version-pill">{VERSION}{" · 管理模式" if ADMIN_MODE else " · 基础版"}</span>
+    <div class="page-head">
+        <span class="page-title">📦 我的产品</span>
+        <span class="version-pill">{VERSION}</span>
     </div>
     """,
     unsafe_allow_html=True,

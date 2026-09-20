@@ -131,17 +131,6 @@ def render_workbench(
         )
         return
 
-    st.markdown(
-        """
-        <div class="hint-bar">
-        <b>📦 我的产品：</b>导入产品（相同 SKU 自动合并）→ 勾选 →
-        🚀 AI 优化 → 结果永久挂在产品上（标题 / 五点 / 简介 / 亮点 / SEO）→
-        随时勾选导出优化后的 Excel。
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
     if _pl_is_admin():
         _render_scope_selector()
 
@@ -554,8 +543,7 @@ def _start_optimize(
 
 
 def _render_task_card(api_key: str, model: str, options: dict) -> None:
-    st.markdown("#### 🚀 AI 优化任务")
-
+    # V2.13.0：没有任务时整块不渲染（不留空标题/说明文字）
     task_id = str(
         st.session_state.get("current_task")
         or load_current_task()
@@ -563,12 +551,6 @@ def _render_task_card(api_key: str, model: str, options: dict) -> None:
     )
 
     if not task_id:
-        st.caption(
-            "当前没有进行中的任务。用法：下方产品列表勾选 → 点"
-            "「🚀 AI 优化」→ 进度显示在这里（每 20 秒自动刷新，"
-            "结果跑完自动写回产品）。"
-        )
-
         return
 
     status = load_status(task_id)
@@ -578,9 +560,10 @@ def _render_task_card(api_key: str, model: str, options: dict) -> None:
         clear_current_task()
         st.session_state.pop("current_task", None)
         st.session_state["task_started"] = False
-        st.caption("当前没有进行中的任务。")
 
         return
+
+    st.markdown("#### 🚀 AI 优化任务")
 
     state = str(status.get("status") or "")
     completed = int(status.get("completed", 0) or 0)
