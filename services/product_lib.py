@@ -562,8 +562,14 @@ def _best_text(best: dict) -> str:
     if best.get("moq"):
         parts.append(f"起订{best['moq']}")
 
+    if best.get("cost"):
+        parts.append(f"成本{best['cost']}")
+
     if best.get("company"):
         parts.append(str(best["company"])[:14])
+
+    if best.get("verify"):
+        parts.append(str(best["verify"]))
 
     return "｜".join(parts) if parts else "—"
 
@@ -588,7 +594,9 @@ def _export_products(items: list) -> io.BytesIO:
                 "中文搜索词": item.get("kw", ""),
                 "匹配分": best.get("score", ""),
                 "采购价": best.get("price", ""),
+                "预估成本": best.get("cost", ""),
                 "起订量": best.get("moq", ""),
+                "核验": best.get("verify", ""),
                 "供应商": best.get("company", ""),
                 "采购链接": best.get("url", ""),
                 "找货时间": _fmt_ms(item.get("last_round")),
@@ -873,6 +881,25 @@ def _render_sourcing_panel(src_key: str, api_key: str, model: str) -> None:
                     type="password",
                     key="pl_panel_api_key",
                 ).strip()
+
+            # V2.11.5：三层漏斗的视觉终审（可选）。填了 GLM 等多模态
+            # Key，收尾时 AI 看图终审前 3 名候选；不填只用本地评分。
+            with st.expander("🔎 视觉核验（可选：AI 看图终审同款）"):
+                st.caption(
+                    "OpenAI 兼容多模态接口，默认智谱 glm-4.5v；"
+                    "Key 也可配在 Secrets 的 ZHIPU_API_KEY 里。"
+                    "不填 = 只用本地评分（数量否决 + 颜色 + 图片相似度）。"
+                )
+                st.text_input(
+                    "视觉 API Key",
+                    type="password",
+                    key="pl_vision_key",
+                )
+                st.text_input(
+                    "视觉模型",
+                    value="glm-4.5v",
+                    key="pl_vision_model",
+                )
 
             mode = st.radio(
                 "找货粒度",
@@ -1286,7 +1313,7 @@ def _render_active_batch(src_key: str) -> None:
     if not record.get("finalized"):
         with st.spinner("📥 下载候选图片并计算匹配分…"):
             try:
-                n_done = _finalize_batch(src_key, record)
+                n_done, fstats = _finalize_batch(src_key, record)
 
             except Exception as exc:
                 st.error(f"收尾失败：{exc}")
@@ -1304,9 +1331,13 @@ def _render_active_batch(src_key: str) -> None:
         except Exception:
             pass
 
+        tail = (
+            f"（数量否决 {fstats['veto']} · 颜色存疑 {fstats['color']}"
+            f" · 视觉核验 {fstats['vision']} · 待人工 {fstats['human']}）"
+        )
         st.success(
             f"✅ 批次跑完：{n_done} 个产品已算出匹配分并保存最佳供应商"
-            "（列表里看「最佳供应商」列）。"
+            f"（列表里看「最佳供应商」列）。{tail}"
         )
 
     else:
@@ -1413,6 +1444,12 @@ def _finalize_batch(src_key: str, record: dict) -> int:
 
     updates = []
 
+    # V2.11.5 三层漏斗（数量否决 → 颜色/规格 → 视觉终审）+ 成本预估
+    from .match_funnel import estimate_cost, funnel_select, vision_cfg
+
+    vc = vision_cfg()
+    stats = {"veto": 0, "color": 0, "vision": 0, "human": 0}
+
     for item in items:
         task = tasks_by_tid.get(str(item.get("tid")), {})
         results = task.get("results") or []
@@ -1420,33 +1457,35 @@ def _finalize_batch(src_key: str, record: dict) -> int:
         if not results:
             continue
 
-        scored = []
+        pick = funnel_select(item, results, cache, vc)
 
-        for cand in results:
-            img_sim = image_similarity(
-                item.get("image_url", ""),
-                cand.get("img", ""),
-                cache,
-            )
+        if not pick:
+            continue
 
-            total, _parts = score_candidate(item, cand, img_sim)
+        top = pick["cand"]
+        stats["veto"] += pick["vetoed_n"]
+        stats["color"] += pick["color_bad_n"]
 
-            scored.append((total, cand))
+        if pick["vision_used"]:
+            stats["vision"] += 1
 
-        scored.sort(key=lambda pair: pair[0], reverse=True)
+        if pick["verify"].startswith("待人工"):
+            stats["human"] += 1
 
-        top_score, top = scored[0]
+        cost = estimate_cost(top.get("price"), top.get("moq"))
 
         updates.append(
             {
                 "pid": item.get("pid"),
                 "best": {
-                    "score": str(top_score),
+                    "score": str(pick["score"]),
                     "url": _buy_url(top),
                     "price": str(top.get("price") or ""),
                     "moq": str(top.get("moq") or ""),
                     "company": str(top.get("company") or ""),
                     "img": str(top.get("img") or ""),
+                    "cost": f"¥{cost['total']:.1f}" if cost else "",
+                    "verify": pick["verify"],
                 },
             }
         )
@@ -1460,7 +1499,7 @@ def _finalize_batch(src_key: str, record: dict) -> int:
             label="保存最佳供应商失败",
         )
 
-    return len(updates)
+    return len(updates), stats
 
 
 # -----------------------------------------------------

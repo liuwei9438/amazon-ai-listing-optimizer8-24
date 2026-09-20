@@ -417,7 +417,11 @@ _HEADERS = {
 
 
 def _fetch_phash(url: str):
-    """下载一张图并算 pHash。任何失败返回 None，绝不上抛。"""
+    """下载一张图并算 (pHash, 主色列表)。任何失败返回 None，绝不上抛。
+
+    V2.11.5：同一次下载顺手算主色（match_funnel 的颜色门用），
+    不再多下一遍图。
+    """
     try:
         resp = requests.get(
             url,
@@ -437,10 +441,12 @@ def _fetch_phash(url: str):
             if buffer.tell() > 8 * 1024 * 1024:
                 return None
 
+        from .match_funnel import dominant_colors
+
         with Image.open(buffer) as image:
             image.load()
 
-            return phash_image(image)
+            return (phash_image(image), dominant_colors(image))
 
     except Exception:
         return None
@@ -477,6 +483,11 @@ def prefetch_phashes(
     return cache
 
 
+def _cache_phash(value):
+    """缓存值可能是 V2.11.5 之前的裸 pHash（int），兼容取值。"""
+    return value[0] if isinstance(value, tuple) else value
+
+
 def image_similarity(
     url_a: str,
     url_b: str,
@@ -486,13 +497,23 @@ def image_similarity(
     if not url_a or not url_b:
         return None
 
-    hash_a = cache.get(url_a)
-    hash_b = cache.get(url_b)
+    hash_a = _cache_phash(cache.get(url_a))
+    hash_b = _cache_phash(cache.get(url_b))
 
     if hash_a is None or hash_b is None:
         return None
 
     return 1.0 - _hamming(hash_a, hash_b) / 64.0
+
+
+def image_colors(url: str, cache: dict):
+    """V2.11.5：从缓存取主色列表 [(色名, 占比)]；取不到返回 None。"""
+    if not url:
+        return None
+
+    value = cache.get(url)
+
+    return value[1] if isinstance(value, tuple) else None
 
 
 # =====================================================
@@ -547,8 +568,14 @@ def score_candidate(
     item: dict,
     cand: dict,
     img_sim,
+    color_state=None,
+    spec_pen: int = 0,
 ) -> tuple[int, dict]:
-    """一个候选供应商的综合分。返回 (总分, 分项)。"""
+    """一个候选供应商的综合分。返回 (总分, 分项)。
+
+    V2.11.5 漏斗加成：color_state（"ok" 加 3 / "bad" 扣 15，
+    来自 match_funnel 颜色门）；spec_pen（规格冲突条数，每条扣 8 封顶 20）。
+    """
     cand_title = _cell_str(cand.get("title"))
     signals = _cell_str(cand.get("signals"))
     hay = _compact(cand_title + " " + signals)
@@ -603,6 +630,16 @@ def score_candidate(
         seller += 1
 
     parts["商家"] = min(W_SELLER, seller)
+
+    # V2.11.5：颜色门 / 规格冲突（match_funnel 提供）
+    if color_state == "ok":
+        parts["颜色"] = 3
+
+    elif color_state == "bad":
+        parts["颜色"] = -15
+
+    if spec_pen:
+        parts["规格"] = -min(20, 8 * spec_pen)
 
     return sum(parts.values()), parts
 
