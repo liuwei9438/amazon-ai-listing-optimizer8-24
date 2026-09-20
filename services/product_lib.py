@@ -80,9 +80,18 @@ _COLLECTOR_HEADERS = [
 # =====================================================
 
 
+# V2.11.8：老板要求找货（产品库）先整体隐藏，把其他流程捋顺后再开。
+# 重新启用：改回 True 部署即可，下面的权限逻辑和 V2.11.7 重排的
+# 界面都还在。
+PRODLIB_ENABLED = False
+
+
 def productlib_allowed() -> bool:
     """产品库入口：登录账号要开找货权限（总后台「开找货」）；
     管理员（app_admins）始终可见；没配登录的本地开发放行。"""
+    if not PRODLIB_ENABLED:
+        return False
+
     try:
         from services.user_auth import current_user
 
