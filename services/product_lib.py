@@ -254,8 +254,10 @@ def _set_pl_flag(batch_id: str, flag: str, value=True) -> None:
 
 
 def _pending_batch_id() -> str | None:
-    """进行中的产品库批次：会话里的优先，否则最近一个没收尾的。
-    V2.11：各人只认自己建的批次；旧记录（没记 user）只有管理员能接。"""
+    """要显示在进度卡里的批次：会话里的优先；否则最近一个没收尾的；
+    再否则最近一个跑完但用户还没点「知道了」的（V2.11.7：结果不再
+    一闪而过）。V2.11：各人只认自己建的批次；旧记录（没记 user）
+    只有管理员能接。"""
     active = st.session_state.get("prodlib_active")
 
     if active:
@@ -263,6 +265,10 @@ def _pending_batch_id() -> str | None:
 
     me = _current_user() or ""
     admin = _pl_is_admin()
+
+    def _visible(record) -> bool:
+        owner = str(record.get("user") or "")
+        return admin or not ((owner or me) and owner != me)
 
     for record in _load_pl_batches():
         if not (
@@ -272,9 +278,21 @@ def _pending_batch_id() -> str | None:
         ):
             continue
 
-        owner = str(record.get("user") or "")
+        if not _visible(record):
+            continue
 
-        if not admin and (owner or me) and owner != me:
+        return str(record.get("batch_id"))
+
+    for record in _load_pl_batches():
+        if not (
+            record.get("batch_id")
+            and record.get("finalized")
+            and not record.get("seen")
+            and not record.get("abandoned")
+        ):
+            continue
+
+        if not _visible(record):
             continue
 
         return str(record.get("batch_id"))
@@ -655,9 +673,11 @@ def render_product_library(api_key: str, model: str) -> None:
 
     index = _ensure_index(src_key)
 
-    _render_import(src_key, index)
-    _render_sourcing_panel(src_key, api_key, model)
+    # V2.11.7：按使用场景排序——进度卡固定最上方（永远同一位置），
+    # 找货配置面板其次（打开时醒目），导入收下来，列表是主工作区。
     _render_active_batch(src_key)
+    _render_sourcing_panel(src_key, api_key, model)
+    _render_import(src_key, index)
     _render_table(src_key)
     _render_detail(src_key)
 
@@ -862,59 +882,92 @@ def _render_sourcing_panel(src_key: str, api_key: str, model: str) -> None:
     convert_key = "prodlib_convert"
 
     with st.expander(
-        f"🔍 给 {len(products)} 个产品找供应商（1688）",
+        f"🔍 第 2 步 · 确认并开始（{len(products)} 个产品）",
         expanded=True,
     ):
-        # V2.11.2：这里原来也是 st.expander —— 折叠面板套折叠面板会被
-        # Streamlit 直接抛异常（Expanders may not be nested），换成边框容器。
-        with st.container(border=True):
-            st.caption("⚙ 高级选项（按变体找 / 修改搜索词）")
+        # V2.11.7：🚀 启动按钮放最上面、设成唯一主按钮——「点了没反应」
+        # 的根源是它原来压在一长串设置最底下，列表底部的「找供应商」
+        # 入口按钮又只是打开面板，两个按钮意图分不清。现在打开面板
+        # 第一眼就是启动键，高级设置默认收起，不挡路。
+        st.caption("点下面的橙色按钮才真正开始找货；进度显示在页面顶部「🚚 找货进度」。")
 
-            # V2.11.3：产品库页通常没在侧栏上传 Excel，app.py 的 API
-            # 配置块包在「已上传」分支里不会渲染，传进来的 api_key 是
-            # 空串——AI 转中文搜索词会静默跳过，全部英文标题直发
-            # 1688（基本都「关键词无结果」）。这里兜底：没 Key 就地
-            # 给输入框，填了照常走转换（管理员 / 员工通用）。
-            if not str(api_key or "").strip():
-                api_key = st.text_input(
-                    "AI API Key（转中文搜索词用；不填就直接用英文标题找）",
+        act_a, act_b = st.columns([3, 1])
+
+        create_clicked = act_a.button(
+            f"🚀 开始找货（{len(products)} 个产品）",
+            type="primary",
+            key="pl_create_btn",
+            use_container_width=True,
+        )
+
+        if act_b.button("收起", key="pl_cancel_btn", use_container_width=True):
+            st.session_state.pop("prodlib_src_panel", None)
+            st.session_state.pop("prodlib_src_pids", None)
+            st.session_state.pop(convert_key, None)
+            st.rerun()
+
+            return
+
+        # V2.11.7：高级选项整块用 checkbox 收起（expander 里不能套
+        # expander——V2.11.6 云端崩溃的教训；checkbox 云端 1.39 也稳）。
+        show_adv = st.checkbox(
+            "⚙ 高级选项（AI 转词 Key / 视觉核验 / 找货粒度 / 改搜索词）",
+            key="pl_show_adv",
+        )
+
+        per_variant = False
+
+        if show_adv:
+            # V2.11.2：这里原来也是 st.expander —— 折叠面板套折叠面板会被
+            # Streamlit 直接抛异常（Expanders may not be nested），换成边框容器。
+            with st.container(border=True):
+                st.caption("⚙ 高级选项")
+
+                # V2.11.3：产品库页通常没在侧栏上传 Excel，app.py 的 API
+                # 配置块包在「已上传」分支里不会渲染，传进来的 api_key 是
+                # 空串——AI 转中文搜索词会静默跳过，全部英文标题直发
+                # 1688（基本都「关键词无结果」）。这里兜底：没 Key 就地
+                # 给输入框，填了照常走转换（管理员 / 员工通用）。
+                if not str(api_key or "").strip():
+                    api_key = st.text_input(
+                        "AI API Key（转中文搜索词用；不填就直接用英文标题找）",
+                        type="password",
+                        key="pl_panel_api_key",
+                    ).strip()
+
+                # V2.11.5：三层漏斗的视觉终审（可选）。填了 GLM 等多模态
+                # Key，收尾时 AI 看图终审前 3 名候选；不填只用本地评分。
+                # V2.11.6：这里不能 st.expander——外层找货面板已是
+                # expander，套着会被 Streamlit 抛 StreamlitAPIException
+                # （云端实测崩溃），和上面高级选项换成边框容器同一教训。
+                st.caption("🔎 视觉核验（可选：AI 看图终审同款）")
+                st.caption(
+                    "OpenAI 兼容多模态接口，默认智谱 glm-4.5v；"
+                    "Key 也可配在 Secrets 的 ZHIPU_API_KEY 里。"
+                    "不填 = 只用本地评分（数量否决 + 颜色 + 图片相似度）。"
+                )
+                vk_col, vm_col = st.columns(2)
+                vk_col.text_input(
+                    "视觉 API Key",
                     type="password",
-                    key="pl_panel_api_key",
-                ).strip()
+                    key="pl_vision_key",
+                )
+                vm_col.text_input(
+                    "视觉模型",
+                    value="glm-4.5v",
+                    key="pl_vision_model",
+                )
 
-            # V2.11.5：三层漏斗的视觉终审（可选）。填了 GLM 等多模态
-            # Key，收尾时 AI 看图终审前 3 名候选；不填只用本地评分。
-            # V2.11.6：这里不能 st.expander——外层找货面板已是
-            # expander，套着会被 Streamlit 抛 StreamlitAPIException
-            # （云端实测崩溃），和上面高级选项换成边框容器同一教训。
-            st.caption("🔎 视觉核验（可选：AI 看图终审同款）")
-            st.caption(
-                "OpenAI 兼容多模态接口，默认智谱 glm-4.5v；"
-                "Key 也可配在 Secrets 的 ZHIPU_API_KEY 里。"
-                "不填 = 只用本地评分（数量否决 + 颜色 + 图片相似度）。"
-            )
-            vk_col, vm_col = st.columns(2)
-            vk_col.text_input(
-                "视觉 API Key",
-                type="password",
-                key="pl_vision_key",
-            )
-            vm_col.text_input(
-                "视觉模型",
-                value="glm-4.5v",
-                key="pl_vision_model",
-            )
+                mode = st.radio(
+                    "找货粒度",
+                    [
+                        "整品找（推荐：1 个产品 1 个任务）",
+                        "按变体分别找（变体是不同零件时用，各自带图搜）",
+                    ],
+                    key="prodlib_mode",
+                )
 
-            mode = st.radio(
-                "找货粒度",
-                [
-                    "整品找（推荐：1 个产品 1 个任务）",
-                    "按变体分别找（变体是不同零件时用，各自带图搜）",
-                ],
-                key="prodlib_mode",
-            )
-
-            per_variant = str(mode).startswith("按变体")
+                per_variant = str(mode).startswith("按变体")
 
             convert_map = st.session_state.get(convert_key) or {}
 
@@ -943,10 +996,10 @@ def _render_sourcing_panel(src_key: str, api_key: str, model: str) -> None:
                 )
 
             st.caption(
-                "搜索词可以直接改；留空的会在点「一键找供应商」时自动用 AI 转好。"
+                "搜索词可以直接改；留空的会在点「开始找货」时自动用 AI 转好。"
             )
 
-            kw_edited = st.data_editor(
+            kw_frame = st.data_editor(
                 pd.DataFrame(edit_rows),
                 key="pl_kw_editor",
                 num_rows="fixed",
@@ -955,22 +1008,27 @@ def _render_sourcing_panel(src_key: str, api_key: str, model: str) -> None:
                 disabled=["pid", "SKU", "标题"],
             )
 
-        act_a, act_b = st.columns([3, 1])
+        else:
+            # 高级选项收起时：沿用上次填过的 Key / 改过的搜索词
+            # （都在 session 里，不因收起而丢），没改过就用库里的词。
+            cached_key = str(
+                st.session_state.get("pl_panel_api_key") or ""
+            ).strip()
 
-        create_clicked = act_a.button(
-            f"🚀 一键找供应商（{len(products)} 个产品）",
-            type="primary",
-            key="pl_create_btn",
-            use_container_width=True,
-        )
+            if cached_key and not str(api_key or "").strip():
+                api_key = cached_key
 
-        if act_b.button("收起", key="pl_cancel_btn", use_container_width=True):
-            st.session_state.pop("prodlib_src_panel", None)
-            st.session_state.pop("prodlib_src_pids", None)
-            st.session_state.pop(convert_key, None)
-            st.rerun()
+            kw_frame = _default_kw_frame(products, convert_key)
 
-            return
+            prev_frame = st.session_state.get("pl_kw_editor")
+
+            if isinstance(prev_frame, pd.DataFrame):
+                try:
+                    if len(prev_frame) == len(products):
+                        kw_frame = prev_frame
+
+                except Exception:
+                    pass
 
         if create_clicked:
             _one_click_create(
@@ -978,9 +1036,39 @@ def _render_sourcing_panel(src_key: str, api_key: str, model: str) -> None:
                 api_key,
                 model,
                 products,
-                kw_edited,
+                kw_frame,
                 per_variant,
             )
+
+
+def _default_kw_frame(products: list, convert_key: str) -> pd.DataFrame:
+    """不展开高级选项时的搜索词表：转换缓存 → 产品自带 → 空（点按钮时 AI 转）。"""
+    convert_map = st.session_state.get(convert_key) or {}
+
+    rows = []
+
+    for it in products:
+        conv = convert_map.get(str(it.get("pid"))) or {}
+        title = str(it.get("title") or "")
+
+        rows.append(
+            {
+                "pid": str(it.get("pid")),
+                "SKU": str(it.get("sku") or "")[:20],
+                "标题": title[:36],
+                "搜索词": str(
+                    conv.get("kw") or it.get("kw") or ""
+                )[:60],
+                "型号": str(
+                    conv.get("model")
+                    or it.get("model")
+                    or fallback_model(title)
+                )[:60],
+                "品牌": str(conv.get("brand") or "")[:30],
+            }
+        )
+
+    return pd.DataFrame(rows)
 
 
 def _one_click_create(
@@ -1233,9 +1321,20 @@ def _create_product_batch(
 
 
 def _render_active_batch(src_key: str) -> None:
+    """V2.11.7 找货进度卡：固定在产品库最上方，永远同一位置——
+    没批次给指路文案；进行中给进度条 + 每 20 秒自动刷新；跑完给
+    本批结果表 + 就地导出。不再是「有批次才冒出来」的浮动区块。"""
+    st.markdown("#### 🚚 找货进度")
+
     batch_id = _pending_batch_id()
 
     if not batch_id:
+        st.caption(
+            "当前没有进行中的批次。用法：下方产品列表勾选 → 点"
+            "「🔍 找供应商」→ 面板里点 🚀 开始找货 → 进度就显示在这里"
+            "（每 20 秒自动刷新，结果跑完也在这里看）。"
+        )
+
         return
 
     record = next(
@@ -1245,10 +1344,9 @@ def _render_active_batch(src_key: str) -> None:
 
     if not record:
         st.session_state.pop("prodlib_active", None)
+        st.caption("当前没有进行中的批次。")
 
         return
-
-    st.markdown("#### 🔍 产品库找货批次")
 
     try:
         data = src_api(
@@ -1270,7 +1368,7 @@ def _render_active_batch(src_key: str) -> None:
 
     # V2.11.4：批次刚创建就查时，Cloudflare KV 可能还没同步到当前
     # 边缘节点（读旧缓存返回空）。等 3 秒重试一次再下结论，免得刚
-    # 点完「一键找供应商」就误报「查不到批次」吓到用户。
+    # 点完「开始找货」就误报「查不到批次」吓到用户。
     if not batches:
         time.sleep(3)
 
@@ -1294,6 +1392,13 @@ def _render_active_batch(src_key: str) -> None:
     pending = counts.get("pending", 0) + counts.get("running", 0)
 
     if pending > 0:
+        total = sum(counts.values()) or int(record.get("count") or 0)
+        finished = counts.get("done", 0) + counts.get("fail", 0)
+
+        st.progress(
+            finished / total if total else 0.0,
+            f"插件执行中 {finished} / {total or '?'}",
+        )
         st.markdown(f"**{_counts_line(counts)}**")
 
         _render_live(src_key, batch_id)
@@ -1340,18 +1445,93 @@ def _render_active_batch(src_key: str) -> None:
             f" · 视觉核验 {fstats['vision']} · 待人工 {fstats['human']}）"
         )
         st.success(
-            f"✅ 批次跑完：{n_done} 个产品已算出匹配分并保存最佳供应商"
-            f"（列表里看「最佳供应商」列）。{tail}"
+            f"✅ 批次跑完：{n_done} 个产品已算出匹配分并保存最佳供应商。{tail}"
         )
 
     else:
         st.caption("✅ 这个批次已完成。")
 
-    if st.button("关闭", key="pl_batch_close"):
+    _render_batch_results(record)
+
+    if st.button("知道了", key="pl_batch_close"):
         st.session_state.pop("prodlib_active", None)
         _set_pl_flag(batch_id, "finalized")
+        _set_pl_flag(batch_id, "seen")
 
         st.rerun()
+
+
+def _render_batch_results(record: dict) -> None:
+    """V2.11.7 本批结果：只列这批的产品 + 最佳供应商，就地导出——
+    不用去大列表里翻是哪几行刚找到的。"""
+    pids = {
+        str(i.get("pid"))
+        for i in record.get("items") or []
+        if i.get("pid")
+    }
+
+    index = st.session_state.get("prodlib_index") or {}
+    items = [
+        it
+        for it in (index.get("items") or [])
+        if str(it.get("pid")) in pids
+    ]
+
+    if not items:
+        st.caption("（本批产品的最新状态在下方产品列表里。）")
+
+        return
+
+    with st.expander(
+        f"👀 本批结果（{len(items)} 个产品）",
+        expanded=True,
+    ):
+        rows = [
+            {
+                "SKU": str(it.get("sku") or "")[:20],
+                "标题": str(it.get("title") or "")[:48],
+                "状态": _STATUS_LABELS.get(
+                    it.get("status") or "wait", ""
+                ),
+                "最佳供应商": _best_text(it.get("best") or {}),
+                "采购链接": str((it.get("best") or {}).get("url") or ""),
+                "找货时间": _fmt_ms(it.get("last_round")),
+            }
+            for it in items
+        ]
+
+        st.dataframe(
+            pd.DataFrame(rows),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "采购链接": st.column_config.LinkColumn(
+                    "链接",
+                    display_text="打开",
+                    width="small",
+                ),
+            },
+        )
+
+        try:
+            buf = _export_products(items)
+
+            st.download_button(
+                f"⬇️ 导出本批结果（{len(items)} 个）",
+                data=buf.getvalue(),
+                file_name=(
+                    f"本批找货结果_{datetime.now().strftime('%m%d_%H%M')}.xlsx"
+                ),
+                mime=(
+                    "application/vnd.openxmlformats-"
+                    "officedocument.spreadsheetml.sheet"
+                ),
+                key="pl_batch_export",
+                use_container_width=True,
+            )
+
+        except Exception as exc:
+            st.caption(f"导出失败：{exc}")
 
 
 def _render_live(src_key: str, batch_id: str) -> None:
@@ -1728,6 +1908,88 @@ def _render_table(src_key: str) -> None:
 
         sel_bar3.caption(f"已勾选 **{len(selected)}** 个（跨页保留）")
 
+    # V2.11.7：操作按钮挪到表格上方——勾选完不用滚过整页数据找按钮。
+    # （按钮读的是上一次渲染写进会话的勾选；编辑表格即时触发刷新，
+    # 所以点按钮时勾选已是最新。）
+    sel_pids = sorted(selected)
+
+    n_sel = len(sel_pids)
+
+    src_btn = cat_btn = del_btn = False
+
+    if read_only:
+        b4 = st.columns(1)[0]
+
+    else:
+        b1, b2, b3, b4 = st.columns(4)
+
+        src_btn = b1.button(
+            f"🔍 找供应商（{n_sel}）",
+            type="primary",
+            key="pl_src_btn",
+            use_container_width=True,
+            disabled=not n_sel,
+        )
+
+        cat_btn = b2.button(
+            f"🏷 设分类（{n_sel}）",
+            key="pl_cat_btn",
+            use_container_width=True,
+            disabled=not n_sel,
+        )
+
+        del_btn = b3.button(
+            f"🗑 删除（{n_sel}）",
+            key="pl_del_btn",
+            use_container_width=True,
+            disabled=not n_sel,
+        )
+
+    export_items = (
+        [it for it in filtered if str(it.get("pid")) in set(sel_pids)]
+        if n_sel
+        else filtered
+    )
+
+    try:
+        export_buf = _export_products(export_items)
+
+        b4.download_button(
+            f"⬇️ 导出（{len(export_items)}）",
+            data=export_buf.getvalue(),
+            file_name=(
+                f"产品库_{datetime.now().strftime('%m%d_%H%M')}.xlsx"
+            ),
+            mime=(
+                "application/vnd.openxmlformats-"
+                "officedocument.spreadsheetml.sheet"
+            ),
+            key="pl_export_btn",
+            use_container_width=True,
+        )
+
+    except Exception as exc:
+        b4.caption(f"导出失败：{exc}")
+
+    if src_btn:
+        st.session_state["prodlib_src_pids"] = sel_pids
+        st.session_state["prodlib_src_panel"] = True
+        st.rerun()
+
+        return
+
+    if cat_btn:
+        st.session_state["prodlib_cat_panel"] = True
+        st.rerun()
+
+        return
+
+    if del_btn:
+        st.session_state["prodlib_del_panel"] = True
+        st.rerun()
+
+        return
+
     edited = st.data_editor(
         pd.DataFrame(rows_src),
         num_rows="fixed",
@@ -1817,85 +2079,6 @@ def _render_table(src_key: str) -> None:
 
         except Exception as exc:
             st.error(f"保存修改失败：{exc}")
-
-    sel_pids = sorted(selected)
-
-    n_sel = len(sel_pids)
-
-    src_btn = cat_btn = del_btn = False
-
-    if read_only:
-        b4 = st.columns(1)[0]
-
-    else:
-        b1, b2, b3, b4 = st.columns(4)
-
-        src_btn = b1.button(
-            f"🔍 找供应商（{n_sel}）",
-            type="primary",
-            key="pl_src_btn",
-            use_container_width=True,
-            disabled=not n_sel,
-        )
-
-        cat_btn = b2.button(
-            f"🏷 设分类（{n_sel}）",
-            key="pl_cat_btn",
-            use_container_width=True,
-            disabled=not n_sel,
-        )
-
-        del_btn = b3.button(
-            f"🗑 删除（{n_sel}）",
-            key="pl_del_btn",
-            use_container_width=True,
-            disabled=not n_sel,
-        )
-
-    export_items = (
-        [it for it in filtered if str(it.get("pid")) in set(sel_pids)]
-        if n_sel
-        else filtered
-    )
-
-    try:
-        export_buf = _export_products(export_items)
-
-        b4.download_button(
-            f"⬇️ 导出（{len(export_items)}）",
-            data=export_buf.getvalue(),
-            file_name=(
-                f"产品库_{datetime.now().strftime('%m%d_%H%M')}.xlsx"
-            ),
-            mime=(
-                "application/vnd.openxmlformats-"
-                "officedocument.spreadsheetml.sheet"
-            ),
-            key="pl_export_btn",
-            use_container_width=True,
-        )
-
-    except Exception as exc:
-        b4.caption(f"导出失败：{exc}")
-
-    if src_btn:
-        st.session_state["prodlib_src_pids"] = sel_pids
-        st.session_state["prodlib_src_panel"] = True
-        st.rerun()
-
-        return
-
-    if cat_btn:
-        st.session_state["prodlib_cat_panel"] = True
-        st.rerun()
-
-        return
-
-    if del_btn:
-        st.session_state["prodlib_del_panel"] = True
-        st.rerun()
-
-        return
 
     # ---- 批量设分类 ----
     if st.session_state.get("prodlib_cat_panel") and n_sel:
