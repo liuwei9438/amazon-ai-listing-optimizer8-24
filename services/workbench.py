@@ -59,9 +59,11 @@ from services.task_worker import start_worker
 
 # 复用产品库的存储/鉴权辅助（product_lib 本身不渲染，页面在这边）
 from services.product_lib import (
+    _STATUS_LABELS,
     _ensure_index,
     _fmt_ms,
     _norm_pid,
+    _pid_owner,
     _pl_is_admin,
     _pl_payload,
     _prod_upsert,
@@ -147,8 +149,11 @@ def render_workbench(
 
     _render_task_card(api_key, model, options)
     _render_wb_import(src_key)
-    _render_wb_table(src_key, api_key, model, options)
+
+    # V2.13.5：详情面板放列表上方——卡片上点「📄 详情」
+    # 之后不用满页找它。
     _render_wb_detail(src_key)
+    _render_wb_table(src_key, api_key, model, options)
 
 
 # =====================================================
@@ -1020,10 +1025,10 @@ def _render_product_card(
     show_owner: bool = False,
 ) -> bool:
     """画一张产品卡：图片 / 状态角标 / 标题 / SKU / 型号 /
-    分类 / 资料行数 / 优化时间。
+    分类 / 资料行数 / 优化时间 / 找货标记。
 
-    返回 True = 用户点了卡片上的选择按钮
-    （由调用方统一改勾选集，跨页保留）。
+    返回 (是否点了选择, 是否点了详情)——都由调用方统一处理
+    （勾选跨页保留；详情面板开在列表上方）。
     """
     pid = str(it.get("pid"))
     label, fg, bg = _WB_BADGE.get(
@@ -1068,20 +1073,46 @@ def _render_product_card(
         if opt_ms:
             st.caption(f"优化时间：{_fmt_ms(opt_ms)}")
 
+        src_status = str(it.get("status") or "wait")
+
+        if src_status == "found":
+            st.caption("✅ 已找到供应商")
+
+        elif src_status == "none":
+            st.caption("❌ 没找到供应商")
+
         if show_owner:
             st.caption(f"👤 {str(it.get('owner') or '—')[:16]}")
 
+        sel_col, det_col = st.columns(2)
+
         if read_only:
-            return False
+            # 只读视图不能勾选 / 改标记，但可以看详情
+            return (
+                False,
+                det_col.button(
+                    "📄 详情",
+                    key=f"wb_card_d_{pid}",
+                    use_container_width=True,
+                ),
+            )
 
         is_sel = pid in selected
 
-        return st.button(
+        toggled = sel_col.button(
             "☑ 已选中" if is_sel else "☐ 选择",
             key=f"wb_card_{pid}",
             type="primary" if is_sel else "secondary",
             use_container_width=True,
         )
+
+        want_detail = det_col.button(
+            "📄 详情",
+            key=f"wb_card_d_{pid}",
+            use_container_width=True,
+        )
+
+        return toggled, want_detail
 
 
 def _render_wb_table(
@@ -1301,7 +1332,12 @@ def _render_wb_table(
 
         return
 
-    total_pages = max(1, math.ceil(len(filtered) / PAGE_SIZE))
+    # V2.13.5：每页条数可选（老板反馈 20 个太少）
+    page_size = int(
+        st.session_state.get("wb_page_size", 0) or PAGE_SIZE
+    )
+
+    total_pages = max(1, math.ceil(len(filtered) / page_size))
 
     page = max(
         0,
@@ -1312,7 +1348,9 @@ def _render_wb_table(
     )
     st.session_state["prodlib_page"] = page
 
-    page_items = filtered[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
+    page_items = filtered[
+        page * page_size:(page + 1) * page_size
+    ]
 
     nav1, nav2, nav3 = st.columns([1, 2, 1])
 
@@ -1343,8 +1381,10 @@ def _render_wb_table(
 
         return
 
-    # ---- 跳页（产品多了光靠上一页/下一页翻不过来）----
-    jump1, jump2, _jump3 = st.columns([0.7, 0.7, 3.6])
+    # ---- 跳页 + 每页条数（产品多了光靠上一页/下一页翻不过来）----
+    jump1, jump2, jump3, _jump4 = st.columns(
+        [0.7, 0.7, 1.2, 2.4]
+    )
 
     jump_to = jump1.number_input(
         "跳到第几页",
@@ -1366,6 +1406,19 @@ def _render_wb_table(
         st.rerun()
 
         return
+
+    # V2.13.5：每页条数（选了立即生效，勾选不受影响）
+    _sizes = [20, 50, 100, 200]
+
+    jump3.selectbox(
+        "每页",
+        _sizes,
+        index=_sizes.index(
+            page_size if page_size in _sizes else PAGE_SIZE
+        ),
+        key="wb_page_size",
+        label_visibility="collapsed",
+    )
     # ---- 勾选状态：会话里存 pid 集合，跨页 / 翻页保留 ----
     sel_state_key = "prodlib_selected"
 
@@ -1511,38 +1564,6 @@ def _render_wb_table(
                     use_container_width=True,
                 )
 
-    # ---- V2.13.4 产品卡片墙：图片 + 信息 + 状态角标 ----
-    toggles = []
-
-    for r0 in range(0, len(page_items), CARDS_PER_ROW):
-        row_slice = page_items[r0:r0 + CARDS_PER_ROW]
-        row_cols = st.columns(CARDS_PER_ROW)
-
-        for col, it in zip(row_cols, row_slice):
-            with col:
-                if _render_product_card(
-                    it,
-                    selected,
-                    read_only=read_only,
-                    show_owner=show_owner,
-                ):
-                    toggles.append(str(it.get("pid")))
-
-    # 卡片上的 ☑ 点击 → 并进跨页勾选集合（翻页 / 换筛选仍保留）
-    if toggles:
-        for pid in toggles:
-            if pid in selected:
-                selected.discard(pid)
-
-            else:
-                selected.add(pid)
-
-        st.session_state[sel_state_key] = sorted(selected)
-        st.rerun()
-
-        return
-
-
     # ---- 批量设分类 ----
     if st.session_state.get("prodlib_cat_panel") and n_sel:
         with st.expander(
@@ -1572,11 +1593,12 @@ def _render_wb_table(
                     try:
                         from services.product_lib import _prod_write
 
+                        # 不带 kw——别把已有搜索词冲掉
                         _prod_write(
                             "/prod_update",
                             "updates",
                             [
-                                {"pid": p, "kw": "", "cat": name}
+                                {"pid": p, "cat": name}
                                 for p in sel_pids
                             ],
                             label="设置失败",
@@ -1617,8 +1639,14 @@ def _render_wb_table(
             try:
                 from services.product_lib import _prod_write
 
+                # V2.13.5：一批最多 100 个 + 自动重试
+                # （worker /prod_del 单次上限就是 100）
                 _prod_write(
-                    "/prod_del", "pids", sel_pids, label="删除失败"
+                    "/prod_del",
+                    "pids",
+                    sel_pids,
+                    label="删除失败",
+                    chunk_size=100,
                 )
                 st.session_state.pop("prodlib_del_panel", None)
 
@@ -1647,6 +1675,51 @@ def _render_wb_table(
 
     if del_btn:
         st.session_state["prodlib_del_panel"] = True
+        st.rerun()
+
+        return
+
+
+    # ---- V2.13.4 产品卡片墙：图片 + 信息 + 状态角标 ----
+    toggles = []
+    detail_pid = ""
+
+    for r0 in range(0, len(page_items), CARDS_PER_ROW):
+        row_slice = page_items[r0:r0 + CARDS_PER_ROW]
+        row_cols = st.columns(CARDS_PER_ROW)
+
+        for col, it in zip(row_cols, row_slice):
+            with col:
+                _tg, _dt = _render_product_card(
+                    it,
+                    selected,
+                    read_only=read_only,
+                    show_owner=show_owner,
+                )
+
+                if _tg:
+                    toggles.append(str(it.get("pid")))
+
+                if _dt:
+                    detail_pid = str(it.get("pid"))
+
+    # 卡片上的 ☑ / 📄 点击 → 统一处理（勾选跨页保留；
+    # 详情面板开在页面上方）
+    if toggles or detail_pid:
+        for pid in toggles:
+            if pid in selected:
+                selected.discard(pid)
+
+            else:
+                selected.add(pid)
+
+        if toggles:
+            st.session_state[sel_state_key] = sorted(selected)
+
+        if detail_pid:
+            st.session_state["wb_detail_pid"] = detail_pid
+            st.toast("📄 产品详情已打开（页面上方）")
+
         st.rerun()
 
         return
@@ -1741,44 +1814,51 @@ def _export_pids(pids: list) -> io.BytesIO | None:
 
 
 # =====================================================
-# 产品详情（AI 结果 / 资料 / 单品操作）
+# 产品详情（点卡片「📄 详情」打开：AI 结果 / 资料 /
+# 变体 / 找货状态标记）
 # =====================================================
 
 
 def _render_wb_detail(src_key: str) -> None:
+    """V2.13.5：卡片上点「📄 详情」打开的单品面板。
+
+    不再是页底下拉框（900 个产品里翻下拉框根本找不到）——
+    哪张卡片点进来就看哪个产品；标记（待找货/已找到/没找到）
+    和分类在这里改，老产品库的功能都回来了。
+    """
+    pid = str(st.session_state.get("wb_detail_pid") or "")
+
+    if not pid:
+        return
+
     read_only = bool(_scope_owner())
 
     index = st.session_state.get("prodlib_index") or {}
     items = index.get("items") or []
 
-    if not items:
-        return
-
-    head = items[:300]
-
-    labels = [
-        f"{str(it.get('sku') or it.get('pid'))[:18]}｜"
-        f"{_WB_STATUS.get(_wb_state(it), '')}｜"
-        f"{str(it.get('title') or '')[:30]}"
-        for it in head
-    ]
-
-    choice = st.selectbox(
-        "📋 产品详情（AI 优化结果 / 完整资料 / 单品操作）",
-        ["（选择产品…）"] + labels,
-        key="wb_detail_sel",
+    it = next(
+        (x for x in items if str(x.get("pid")) == pid),
+        {},
     )
 
-    if not choice or choice.startswith("（"):
-        return
+    head1, head2 = st.columns([4, 1])
 
-    it = head[labels.index(choice)]
-    pid = str(it.get("pid"))
+    head1.markdown("#### 📋 产品详情")
+
+    if head2.button(
+        "✖ 关闭",
+        key="wb_detail_close",
+        use_container_width=True,
+    ):
+        st.session_state.pop("wb_detail_pid", None)
+        st.rerun()
+
+        return
 
     try:
         data = src_api(
             "/prod_list",
-            _pl_payload({"pid": pid}),
+            _pl_payload({"pid": pid, "owner": _pid_owner(pid)}),
         )
 
     except Exception as exc:
@@ -1840,6 +1920,70 @@ def _render_wb_detail(src_key: str) -> None:
                     )
 
                 st.caption(_when)
+
+        # ---- 标记 + 分类（老产品库的标记功能）----
+        if not read_only:
+            m1, m2, m3 = st.columns([1.2, 1.6, 0.8])
+
+            status_now = str(rec.get("status") or "wait")
+
+            if status_now not in ("wait", "found", "none"):
+                status_now = "wait"
+
+            with m1:
+                new_status = st.selectbox(
+                    "标记",
+                    ["wait", "found", "none"],
+                    index=["wait", "found", "none"].index(
+                        status_now
+                    ),
+                    format_func=lambda s: _STATUS_LABELS.get(
+                        s, s
+                    ),
+                    key=f"wb_d_st_{pid}",
+                )
+
+            with m2:
+                new_cat = st.text_input(
+                    "分类",
+                    value=str(rec.get("cat") or ""),
+                    key=f"wb_d_cat_{pid}",
+                    max_chars=40,
+                )
+
+            with m3:
+                st.caption("")
+
+                if st.button(
+                    "💾 保存标记",
+                    key=f"wb_d_save_{pid}",
+                    use_container_width=True,
+                ):
+                    try:
+                        # 不带 kw 字段——别把已有搜索词冲掉
+                        src_api(
+                            "/prod_update",
+                            _pl_payload(
+                                {
+                                    "updates": [
+                                        {
+                                            "pid": pid,
+                                            "cat": new_cat.strip(),
+                                            "status": new_status,
+                                        }
+                                    ]
+                                }
+                            ),
+                            timeout=30,
+                        )
+                        _refresh_index(src_key)
+                        st.toast("✅ 已保存标记")
+                        st.rerun()
+
+                        return
+
+                    except Exception as exc:
+                        st.error(f"保存失败：{exc}")
 
         if opt:
             st.markdown("##### 🤖 AI 优化结果")
@@ -1915,46 +2059,14 @@ def _render_wb_detail(src_key: str) -> None:
             )
 
         if not read_only:
-            e1, e2, e3 = st.columns([2, 1, 1])
+            e1, e2 = st.columns([3, 1])
 
             with e1:
-                new_cat = st.text_input(
-                    "改分类",
-                    value=str(rec.get("cat") or ""),
-                    key=f"wb_d_cat_{pid}",
-                    max_chars=40,
+                st.caption(
+                    "「🚀 优化这个产品」= 只勾选这一个产品去优化。"
                 )
 
             with e2:
-                if st.button(
-                    "💾 保存分类",
-                    key=f"wb_d_save_{pid}",
-                    use_container_width=True,
-                ):
-                    try:
-                        src_api(
-                            "/prod_update",
-                            _pl_payload(
-                                {
-                                    "updates": [
-                                        {
-                                            "pid": pid,
-                                            "kw": "",
-                                            "cat": new_cat.strip(),
-                                        }
-                                    ]
-                                }
-                            ),
-                            timeout=30,
-                        )
-                        _refresh_index(src_key)
-                        st.toast("✅ 已保存")
-                        st.rerun()
-
-                    except Exception as exc:
-                        st.error(f"保存失败：{exc}")
-
-            with e3:
                 if st.button(
                     "🚀 优化这个产品",
                     key=f"wb_d_opt_{pid}",

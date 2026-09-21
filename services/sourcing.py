@@ -111,26 +111,55 @@ def src_api(
     payload: dict,
     timeout: int = 25,
 ) -> dict:
-    """调 Worker 找货接口。返回响应 JSON；网络/HTTP 错抛 RuntimeError。"""
-    resp = requests.post(
-        _src_server() + path,
-        json=payload,
-        timeout=timeout,
-        headers={"Content-Type": "application/json"},
-    )
+    """调 Worker 找货接口。返回响应 JSON；网络/HTTP 错抛 RuntimeError。
 
-    try:
-        data = resp.json()
+    V2.13.5：①带浏览器 User-Agent——workers.dev 在 Cloudflare
+    后面，python-requests 默认 UA 偶发被拦（返回挑战页不是
+    JSON，页面就报「删除失败」这类错）；②瞬态失败自动重试
+    一次（1.5 秒后），绝大多数一次重试就过。
+    """
+    import time as _time
 
-    except Exception as exc:
-        raise RuntimeError(
-            f"Worker 响应不是 JSON（HTTP {resp.status_code}）"
-        ) from exc
+    headers = {
+        "Content-Type": "application/json",
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/126.0.0.0 Safari/537.36"
+        ),
+    }
 
-    if not isinstance(data, dict):
-        raise RuntimeError("Worker 响应格式异常")
+    for attempt in (1, 2):
+        try:
+            resp = requests.post(
+                _src_server() + path,
+                json=payload,
+                timeout=timeout,
+                headers=headers,
+            )
 
-    return data
+            try:
+                data = resp.json()
+
+            except Exception as exc:
+                raise RuntimeError(
+                    f"HTTP {resp.status_code} 返回的不是 JSON"
+                    "（可能被 Cloudflare 拦了一下）"
+                ) from exc
+
+            if isinstance(data, dict):
+                return data
+
+            raise RuntimeError("Worker 响应格式异常")
+
+        except Exception as exc:
+            if attempt == 2:
+                msg = str(exc) or type(exc).__name__
+                raise RuntimeError(
+                    f"连不上服务器（{msg[:120]}）"
+                ) from exc
+
+            _time.sleep(1.5)
 
 
 # =====================================================

@@ -532,23 +532,59 @@ def _prod_write(
     values: list,
     timeout: int = 60,
     label: str = "写入失败",
+    chunk_size: int = 20,
+    retries: int = 2,
 ) -> None:
     """批量写产品库（改分类/删产品/回写最佳供应商）分块提交。
 
-    和 _prod_upsert 同理：一块 20 条 ≈ 42 次 KV 子操作，
-    不超过 Worker 免费版单次 50 次的上限。失败抛 RuntimeError。
+    一块 20 条 ≈ 42 次 KV 子操作，不超过 Worker 免费版单次
+    50 次的上限（删除可以一批 100：/prod_del 只有索引读写）。
+
+    V2.13.5：网络瞬态（Cloudflare 偶发拦截/超时）自动重试
+    retries 次；最终失败时报出已成功的条数——删除是幂等的，
+    稍后再点一次会接着删剩下的。
     """
-    for start in range(0, len(values), 20):
-        chunk = values[start:start + 20]
+    total = len(values)
+    done = 0
 
-        resp = src_api(
-            path,
-            _pl_payload({field: chunk}),
-            timeout=timeout,
-        )
+    for start in range(0, total, chunk_size):
+        chunk = values[start:start + chunk_size]
+        err = None
 
-        if not resp.get("ok"):
-            raise RuntimeError(str(resp.get("error") or label))
+        for _try in range(retries + 1):
+            try:
+                resp = src_api(
+                    path,
+                    _pl_payload({field: chunk}),
+                    timeout=timeout,
+                )
+
+                if resp.get("ok"):
+                    err = None
+                    break
+
+                err = str(resp.get("error") or label)
+
+                if resp.get("denied"):
+                    # 登录过期 / 没权限这类明确拒绝——
+                    # 重试结果一模一样，直接报给用户
+                    break
+
+                # 其他 ok:false（存储抖动等）值得一试再试
+
+            except Exception as exc:
+                err = f"{type(exc).__name__}: {exc}"
+
+        if err:
+            done = start
+            more = (
+                f"（前 {done} 条已生效，稍后再点一次即可继续）"
+                if done
+                else ""
+            )
+            raise RuntimeError(f"{err}{more}")
+
+        done = start + len(chunk)
 
 
 # =====================================================
