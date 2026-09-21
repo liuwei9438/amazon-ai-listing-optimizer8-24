@@ -1,0 +1,10 @@
+# 运行时文件 —— 绝不提交（session 含登录令牌，config 可能含 AI Key）
+desktop/config.json
+desktop/session.json
+desktop/index_cache.json
+desktop/index_cache.all.json
+tasks/
+
+# Python 缓存
+__pycache__/
+*.pyc

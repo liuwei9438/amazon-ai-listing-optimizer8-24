@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>我的产品 · 桌面版</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<!-- ============ 登录 ============ -->
+<div id="login" class="login-wrap hidden">
+  <div class="login-card">
+    <div class="login-logo">📦</div>
+    <div class="login-title">我的产品 <span>桌面版</span></div>
+    <div class="login-sub">登录后自动连接云端产品库</div>
+    <input id="loginUser" type="text" placeholder="账号" autocomplete="username">
+    <input id="loginPass" type="password" placeholder="密码" autocomplete="current-password">
+    <div id="loginErr" class="login-err"></div>
+    <button id="loginBtn" class="btn primary wide">登 录</button>
+    <div class="login-foot">数据存在云端 · 员工采集照常进库</div>
+  </div>
+</div>
+
+<!-- ============ 主界面 ============ -->
+<div id="app" class="hidden">
+
+  <header class="topbar">
+    <div class="brand">📦 我的产品 <span id="verPill" class="pill">D1.0</span></div>
+    <div class="top-right">
+      <span id="netDot" class="dot" title="网络状态"></span>
+      <span id="userChip" class="chip"></span>
+      <button id="btnRefresh" class="btn ghost" title="重新读取产品库">🔄 刷新</button>
+      <button id="btnAi" class="btn ghost hidden" title="AI 设置">⚙️</button>
+      <button id="btnLogout" class="btn ghost">退出</button>
+    </div>
+  </header>
+
+  <main class="main">
+
+    <!-- 优化任务卡 -->
+    <div id="taskCard" class="task-card hidden">
+      <div class="task-head">
+        <b>🚀 AI 优化任务</b>
+        <span id="taskMsg" class="task-msg"></span>
+        <span class="task-acts">
+          <button id="btnPause" class="btn small">⏸ 暂停</button>
+          <button id="btnResume" class="btn small">▶ 继续</button>
+          <button id="btnCancel" class="btn small">⛔ 取消</button>
+          <button id="btnWriteback" class="btn small hidden">📥 重新写回</button>
+          <button id="btnCloseTask" class="btn small">✖ 关闭</button>
+        </span>
+      </div>
+      <div class="bar"><div id="taskBar" class="bar-in"></div></div>
+      <div id="taskStat" class="task-stat"></div>
+    </div>
+
+    <!-- 筛选 -->
+    <div class="tabs" id="statusTabs"></div>
+    <div class="tabs small" id="dateTabs"></div>
+
+    <div class="filter-row">
+      <select id="selCat" class="inp"></select>
+      <input id="inpQ" class="inp grow" placeholder="搜索：标题 / SKU / 型号">
+      <select id="selSort" class="inp">
+        <option value="updated">最近更新</option>
+        <option value="created">最近导入</option>
+        <option value="created_asc">最早导入</option>
+        <option value="opt">最近优化</option>
+      </select>
+      <select id="selPer" class="inp">
+        <option value="20">每页 20</option>
+        <option value="50">每页 50</option>
+        <option value="100">每页 100</option>
+        <option value="200">每页 200</option>
+      </select>
+      <select id="selScope" class="inp hidden">
+        <option value="">我的库</option>
+        <option value="all">全部产品（只读）</option>
+      </select>
+    </div>
+
+    <!-- 勾选操作 -->
+    <div class="selbar">
+      <button id="btnSelAll" class="btn">☑ 全选本页</button>
+      <button id="btnSelNone" class="btn">✖ 清空勾选</button>
+      <span id="selCount" class="selcount">已选 0 个（跨页保留）</span>
+      <span class="spacer"></span>
+      <button id="btnOpt" class="btn primary">🚀 AI 优化</button>
+      <button id="btnCat" class="btn">🏷 设分类</button>
+      <button id="btnDel" class="btn danger">🗑 删除</button>
+      <button id="btnExport" class="btn">⬇️ 导出优化结果</button>
+      <button id="btnImportToggle" class="btn">📥 导入产品</button>
+    </div>
+
+    <!-- 导入面板 -->
+    <div id="importPanel" class="import-panel hidden">
+      <div class="imp-row">
+        <div class="imp-col">
+          <b>上传采集 Excel（20 列模板）</b>
+          <input id="fileXlsx" type="file" accept=".xlsx" class="inp">
+          <button id="btnImportXlsx" class="btn primary">导入 Excel</button>
+        </div>
+        <div class="imp-col">
+          <b>或粘贴插件「发送到优化」复制的内容</b>
+          <textarea id="taPaste" class="inp" rows="4" placeholder="在采集插件面板点「发送到优化」→ 复制 → 粘贴到这里"></textarea>
+          <button id="btnImportPaste" class="btn primary">导入粘贴内容</button>
+        </div>
+      </div>
+      <div class="imp-note">相同 SKU 再次导入会合并更新（不重复建条）；导入的产品带完整资料，勾选后直接 AI 优化。</div>
+    </div>
+
+    <!-- 卡片墙 -->
+    <div id="grid" class="grid"></div>
+    <div id="empty" class="empty hidden">没有符合条件的产品。用上面「📥 导入」添加第一批。</div>
+
+    <!-- 分页 -->
+    <div class="pager">
+      <button id="btnPrev" class="btn">⬅ 上一页</button>
+      <span id="pageInfo" class="pageinfo"></span>
+      <input id="inpJump" type="number" min="1" class="inp narrow">
+      <button id="btnJump" class="btn">跳页</button>
+      <button id="btnNext" class="btn">下一页 ➡</button>
+    </div>
+
+  </main>
+</div>
+
+<!-- ============ 产品详情 ============ -->
+<div id="dlgDetail" class="modal hidden">
+  <div class="modal-box wide">
+    <div class="modal-head"><b id="dTitle">产品详情</b><button class="btn ghost" data-close>✖</button></div>
+    <div id="dBody" class="modal-body"></div>
+  </div>
+</div>
+
+<!-- ============ 设分类 ============ -->
+<div id="dlgCat" class="modal hidden">
+  <div class="modal-box">
+    <div class="modal-head"><b>🏷 给选中的产品设置分类</b><button class="btn ghost" data-close>✖</button></div>
+    <div class="modal-body">
+      <input id="catInput" class="inp" placeholder="分类名（如：打印机配件）" maxlength="40">
+      <button id="btnCatApply" class="btn primary wide">✅ 应用分类</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 删除确认 ============ -->
+<div id="dlgDel" class="modal hidden">
+  <div class="modal-box">
+    <div class="modal-head"><b>🗑 删除产品</b><button class="btn ghost" data-close>✖</button></div>
+    <div class="modal-body">
+      <div class="warn">确定删除选中的 <b id="delCount">0</b> 个产品？资料和优化结果都会一起删，不可恢复。</div>
+      <button id="btnDelApply" class="btn danger wide">🗑 确认删除</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ AI 设置 ============ -->
+<div id="dlgAi" class="modal hidden">
+  <div class="modal-box">
+    <div class="modal-head"><b>⚙️ AI 设置</b><button class="btn ghost" data-close>✖</button></div>
+    <div class="modal-body">
+      <div id="aiStatus" class="ai-status"></div>
+      <select id="aiProvider" class="inp">
+        <option value="openai">OpenAI</option>
+        <option value="deepseek">DeepSeek（国内直连、便宜）</option>
+      </select>
+      <input id="aiKey" type="password" class="inp" placeholder="API Key（留空=用服务器保存的）">
+      <button id="btnAiSave" class="btn primary wide">💾 保存到本机</button>
+      <div class="imp-note">这里保存的 Key 只存在这台电脑；管理员在网页版保存过的「服务器全局 Key」会自动拿来用。</div>
+    </div>
+  </div>
+</div>
+
+<div id="toasts" class="toasts"></div>
+<div id="busy" class="busy hidden"><div class="busy-box"><div class="spin"></div><span id="busyText">处理中…</span></div></div>
+
+<script src="/app.js"></script>
+</body>
+</html>
