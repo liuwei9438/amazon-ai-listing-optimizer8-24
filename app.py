@@ -77,7 +77,7 @@ except Exception:
         return False, "服务器模块未同步（到 share.streamlit.io 重启应用即可恢复）"
 
 
-VERSION = "V2.13.3"
+VERSION = "V2.13.4"
 
 TASK_RUNNING_STATUS = [
     "created",

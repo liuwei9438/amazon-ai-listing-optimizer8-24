@@ -74,7 +74,7 @@ from services.product_lib import (
 
 TASK_RUNNING_STATUS = ["created", "running", "processing"]
 
-PAGE_SIZE = 50  # 列表每页条数
+PAGE_SIZE = 20  # 卡片墙每页张数（V2.13.4）
 
 # 采集插件 20 列模板 → FieldMap（粘贴导入直接建 ProductRecord，
 # 和 Excel 上传走同一条 build_product_records 路径）
@@ -1000,6 +1000,90 @@ _WB_STATUS = {
 }
 
 
+# =====================================================
+# V2.13.4 产品卡片（老产品库样式：图片 + 信息 + 状态角标）
+# =====================================================
+
+CARDS_PER_ROW = 5
+
+_WB_BADGE = {
+    "opt": ("✅ 已优化", "#1a6b32", "#e8f5e9"),
+    "ready": ("⏳ 待优化", "#9a5b00", "#fff3e0"),
+    "thin": ("⚠️ 资料不全", "#8a6d3b", "#f6efe4"),
+}
+
+
+def _render_product_card(
+    it: dict,
+    selected: set,
+    read_only: bool = False,
+    show_owner: bool = False,
+) -> bool:
+    """画一张产品卡：图片 / 状态角标 / 标题 / SKU / 型号 /
+    分类 / 资料行数 / 优化时间。
+
+    返回 True = 用户点了卡片上的选择按钮
+    （由调用方统一改勾选集，跨页保留）。
+    """
+    pid = str(it.get("pid"))
+    label, fg, bg = _WB_BADGE.get(
+        _wb_state(it),
+        ("⏳ 待优化", "#9a5b00", "#fff3e0"),
+    )
+
+    with st.container(border=True):
+        img = str(it.get("img") or "")
+
+        if img:
+            try:
+                st.image(img, width=160)
+
+            except Exception:
+                st.caption("（图片打不开）")
+
+        else:
+            st.caption("（无图片）")
+
+        st.markdown(
+            f'''<span style="background:{bg};color:{fg};
+            border-radius:999px;padding:2px 10px;
+            font-size:12px;font-weight:700;">{label}</span>''',
+            unsafe_allow_html=True,
+        )
+
+        title = str(it.get("title") or "（无标题）")
+        st.markdown(f"**{title[:60]}**")
+
+        st.caption(
+            f"SKU：{str(it.get('sku') or '—')[:24]}　"
+            f"型号：{str(it.get('model') or '—')[:20]}"
+        )
+        st.caption(
+            f"分类：{str(it.get('cat') or '未分类')}"
+            f"（资料 {int(it.get('n_rows') or 0)} 行）"
+        )
+
+        opt_ms = int(it.get("opt_at") or 0)
+
+        if opt_ms:
+            st.caption(f"优化时间：{_fmt_ms(opt_ms)}")
+
+        if show_owner:
+            st.caption(f"👤 {str(it.get('owner') or '—')[:16]}")
+
+        if read_only:
+            return False
+
+        is_sel = pid in selected
+
+        return st.button(
+            "☑ 已选中" if is_sel else "☐ 选择",
+            key=f"wb_card_{pid}",
+            type="primary" if is_sel else "secondary",
+            use_container_width=True,
+        )
+
+
 def _render_wb_table(
     src_key: str,
     api_key: str,
@@ -1024,42 +1108,122 @@ def _render_wb_table(
 
     st.markdown("#### 产品列表")
 
-    f1, f2, f3, f4 = st.columns([1.2, 1.2, 2.4, 0.5])
+    # ---- V2.13.4 老产品库样式：状态标签页（带数量）----
+    st.session_state.setdefault("wb_status_code", "")
 
-    with f1:
-        status_choice = st.selectbox(
-            "状态",
-            [
-                f"全部 {counts['all']}",
-                f"待优化 {counts['ready']}",
-                f"已优化 {counts['opt']}",
-                f"资料不全 {counts['thin']}",
-            ],
-            key="wb_status",
+    tab_cols = st.columns(4)
+
+    status_defs = [
+        ("", f"全部（{counts['all']}）"),
+        ("ready", f"⏳ 待优化（{counts['ready']}）"),
+        ("opt", f"✅ 已优化（{counts['opt']}）"),
+        ("thin", f"⚠️ 资料不全（{counts['thin']}）"),
+    ]
+
+    for col, (code, label) in zip(tab_cols, status_defs):
+        active = st.session_state["wb_status_code"] == code
+
+        if col.button(
+            label,
+            key=f"wb_tab_{code or 'all'}",
+            type="primary" if active else "secondary",
+            use_container_width=True,
+        ):
+            st.session_state["wb_status_code"] = code
+            st.rerun()
+
+            return
+
+    state_code = st.session_state["wb_status_code"]
+
+    # ---- 导入日期快捷筛选（created 毫秒，客户端过滤）----
+    st.session_state.setdefault("wb_date_code", "all")
+
+    date_cols = st.columns(8)
+
+    date_defs = [
+        ("all", "全部时间"),
+        ("w1", "一周内"),
+        ("m1", "一月内"),
+        ("m3", "三月内"),
+        ("m6", "半年内"),
+        ("y1", "一年内"),
+        ("y3", "三年内"),
+        ("custom", "自定义"),
+    ]
+
+    for col, (code, label) in zip(date_cols, date_defs):
+        active = st.session_state["wb_date_code"] == code
+
+        if col.button(
+            label,
+            key=f"wb_date_{code}",
+            type="primary" if active else "secondary",
+            use_container_width=True,
+        ):
+            st.session_state["wb_date_code"] = code
+            st.rerun()
+
+            return
+
+    date_days = {
+        "w1": 7,
+        "m1": 30,
+        "m3": 91,
+        "m6": 183,
+        "y1": 365,
+        "y3": 1096,
+    }
+
+    lo_ms = hi_ms = None
+
+    if st.session_state["wb_date_code"] in date_days:
+        lo_ms = (
+            datetime.now().timestamp() * 1000
+            - date_days[st.session_state["wb_date_code"]]
+            * 86400000
         )
 
-        state_code = ""
+    elif st.session_state["wb_date_code"] == "custom":
+        lo_col, hi_col = st.columns(2)
 
-        if status_choice.startswith("待"):
-            state_code = "ready"
+        with lo_col:
+            lo_date = st.date_input("起始日期", key="wb_date_lo")
 
-        elif status_choice.startswith("已"):
-            state_code = "opt"
+        with hi_col:
+            hi_date = st.date_input("截止日期", key="wb_date_hi")
 
-        elif status_choice.startswith("资料"):
-            state_code = "thin"
+        if lo_date:
+            lo_ms = datetime.combine(
+                lo_date, datetime.min.time()
+            ).timestamp() * 1000
 
-    with f2:
+        if hi_date:
+            hi_ms = datetime.combine(
+                hi_date, datetime.max.time()
+            ).timestamp() * 1000
+
+    # ---- 分类 / 搜索 / 排序 / 刷新 ----
+    f1, f2, f3, f4 = st.columns([1.4, 2.2, 1.2, 0.5])
+
+    with f1:
         cat_choice = st.selectbox(
             "分类",
             ["全部分类"] + cats,
             key="wb_cat",
         )
 
-    with f3:
+    with f2:
         query = st.text_input(
             "搜索（标题 / SKU / 型号）",
             key="wb_q",
+        )
+
+    with f3:
+        sort_choice = st.selectbox(
+            "排序",
+            ["最近更新", "最近导入", "最早导入", "最近优化"],
+            key="wb_sort",
         )
 
     with f4:
@@ -1083,13 +1247,34 @@ def _render_wb_table(
 
     needle = re.sub(r"\s+", "", str(query or "")).lower()
 
+    sort_keys = {
+        "最近更新": lambda it: -(int(it.get("updated") or 0)),
+        "最近导入": lambda it: -(int(it.get("created") or 0)),
+        "最早导入": lambda it: int(it.get("created") or 0),
+        "最近优化": lambda it: -(int(it.get("opt_at") or 0)),
+    }
+
     filtered = []
 
     for it in items:
         if state_code and _wb_state(it) != state_code:
             continue
 
-        if cat_choice != "全部分类" and (it.get("cat") or "未分类") != cat_choice:
+        if cat_choice != "全部分类" and (
+            it.get("cat") or "未分类"
+        ) != cat_choice:
+            continue
+
+        created_ms = int(it.get("created") or 0)
+
+        if lo_ms is not None and (
+            not created_ms or created_ms < lo_ms
+        ):
+            continue
+
+        if hi_ms is not None and (
+            not created_ms or created_ms > hi_ms
+        ):
             continue
 
         if needle:
@@ -1104,6 +1289,10 @@ def _render_wb_table(
                 continue
 
         filtered.append(it)
+
+    filtered.sort(
+        key=sort_keys.get(sort_choice, sort_keys["最近更新"])
+    )
 
     if not filtered:
         st.info(
@@ -1139,7 +1328,8 @@ def _render_wb_table(
         return
 
     nav2.caption(
-        f"第 {page + 1} / {total_pages} 页 · 符合条件 {len(filtered)} 个"
+        f"第 {page + 1} / {total_pages} 页 · "
+        f"共找到 {len(filtered)} 个产品（库里共 {len(items)} 个）"
     )
 
     if nav3.button(
@@ -1153,6 +1343,29 @@ def _render_wb_table(
 
         return
 
+    # ---- 跳页（产品多了光靠上一页/下一页翻不过来）----
+    jump1, jump2, _jump3 = st.columns([0.7, 0.7, 3.6])
+
+    jump_to = jump1.number_input(
+        "跳到第几页",
+        min_value=1,
+        max_value=total_pages,
+        value=page + 1,
+        key="wb_jump",
+        label_visibility="collapsed",
+    )
+
+    if jump2.button(
+        "跳页",
+        key="wb_jump_btn",
+        use_container_width=True,
+    ):
+        st.session_state["prodlib_page"] = max(
+            0, min(int(jump_to) - 1, total_pages - 1)
+        )
+        st.rerun()
+
+        return
     # ---- 勾选状态：会话里存 pid 集合，跨页 / 翻页保留 ----
     sel_state_key = "prodlib_selected"
 
@@ -1168,29 +1381,7 @@ def _render_wb_table(
 
     page_pid_set = {str(it.get("pid")) for it in page_items}
 
-    rows_src = []
-    row_pids = []
 
-    for it in page_items:
-        rows_src.append(
-            {
-                **({} if read_only else {"选": str(it.get("pid")) in selected}),
-                **(
-                    {"归属": str(it.get("owner") or "—")[:16]}
-                    if show_owner
-                    else {}
-                ),
-                "图": str(it.get("img") or ""),
-                "标题": str(it.get("title") or "")[:60],
-                "SKU": str(it.get("sku") or "")[:24],
-                "型号": str(it.get("model") or "")[:20],
-                "分类": str(it.get("cat") or ""),
-                "资料行": int(it.get("n_rows") or 0),
-                "状态": _WB_STATUS.get(_wb_state(it), ""),
-                "优化时间": _fmt_ms(it.get("opt_at")),
-            }
-        )
-        row_pids.append(str(it.get("pid")))
 
     sel_pids = sorted(selected)
     n_sel = len(sel_pids)
@@ -1320,84 +1511,37 @@ def _render_wb_table(
                     use_container_width=True,
                 )
 
-    edited = st.data_editor(
-        pd.DataFrame(rows_src),
-        num_rows="fixed",
-        hide_index=True,
-        use_container_width=True,
-        height=min(38 * len(rows_src) + 60, 640),
-        disabled=True if read_only else [
-            "图", "标题", "SKU", "型号", "资料行",
-            "状态", "优化时间",
-        ],
-        column_config={
-            "选": st.column_config.CheckboxColumn(
-                "选",
-                width="small",
-                default=False,
-            ),
-            "图": st.column_config.ImageColumn("图", width="small"),
-            "标题": st.column_config.TextColumn("标题", width="large"),
-            "分类": st.column_config.TextColumn("分类", width="small"),
-        },
-    )
+    # ---- V2.13.4 产品卡片墙：图片 + 信息 + 状态角标 ----
+    toggles = []
 
-    try:
-        edited_rows = edited.to_dict("records")
+    for r0 in range(0, len(page_items), CARDS_PER_ROW):
+        row_slice = page_items[r0:r0 + CARDS_PER_ROW]
+        row_cols = st.columns(CARDS_PER_ROW)
 
-    except Exception:
-        edited_rows = []
+        for col, it in zip(row_cols, row_slice):
+            with col:
+                if _render_product_card(
+                    it,
+                    selected,
+                    read_only=read_only,
+                    show_owner=show_owner,
+                ):
+                    toggles.append(str(it.get("pid")))
 
-    # ---- 本页勾选写回会话（其他页的保留；只读视图不碰勾选）----
-    if not read_only:
-        page_checked = {
-            pid
-            for ed_row, pid in zip(edited_rows, row_pids)
-            if bool(ed_row.get("选"))
-        }
+    # 卡片上的 ☑ 点击 → 并进跨页勾选集合（翻页 / 换筛选仍保留）
+    if toggles:
+        for pid in toggles:
+            if pid in selected:
+                selected.discard(pid)
 
-        selected = (selected - page_pid_set) | page_checked
+            else:
+                selected.add(pid)
+
         st.session_state[sel_state_key] = sorted(selected)
+        st.rerun()
 
-    # ---- 表格里改的分类自动保存 ----
-    updates = []
+        return
 
-    for src_row, ed_row, pid in zip(rows_src, edited_rows, row_pids):
-        new_cat = str(ed_row.get("分类") or "").strip()
-
-        if new_cat != str(src_row["分类"]).strip():
-            updates.append(
-                {"pid": pid, "kw": "", "cat": new_cat}
-            )
-
-    if updates:
-        try:
-            from services.product_lib import _prod_write
-
-            _prod_write(
-                "/prod_update",
-                "updates",
-                updates,
-                label="保存修改失败",
-            )
-
-            by_pid = {u["pid"]: u for u in updates}
-            session_index = st.session_state.get("prodlib_index")
-
-            if isinstance(session_index, dict):
-                for it in session_index.get("items", []):
-                    change = by_pid.get(it.get("pid"))
-
-                    if change:
-                        it["cat"] = change["cat"]
-
-            st.toast(f"✅ 已保存 {len(updates)} 处分类")
-            st.rerun()
-
-            return
-
-        except Exception as exc:
-            st.error(f"保存修改失败：{exc}")
 
     # ---- 批量设分类 ----
     if st.session_state.get("prodlib_cat_panel") and n_sel:
