@@ -17,20 +17,67 @@ from services.current_task import (
 )
 
 
-from services.user_auth import (
-    current_dept,
-    get_dept_key_info,
-    get_opt_config,
-    get_worker_ai_key,
-    is_admin_user,
-    render_sidebar_badge,
-    require_login,
-    set_worker_ai_key,
-    sync_session_cookie,
-)
+# V2.13.3 容错导入：09-21 云端曾因这条 import 整页崩溃（云端的
+# services/user_auth.py 没同步到新版、缺 get_worker_ai_key /
+# set_worker_ai_key 时，ImportError 直接白屏打不开）。改为：
+# 老函数正常导入；两个新函数单独容错（缺了退化为「未配置」）；
+# 整链异常时进安全模式并把真实错误亮在页面上，绝不再白屏。
+try:
+    from services.user_auth import (
+        current_dept,
+        get_dept_key_info,
+        get_opt_config,
+        is_admin_user,
+        render_sidebar_badge,
+        require_login,
+        sync_session_cookie,
+    )
+    _AUTH_IMPORT_ERROR = ""
+except Exception as _auth_err:
+
+    _AUTH_IMPORT_ERROR = f"{type(_auth_err).__name__}: {_auth_err}"
+
+    def current_dept():
+        return ""
+
+    def get_dept_key_info(dept):
+        return "", ""
+
+    def get_opt_config():
+        return {}
+
+    def is_admin_user():
+        return False
+
+    def render_sidebar_badge():
+        return None
+
+    def require_login():
+        st.error(
+            "登录模块加载失败（安全模式）。请把下面这段错误"
+            "截图发给技术，然后到 share.streamlit.io 重启应用："
+        )
+        st.code(_AUTH_IMPORT_ERROR)
+        st.stop()
+
+    def sync_session_cookie():
+        return None
+
+try:
+    from services.user_auth import get_worker_ai_key, set_worker_ai_key
+except Exception:
+    # 云端 user_auth.py 还是旧版（缺这两个函数）时不崩溃：
+    # AI 设置面板照常打开，保存/读取提示未同步；重启应用
+    # 重新拉取代码后自动恢复。
+
+    def get_worker_ai_key():
+        return "", ""
+
+    def set_worker_ai_key(provider, key):
+        return False, "服务器模块未同步（到 share.streamlit.io 重启应用即可恢复）"
 
 
-VERSION = "V2.13.2"
+VERSION = "V2.13.3"
 
 TASK_RUNNING_STATUS = [
     "created",
