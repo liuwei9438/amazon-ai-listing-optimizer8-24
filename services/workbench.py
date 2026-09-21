@@ -24,6 +24,7 @@ from __future__ import annotations
 
 
 import hashlib
+import html
 import io
 import json
 import math
@@ -1018,6 +1019,79 @@ _WB_BADGE = {
 }
 
 
+def _card_body_html(
+    it: dict,
+    label: str,
+    fg: str,
+    bg: str,
+    show_owner: bool = False,
+) -> str:
+    """一张卡的全部正文（图片/角标/标题/文字行）压成一个 HTML 块
+    ——V2.13.6 卡顿修复的核心，见 _render_product_card 注释。"""
+    img = str(it.get("img") or "").strip()
+
+    if img:
+        # loading="lazy"：滚动到哪张浏览器才加载哪张，不再一页
+        # 几百张图同时请求；打不开的图就地隐藏（留浅灰占位框）
+        media = (
+            f'<img src="{html.escape(img, quote=True)}"'
+            ' loading="lazy" referrerpolicy="no-referrer"'
+            " onerror=\"this.onerror=null;"
+            "this.style.visibility='hidden'\""
+            ' style="width:100%;height:110px;object-fit:contain;'
+            'background:#fafafa;border-radius:6px;" />'
+        )
+
+    else:
+        media = (
+            '<div style="height:110px;display:flex;align-items:center;'
+            'justify-content:center;color:#aaa;font-size:12px;'
+            'background:#fafafa;border-radius:6px;">（无图片）</div>'
+        )
+
+    title = html.escape(str(it.get("title") or "（无标题）")[:60])
+
+    lines = [
+        "SKU：{}　型号：{}".format(
+            html.escape(str(it.get("sku") or "—")[:24]),
+            html.escape(str(it.get("model") or "—")[:20]),
+        ),
+        "分类：{}（资料 {} 行）".format(
+            html.escape(str(it.get("cat") or "未分类")[:20]),
+            int(it.get("n_rows") or 0),
+        ),
+    ]
+
+    opt_ms = int(it.get("opt_at") or 0)
+
+    if opt_ms:
+        lines.append(f"优化时间：{_fmt_ms(opt_ms)}")
+
+    src_status = str(it.get("status") or "wait")
+
+    if src_status == "found":
+        lines.append("✅ 已找到供应商")
+
+    elif src_status == "none":
+        lines.append("❌ 没找到供应商")
+
+    if show_owner:
+        lines.append("👤 " + html.escape(str(it.get("owner") or "—")[:16]))
+
+    body = "<br/>".join(html.escape(x) for x in lines)
+
+    return (
+        f'{media}'
+        f'<span style="background:{bg};color:{fg};border-radius:999px;'
+        f'padding:2px 10px;font-size:12px;font-weight:700;'
+        f'display:inline-block;margin-top:6px;">{label}</span>'
+        f'<div style="font-weight:700;font-size:13px;'
+        f'margin:4px 0 2px;word-break:break-word;">{title}</div>'
+        f'<div style="font-size:12px;color:#555;'
+        f'line-height:1.6;">{body}</div>'
+    )
+
+
 def _render_product_card(
     it: dict,
     selected: set,
@@ -1026,6 +1100,11 @@ def _render_product_card(
 ) -> bool:
     """画一张产品卡：图片 / 状态角标 / 标题 / SKU / 型号 /
     分类 / 资料行数 / 优化时间 / 找货标记。
+
+    V2.13.6 卡顿修复：正文（图片+角标+全部文字行）压成 1 个
+    HTML 块，每卡只剩 正文块 + 2 个按钮。原来每卡 10 来个元素，
+    老板录屏实测选 200/页后点一次删除，两千多个元素把连接挤断
+    51 秒（右上角一直 CONNECTING）。
 
     返回 (是否点了选择, 是否点了详情)——都由调用方统一处理
     （勾选跨页保留；详情面板开在列表上方）。
@@ -1037,52 +1116,10 @@ def _render_product_card(
     )
 
     with st.container(border=True):
-        img = str(it.get("img") or "")
-
-        if img:
-            try:
-                st.image(img, width=160)
-
-            except Exception:
-                st.caption("（图片打不开）")
-
-        else:
-            st.caption("（无图片）")
-
         st.markdown(
-            f'''<span style="background:{bg};color:{fg};
-            border-radius:999px;padding:2px 10px;
-            font-size:12px;font-weight:700;">{label}</span>''',
+            _card_body_html(it, label, fg, bg, show_owner),
             unsafe_allow_html=True,
         )
-
-        title = str(it.get("title") or "（无标题）")
-        st.markdown(f"**{title[:60]}**")
-
-        st.caption(
-            f"SKU：{str(it.get('sku') or '—')[:24]}　"
-            f"型号：{str(it.get('model') or '—')[:20]}"
-        )
-        st.caption(
-            f"分类：{str(it.get('cat') or '未分类')}"
-            f"（资料 {int(it.get('n_rows') or 0)} 行）"
-        )
-
-        opt_ms = int(it.get("opt_at") or 0)
-
-        if opt_ms:
-            st.caption(f"优化时间：{_fmt_ms(opt_ms)}")
-
-        src_status = str(it.get("status") or "wait")
-
-        if src_status == "found":
-            st.caption("✅ 已找到供应商")
-
-        elif src_status == "none":
-            st.caption("❌ 没找到供应商")
-
-        if show_owner:
-            st.caption(f"👤 {str(it.get('owner') or '—')[:16]}")
 
         sel_col, det_col = st.columns(2)
 
@@ -1337,6 +1374,15 @@ def _render_wb_table(
         st.session_state.get("wb_page_size", 0) or PAGE_SIZE
     )
 
+    # V2.13.6：砍掉 200 档（录屏实测老板选 200/页后点一次删除，
+    # 两千多个元素把连接挤断 51 秒）；旧会话残留的非法值就地回收到
+    # 默认——必须在这里做，下面 total_pages 用的就是 page_size
+    _sizes = [20, 50, 100]
+
+    if page_size not in _sizes:
+        page_size = PAGE_SIZE
+        st.session_state["wb_page_size"] = PAGE_SIZE
+
     total_pages = max(1, math.ceil(len(filtered) / page_size))
 
     page = max(
@@ -1407,9 +1453,8 @@ def _render_wb_table(
 
         return
 
-    # V2.13.5：每页条数（选了立即生效，勾选不受影响）
-    _sizes = [20, 50, 100, 200]
-
+    # V2.13.6：每页条数选项（200 档已砍，回收逻辑在上面
+    # page_size 读取处——total_pages 前就要修好）
     jump3.selectbox(
         "每页",
         _sizes,
