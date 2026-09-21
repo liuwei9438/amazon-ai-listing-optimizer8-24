@@ -95,6 +95,15 @@ _TEMPLATE_FIELDS = FieldMap(
 _RAW_MAX_CHARS = 300000
 
 
+def _exp_lib_ok() -> bool:
+    """网页导出权限：worker /login 的 exp_lib（总后台「网页导出」开关，
+    默认允许）；管理员永远可导出。"""
+    return bool(
+        _pl_is_admin()
+        or st.session_state.get("auth_exp_lib", True)
+    )
+
+
 # =====================================================
 # 权限门 / 页面骨架
 # =====================================================
@@ -755,7 +764,7 @@ def _render_task_card(api_key: str, model: str, options: dict) -> None:
     act1, act2 = st.columns(2)
 
     with act1:
-        if has_manifest:
+        if has_manifest and _exp_lib_ok():
             pids = [str(p) for p in manifest.get("pids") or []]
 
             try:
@@ -1262,7 +1271,8 @@ def _render_wb_table(
             disabled=not n_sel,
         )
 
-        export_clicked = b4.button(
+        # V2.13.1：没有「网页导出」权限的账号不显示导出按钮
+        export_clicked = _exp_lib_ok() and b4.button(
             f"⬇️ 导出优化结果（{n_sel}）",
             key="wb_export_btn",
             use_container_width=True,

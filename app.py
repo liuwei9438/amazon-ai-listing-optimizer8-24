@@ -28,7 +28,7 @@ from services.user_auth import (
 )
 
 
-VERSION = "V2.13.0"
+VERSION = "V2.13.1"
 
 TASK_RUNNING_STATUS = [
     "created",
