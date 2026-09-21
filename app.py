@@ -21,14 +21,16 @@ from services.user_auth import (
     current_dept,
     get_dept_key_info,
     get_opt_config,
+    get_worker_ai_key,
     is_admin_user,
     render_sidebar_badge,
     require_login,
+    set_worker_ai_key,
     sync_session_cookie,
 )
 
 
-VERSION = "V2.13.1"
+VERSION = "V2.13.2"
 
 TASK_RUNNING_STATUS = [
     "created",
@@ -324,11 +326,19 @@ with st.sidebar:
     if ADMIN_MODE:
 
         # ---- 管理员：所有配置收进默认收起的设置面板 ----
+        # V2.13.2：Key 保存进服务器（worker v13.6 cfg:ai）——填
+        # 一次全站生效，管理员/组长/员工都不再手填；小组自己
+        # 填了 Key 的组仍按组优先。
+        try:
+            wk_key, wk_provider = get_worker_ai_key()
+        except Exception:
+            wk_key, wk_provider = "", ""
+
         with st.expander("⚙️ AI 设置", expanded=False):
             provider = st.radio(
                 "AI 服务商",
                 AI_PROVIDERS,
-                index=0,
+                index=(1 if wk_provider == "deepseek" else 0),
                 horizontal=True,
                 key="ai_provider",
                 disabled=task_running_now,
@@ -357,19 +367,86 @@ with st.sidebar:
                 else "到 platform.openai.com 充值并创建 Key"
             )
 
-            # 严格按服务商读对应的 Secrets 密钥（不做跨服务商
-            # 回退：错家的 Key 发给接口只会 401 全军覆没）。
-            saved_api_key = get_saved_provider_key(provider)
-
             manual_api_key = st.text_input(
                 key_label,
                 type="password",
+                help="留空=直接用已保存的 Key；填了仅本次登录"
+                "有效，点「保存到服务器」后全站永久生效。",
             )
 
-            api_key = manual_api_key.strip() or saved_api_key
+            # Key 来源优先级：本次手填 > 服务器全局 Key（服务商
+            # 必须一致，错家的 Key 发过去只会 401）> Secrets。
+            api_key = manual_api_key.strip()
+            if not api_key and wk_key and (
+                (provider == "DeepSeek")
+                == (wk_provider == "deepseek")
+            ):
+                api_key = wk_key
+            if not api_key:
+                # 严格按服务商读对应的 Secrets 密钥（不做跨服务商
+                # 回退：错家的 Key 发给接口只会 401 全军覆没）。
+                api_key = get_saved_provider_key(provider)
 
             if not api_key.strip():
                 st.caption(f"💡 {key_hint}")
+
+            if wk_key:
+                st.caption(
+                    "🔒 服务器已保存："
+                    + (
+                        "DeepSeek"
+                        if wk_provider == "deepseek"
+                        else "OpenAI"
+                    )
+                    + f" Key（{len(wk_key)} 位）——全站登录自动"
+                    "使用；小组填了 Key 的组按组优先。"
+                )
+            else:
+                st.caption(
+                    "🔒 服务器尚未保存 Key：保存后全站登录自动带，"
+                    "谁都不用再手填。"
+                )
+
+            col_save, col_clear = st.columns(2)
+            with col_save:
+                if st.button(
+                    "💾 保存到服务器（全站生效）",
+                    use_container_width=True,
+                    disabled=(
+                        task_running_now
+                        or not manual_api_key.strip()
+                    ),
+                ):
+                    ok, err = set_worker_ai_key(
+                        "deepseek"
+                        if provider == "DeepSeek"
+                        else "openai",
+                        manual_api_key.strip(),
+                    )
+                    if ok:
+                        st.session_state[
+                            "_worker_ai_key_cache"
+                        ] = None
+                        st.success(
+                            "已保存 ✅ 全站生效（下次刷新页面后"
+                            "状态更新）"
+                        )
+                    else:
+                        st.error(f"保存失败：{err}")
+            with col_clear:
+                if st.button(
+                    "🗑️ 清空服务器 Key",
+                    use_container_width=True,
+                    disabled=task_running_now or not wk_key,
+                ):
+                    ok, err = set_worker_ai_key("", "")
+                    if ok:
+                        st.session_state[
+                            "_worker_ai_key_cache"
+                        ] = None
+                        st.success("已清空 ✅")
+                    else:
+                        st.error(f"清空失败：{err}")
 
             # 模型名跟随服务商自动切换（自定义过的不会被动）。
             default_model = (
@@ -415,13 +492,31 @@ with st.sidebar:
             )
             api_key = dept_key
         else:
-            saved_open = get_saved_provider_key("OpenAI")
-            saved_deep = get_saved_provider_key("DeepSeek")
+            # V2.13.2：管理员保存在服务器的全局 Key 排在
+            # Secrets 前面（那是「⚙️ AI 设置」真保存的那把）。
+            try:
+                wk_key, wk_provider = get_worker_ai_key()
+            except Exception:
+                wk_key, wk_provider = "", ""
 
-            if saved_deep and not saved_open:
-                provider, api_key = "DeepSeek", saved_deep
+            if wk_key:
+                provider = (
+                    "DeepSeek"
+                    if wk_provider == "deepseek"
+                    else "OpenAI"
+                )
+                api_key = wk_key
             else:
-                provider, api_key = "OpenAI", saved_open
+                saved_open = get_saved_provider_key("OpenAI")
+                saved_deep = get_saved_provider_key("DeepSeek")
+
+                if saved_deep and not saved_open:
+                    provider, api_key = (
+                        "DeepSeek",
+                        saved_deep,
+                    )
+                else:
+                    provider, api_key = "OpenAI", saved_open
 
         if provider == "DeepSeek":
             os.environ["OPENAI_BASE_URL"] = (

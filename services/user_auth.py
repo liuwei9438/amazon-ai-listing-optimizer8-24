@@ -341,6 +341,87 @@ def get_dept_api_key(dept: str) -> str:
     return key
 
 
+def get_worker_ai_key():
+    """读全局 AI Key（worker v13.6 cfg:ai），返回 (key, provider)。
+
+    管理员在优化程序「⚙️ AI 设置」里保存的那把：全站账号自动
+    带着用；小组自己填了 Key 的组仍按组优先。provider 是
+    "openai" / "deepseek"。每个会话只取一次；没配置返回 ("", "")。
+    """
+    cache = st.session_state.get("_worker_ai_key_cache")
+    if cache is not None:
+        return cache[0], cache[1]
+
+    server = _worker_server()
+    admin_key = _secrets_str("auth_admin_key")
+    if not server or not admin_key:
+        return "", ""
+
+    key = ""
+    provider = ""
+    try:
+        data = _worker_post(
+            server,
+            "/admin",
+            {
+                "admin_key": admin_key,
+                "action": "ai_key_get",
+            },
+            timeout=6,
+        )
+        if isinstance(data, dict) and data.get("ok"):
+            key = str(data.get("key") or "").strip()
+            if key:
+                provider = (
+                    "deepseek"
+                    if str(
+                        data.get("provider") or ""
+                    ).strip().lower()
+                    == "deepseek"
+                    else "openai"
+                )
+    except Exception:
+        pass
+
+    st.session_state["_worker_ai_key_cache"] = (key, provider)
+    return key, provider
+
+
+def set_worker_ai_key(provider: str, key: str):
+    """保存/清空全局 AI Key（worker v13.6）。
+
+    key 传空串=清空。返回 (ok, error)；ok=True 时 error 为空。
+    """
+    server = _worker_server()
+    admin_key = _secrets_str("auth_admin_key")
+    if not server or not admin_key:
+        return False, "服务器未配置（auth_server / auth_admin_key）"
+
+    try:
+        data = _worker_post(
+            server,
+            "/admin",
+            {
+                "admin_key": admin_key,
+                "action": "ai_key_set",
+                "provider": provider,
+                "key": key,
+            },
+            timeout=8,
+        )
+    except Exception as e:
+        return False, f"连不上授权服务器：{e}"
+
+    if isinstance(data, dict) and data.get("ok"):
+        return True, ""
+    err = (
+        str(data.get("error") or "服务器未返回 ok")
+        if isinstance(data, dict)
+        else "服务器无响应"
+    )
+    return False, err
+
+
 def auth_enabled() -> bool:
     """登录门是否启用（本地账号或授权服务器任一配置即启用）。"""
     return bool(_load_users()) or worker_auth_enabled()
