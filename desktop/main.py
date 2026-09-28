@@ -40,7 +40,7 @@ ROOT = APP_DIR.parent                          # 仓库根
 os.chdir(ROOT)                                 # 引擎的 tasks/ 落在根目录
 sys.path.insert(0, str(ROOT))
 
-VERSION = "D1.3.1"
+VERSION = "D1.4.0"
 APP_DIR_NAME = "app"
 
 DEFAULT_CONFIG = {
@@ -55,6 +55,15 @@ DEFAULT_CONFIG = {
         "amazon_aliexpress_collector_v4_20\\auth-server\\admin_config.json"
     ),
     "ai": {"provider": "openai", "key": "", "model": ""},
+    # 亚马逊 SP-API（上传/刊登）：凭证只存本机 config.json，
+    # 绝不进 git、绝不回显到界面。lwa_base/spapi_base 是测试
+    # 覆盖项（留空 = 官方域名）。
+    "amazon": {
+        "client_id": "", "client_secret": "", "refresh_token": "",
+        "app_id": "", "seller_id": "",
+        "marketplace": "ATVPDKIKX0DER", "product_type": "PRODUCT",
+        "lwa_base": "", "spapi_base": "",
+    },
 }
 
 CONFIG_PATH = APP_DIR / "config.json"
@@ -1121,6 +1130,649 @@ def _export_pids(pids: list) -> tuple[str, bytes] | None:
 
 
 # =====================================================
+# 亚马逊 SP-API 上传（刊登）：LWA 令牌 + JSON_LISTINGS_FEED
+# 凭证只存本机 config.json；worker 端零改动。
+# =====================================================
+
+_MARKETPLACES = {           # marketplaceId → (区域, 语言, 名称)
+    "ATVPDKIKX0DER": ("na", "en_US", "美国 US"),
+    "A2EUQ1WTGCTBG2": ("na", "en_CA", "加拿大 CA"),
+    "A1AM78C64UM0Y8": ("na", "es_MX", "墨西哥 MX"),
+    "A2Q3Y263D00KWC": ("na", "pt_BR", "巴西 BR"),
+    "A1F83G8C2ARO7P": ("eu", "en_GB", "英国 UK"),
+    "A1PA6795UKMFR9": ("eu", "de_DE", "德国 DE"),
+    "A13V1IB3VIYZZH": ("eu", "fr_FR", "法国 FR"),
+    "APJ6JRA9NG5V4": ("eu", "it_IT", "意大利 IT"),
+    "A1RKKUPIHCS9HS": ("eu", "es_ES", "西班牙 ES"),
+    "A2NODRKZP88ZB9": ("eu", "nl_NL", "荷兰 NL"),
+    "A1805IZSGTT6HS": ("eu", "se_SE", "瑞典 SE"),
+    "A1C3SOZRARQ6R3": ("eu", "pl_PL", "波兰 PL"),
+    "A2VIGQ35RCS4UG": ("eu", "en_AE", "阿联酋 AE"),
+    "A17E79C6D8DWNP": ("eu", "ar_SA", "沙特 SA"),
+    "A21TJRUUN4KGV": ("eu", "en_IN", "印度 IN"),
+    "A1VC38T7YXB528": ("fe", "ja_JP", "日本 JP"),
+    "A39IBJ37TRP1C6": ("fe", "en_AU", "澳大利亚 AU"),
+    "A19VAU5U5O7RUS": ("fe", "en_SG", "新加坡 SG"),
+}
+
+_AMZ_LOCK = threading.Lock()
+_AMZ_TASK = {
+    "phase": "idle",   # idle/building/uploading/polling/done/error
+    "message": "", "total": 0, "pids": [],
+    "feed_id": "", "result": None, "started_at": 0,
+}
+_AMZ_TOKEN = {"at": "", "exp": 0.0}
+_AMZ_AUTHZ = {"state": "idle", "message": "", "url": ""}
+_AUTHZ_PORT = 9999
+_AMZ_UPLOADS_PATH = APP_DIR / "amazon_uploads.json"
+
+
+def _amz_cfg() -> dict:
+    return CONFIG.get("amazon") or {}
+
+
+def _amz_spapi_host() -> str:
+    base = str(_amz_cfg().get("spapi_base") or "").strip()
+    if base:
+        return base.rstrip("/")
+    region = str(_amz_cfg().get("region") or "na").lower()
+    mk = str(_amz_cfg().get("marketplace") or "")
+    if mk in _MARKETPLACES:
+        region = _MARKETPLACES[mk][0]
+    return f"https://sellingpartnerapi-{region}.amazon.com"
+
+
+def _amz_lwa_host() -> str:
+    base = str(_amz_cfg().get("lwa_base") or "").strip()
+    return base.rstrip("/") if base else "https://api.amazon.com"
+
+
+def _amz_task_snap() -> dict:
+    with _AMZ_LOCK:
+        return dict(_AMZ_TASK)
+
+
+def amz_token() -> str:
+    """LWA 访问令牌（约 1 小时有效，本地缓存自动续）。"""
+    c = _amz_cfg()
+    if not all(str(c.get(k) or "").strip() for k in (
+        "refresh_token", "client_id", "client_secret",
+    )):
+        raise RuntimeError("亚马逊授权还没配置（点「⚙️ 授权设置」）")
+
+    now = time.time()
+    if _AMZ_TOKEN["at"] and now < _AMZ_TOKEN["exp"] - 120:
+        return _AMZ_TOKEN["at"]
+
+    resp = requests.post(
+        _amz_lwa_host() + "/auth/o2/token",
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": str(c.get("refresh_token")),
+            "client_id": str(c.get("client_id")),
+            "client_secret": str(c.get("client_secret")),
+        },
+        timeout=20,
+    )
+    data = {}
+    try:
+        data = resp.json()
+    except Exception:
+        pass
+    at = str(data.get("access_token") or "")
+    if resp.status_code != 200 or not at:
+        raise RuntimeError(
+            "拿亚马逊令牌失败："
+            + str(data.get("error_description") or data.get("error")
+                  or resp.text)[:300]
+        )
+    _AMZ_TOKEN["at"] = at
+    _AMZ_TOKEN["exp"] = now + float(data.get("expires_in") or 3600)
+    return at
+
+
+def amz_verify() -> dict:
+    """配置自检：令牌能用 + 列出这个店铺参加的站点。"""
+    token = amz_token()
+    resp = requests.get(
+        _amz_spapi_host() + "/sellers/v1/marketplaceParticipations",
+        headers={"x-amz-access-token": token},
+        timeout=25,
+    )
+    if resp.status_code != 200:
+        return {
+            "ok": False,
+            "error": f"亚马逊返回 {resp.status_code}：{resp.text[:300]}",
+        }
+    mks = []
+    for it in resp.json() or []:
+        mk = (it or {}).get("marketplace") or {}
+        if mk.get("id"):
+            mks.append({
+                "id": str(mk.get("id")),
+                "name": str(mk.get("name") or "")[:80],
+            })
+    return {"ok": True, "marketplaces": mks}
+
+
+def _amz_api(method: str, path: str, token: str, payload=None):
+    headers = {
+        "x-amz-access-token": token,
+        "Content-Type": "application/json",
+    }
+    resp = requests.request(
+        method,
+        _amz_spapi_host() + path,
+        headers=headers,
+        data=(
+            json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            if payload is not None else None
+        ),
+        timeout=40,
+    )
+    try:
+        body = resp.json()
+    except Exception:
+        body = {"raw": resp.text[:400]}
+    return resp.status_code, body
+
+
+# ---- 一键授权：本地 9999 端口接亚马逊跳回来的授权码，自动换令牌 ----
+
+def _amz_start_authorize(app_id: str, client_id: str, client_secret: str) -> str:
+    global _AMZ_AUTHZ
+
+    if _AMZ_AUTHZ.get("state") == "running":
+        return _AMZ_AUTHZ.get("url") or ""
+
+    redirect = f"http://localhost:{_AUTHZ_PORT}/callback"
+    url = (
+        "https://sellercentral.amazon.com/apps/authorize/consent"
+        f"?application_id={app_id}&version=beta"
+    )
+    _AMZ_AUTHZ = {
+        "state": "running",
+        "message": "等您在浏览器里完成授权（登录亚马逊并点同意）…",
+        "url": url,
+    }
+
+    class AuthHandler(BaseHTTPRequestHandler):
+        def log_message(self, fmt, *args):
+            pass
+
+        def _page(self, text: str) -> None:
+            body = (
+                "<meta charset='utf-8'><body style='font-family:sans-serif;"
+                "font-size:20px;text-align:center;padding:70px'>"
+                + text + "</body>"
+            ).encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            try:
+                self.wfile.write(body)
+            except Exception:
+                pass
+
+        def do_GET(self) -> None:
+            u = urlparse(self.path)
+            if u.path != "/callback":
+                self._page("不是授权回调地址")
+                return
+
+            q = parse_qs(u.query)
+            code = (q.get("spapi_oauth_code") or q.get("code") or [""])[0]
+            err = (
+                q.get("error_description") or q.get("error") or [""]
+            )[0]
+
+            if err:
+                _AMZ_AUTHZ.update(
+                    state="error", message="授权失败：" + str(err)[:300],
+                )
+            elif code:
+                try:
+                    tok = requests.post(
+                        _amz_lwa_host() + "/auth/o2/token",
+                        data={
+                            "grant_type": "authorization_code",
+                            "code": code,
+                            "client_id": client_id,
+                            "client_secret": client_secret,
+                            "redirect_uri": redirect,
+                        },
+                        timeout=20,
+                    ).json()
+                    rt = str(tok.get("refresh_token") or "")
+                    if not rt:
+                        raise RuntimeError(
+                            str(tok.get("error_description") or tok)[:300]
+                        )
+                    amz = dict(CONFIG.get("amazon") or {})
+                    amz["refresh_token"] = rt
+                    CONFIG["amazon"] = amz
+                    _save_json_file(CONFIG_PATH, CONFIG)
+                    _AMZ_TOKEN.update(at="", exp=0.0)
+                    _AMZ_AUTHZ.update(
+                        state="done", message="✅ 授权成功，已自动保存",
+                    )
+                except Exception as exc:
+                    _AMZ_AUTHZ.update(
+                        state="error",
+                        message="换令牌失败：" + str(exc)[:300],
+                    )
+            else:
+                _AMZ_AUTHZ.update(state="error", message="没拿到授权码")
+
+            self._page(
+                "✅ 授权成功！可以关掉这个网页，回到「我的产品」窗口。"
+                if _AMZ_AUTHZ["state"] == "done"
+                else "❌ 授权没成功，回到「我的产品」窗口重试。"
+            )
+            threading.Timer(0.6, self.server.shutdown).start()
+
+    try:
+        httpd = ThreadingHTTPServer(("127.0.0.1", _AUTHZ_PORT), AuthHandler)
+    except OSError:
+        _AMZ_AUTHZ.update(
+            state="error",
+            message=f"本地 {_AUTHZ_PORT} 端口被占，关掉占它的程序再试",
+        )
+        return url
+
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+
+    def _expire() -> None:
+        if _AMZ_AUTHZ.get("state") == "running":
+            _AMZ_AUTHZ.update(
+                state="error",
+                message="15 分钟没完成授权，重新点「🔓 一键授权」",
+            )
+        try:
+            httpd.shutdown()
+        except Exception:
+            pass
+
+    threading.Timer(900, _expire).start()
+    return url
+
+
+# ---- 刊登数据：产品 → JSON_LISTINGS_FEED 的 messages ----
+
+def _amz_build_messages(
+    products: list, mid: str, lang: str,
+    variant_mode: str, product_type: str,
+) -> tuple[list, list]:
+    """返回 (messages, notes)。内容来源：AI 优化结果优先，没有就
+    原始资料。图片只收 https（亚马逊要公网可下载）。变体：>1 行且
+    行行有颜色 → 父子变体（颜色主题），否则各行独立单品。"""
+
+    def txt(v, cap):
+        return [{
+            "value": str(v or "").strip()[:cap],
+            "language_tag": lang,
+            "marketplace_id": mid,
+        }]
+
+    def img_attrs(imgs):
+        out = {}
+        for i, u in enumerate(imgs[:9]):
+            key = (
+                "main_product_image_locator" if i == 0
+                else f"other_image_locator_{i}"
+            )
+            out[key] = [{"media_location": u}]
+        return out
+
+    def content_of(p, r):
+        opt = p.get("opt") or {}
+        rd = r.get("raw_data") or {}
+        title = str(
+            opt.get("title") or rd.get("标题(必填)") or r.get("title")
+            or p.get("title") or "",
+        ).strip()
+        bullets = [
+            str(b).strip() for b in (opt.get("bullets") or [])
+            if str(b or "").strip()
+        ] or [
+            str(b).strip() for b in (r.get("bullets") or [])
+            if str(b or "").strip()
+        ]
+        desc = str(
+            opt.get("description") or rd.get("简介")
+            or r.get("description") or "",
+        ).strip()
+        return title, bullets[:5], desc
+
+    messages: list = []
+    notes: list = []
+    msg = lambda: len(messages) + 1     # noqa: E731
+
+    for p in products:
+        rows = p.get("raw") or []
+        label = str(p.get("sku") or p.get("pid") or "")
+
+        main = str(p.get("img") or "").strip()
+        imgs = [main] if main.startswith("https://") else []
+        for r in rows:
+            for u in (
+                (r.get("image_urls") or []) + (r.get("detail_image_urls") or [])
+            ):
+                u = str(u or "").strip()
+                if u.startswith("https://") and u not in imgs:
+                    imgs.append(u)
+        if not imgs:
+            notes.append(f"{label}：没有 https 公网图片，跳过（先在图片集补图）")
+            continue
+
+        colors = [
+            str((r.get("raw_data") or {}).get("颜色") or "").strip()
+            for r in rows
+        ]
+        use_variant = len(rows) > 1 and all(colors) and variant_mode != "single"
+        if variant_mode == "variant" and not use_variant:
+            notes.append(
+                f"{label}：不是每行都有颜色，合成不了变体，改为各自独立上传"
+            )
+            use_variant = False
+
+        if use_variant:
+            parent_sku = str(
+                p.get("sku")
+                or (rows[0].get("raw_data") or {}).get("父SKU(必填)")
+                or "",
+            ).strip()
+            parent_title, _, _ = content_of(p, rows[0])
+            messages.append({
+                "messageId": msg(),
+                "sku": parent_sku,
+                "operationType": "UPDATE",
+                "productType": product_type,
+                "requirements": "LISTING",
+                "attributes": {
+                    "condition_type": [{"value": "new_new"}],
+                    "item_name": txt(parent_title or parent_sku, 200),
+                },
+            })
+            for i, (r, color) in enumerate(zip(rows, colors)):
+                sku = str((r.get("raw_data") or {}).get("SKU") or "").strip()
+                if not sku:
+                    notes.append(f"{parent_sku}：第 {i + 1} 行没有 SKU，跳过")
+                    continue
+                title, bullets, desc = content_of(p, r)
+                attrs = {
+                    "condition_type": [{"value": "new_new"}],
+                    "parent_sku": [{"value": parent_sku}],
+                    "color": txt(color, 100),
+                    "item_name": txt(title or sku, 200),
+                }
+                if bullets:
+                    attrs["bullet_point"] = [
+                        txt(b, 500)[0] for b in bullets
+                    ]
+                if desc:
+                    attrs["product_description"] = txt(desc, 2000)
+                attrs.update(img_attrs(imgs))
+                messages.append({
+                    "messageId": msg(),
+                    "sku": sku,
+                    "operationType": "UPDATE",
+                    "productType": product_type,
+                    "requirements": "LISTING",
+                    "attributes": attrs,
+                })
+        else:
+            for i, r in enumerate(rows):
+                rd = r.get("raw_data") or {}
+                sku = str(rd.get("SKU") or "").strip()
+                if not sku:
+                    notes.append(f"{label}：第 {i + 1} 行没有 SKU，跳过")
+                    continue
+                title, bullets, desc = content_of(p, r)
+                attrs = {
+                    "condition_type": [{"value": "new_new"}],
+                    "item_name": txt(title or sku, 200),
+                }
+                if bullets:
+                    attrs["bullet_point"] = [txt(b, 500)[0] for b in bullets]
+                if desc:
+                    attrs["product_description"] = txt(desc, 2000)
+                attrs.update(img_attrs(imgs))
+                messages.append({
+                    "messageId": msg(),
+                    "sku": sku,
+                    "operationType": "UPDATE",
+                    "productType": product_type,
+                    "requirements": "LISTING",
+                    "attributes": attrs,
+                })
+
+    return messages, notes
+
+
+# ---- 上传管道：文档 → feed → 轮询 → 结果 ----
+
+def _amz_submit_feed(payload: dict, mid: str) -> str:
+    token = amz_token()
+    st, doc = _amz_api(
+        "POST", "/feeds/2021-06-30/documents", token,
+        {"contentType": "application/json; charset=UTF-8"},
+    )
+    doc_id = str((doc or {}).get("feedDocumentId") or "")
+    url = str((doc or {}).get("url") or "")
+    if st != 200 or not (doc_id and url):
+        raise RuntimeError(
+            f"创建上传文档失败（{st}）：{str(doc.get('raw') or doc)[:300]}"
+        )
+
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    r = requests.put(
+        url, data=body,
+        headers={"Content-Type": "application/json; charset=UTF-8"},
+        timeout=90,
+    )
+    if r.status_code not in (200, 201):
+        raise RuntimeError(
+            f"传上传内容失败（{r.status_code}）：{r.text[:200]}"
+        )
+
+    st, feed = _amz_api(
+        "POST", "/feeds/2021-06-30/feeds", token,
+        {
+            "feedType": "JSON_LISTINGS_FEED",
+            "marketplaceIds": [mid],
+            "inputFeedDocumentId": doc_id,
+        },
+    )
+    feed_id = str((feed or {}).get("feedId") or "")
+    if st != 200 or not feed_id:
+        raise RuntimeError(
+            f"创建上传任务失败（{st}）：{str(feed.get('raw') or feed)[:300]}"
+        )
+    return feed_id
+
+
+def _amz_wait_feed(feed_id: str) -> dict:
+    token = amz_token()
+    deadline = time.time() + 15 * 60
+
+    while time.time() < deadline:
+        st, feed = _amz_api("GET", f"/feeds/2021-06-30/feeds/{feed_id}", token)
+        status = str((feed or {}).get("processingStatus") or "") if st == 200 else ""
+
+        if status:
+            with _AMZ_LOCK:
+                _AMZ_TASK["message"] = f"亚马逊处理中（{status}）…"
+
+        if status == "DONE":
+            rid = str(feed.get("resultFeedDocumentId") or "")
+            if not rid:
+                return {"header": {}, "messages": [], "issues": []}
+            st, doc = _amz_api(
+                "GET", f"/feeds/2021-06-30/documents/{rid}", token,
+            )
+            url = str((doc or {}).get("url") or "")
+            if not url:
+                raise RuntimeError("拿结果文档失败：" + str(doc)[:200])
+            rr = requests.get(url, timeout=60)
+            try:
+                return rr.json()
+            except Exception:
+                raise RuntimeError("结果解析失败：" + rr.text[:200])
+
+        if status in ("CANCELLED", "FATAL"):
+            raise RuntimeError(
+                f"亚马逊终止了这次上传（{status}），稍后再试一次"
+            )
+
+        time.sleep(6)
+
+    raise RuntimeError("等亚马逊结果超时（15 分钟），稍后重传一次")
+
+
+def _amz_parse_result(result: dict) -> dict:
+    skus = []
+    for m in result.get("messages") or []:
+        skus.append({
+            "sku": str(m.get("sku") or ""),
+            "status": str(m.get("status") or ""),
+            "issues": [
+                {
+                    "code": str(i.get("code") or ""),
+                    "message": str(i.get("message") or "")[:500],
+                }
+                for i in (m.get("issues") or [])
+            ],
+        })
+    n_ok = sum(1 for s in skus if s["status"].lower() == "success")
+    return {
+        "total": len(skus),
+        "success": n_ok,
+        "error": len(skus) - n_ok,
+        "skus": skus,
+        "feed_issues": [
+            {
+                "code": str(i.get("code") or ""),
+                "message": str(i.get("message") or "")[:500],
+            }
+            for i in (result.get("issues") or [])
+        ],
+    }
+
+
+def _amz_log_add(entry: dict) -> None:
+    logs = _load_json_file(_AMZ_UPLOADS_PATH, [])
+    if not isinstance(logs, list):
+        logs = []
+    logs.insert(0, entry)
+    _save_json_file(_AMZ_UPLOADS_PATH, logs[:20])
+
+
+def _amz_start_upload(
+    pids: list, variant_mode: str, product_type: str,
+) -> None:
+    def work():
+        try:
+            with _AMZ_LOCK:
+                _AMZ_TASK.update(
+                    phase="building", message="读取产品资料…",
+                    total=len(pids), pids=list(pids),
+                    feed_id="", result=None,
+                    started_at=int(time.time()),
+                )
+
+            products = []
+            for i, pid in enumerate(pids):
+                try:
+                    data = src_api(
+                        "/prod_list", _prod_auth() | {"pid": pid}, timeout=30,
+                    )
+                except Exception:
+                    continue
+                product = (data.get("product") or {}) if data.get("ok") else {}
+                if product.get("raw"):
+                    products.append(product)
+                with _AMZ_LOCK:
+                    _AMZ_TASK["message"] = (
+                        f"读取产品资料… {i + 1} / {len(pids)}"
+                    )
+
+            if not products:
+                raise RuntimeError(
+                    "选中的产品都没有完整资料（原始行），先重新导入补全"
+                )
+
+            c = _amz_cfg()
+            mid = str(c.get("marketplace") or "ATVPDKIKX0DER")
+            info = _MARKETPLACES.get(mid, ("na", "en_US", ""))
+
+            messages, notes = _amz_build_messages(
+                products, mid, info[1], variant_mode, product_type,
+            )
+            if not messages:
+                raise RuntimeError(
+                    "没有可上传的内容：" + "；".join(notes)[:300]
+                )
+
+            payload = {
+                "header": {
+                    "sellerId": str(c.get("seller_id") or ""),
+                    "version": "2.0",
+                    "issueLocale": "en_US",
+                },
+                "messages": messages,
+            }
+
+            with _AMZ_LOCK:
+                _AMZ_TASK.update(
+                    phase="uploading",
+                    message=f"提交 {len(messages)} 条到亚马逊…",
+                )
+
+            feed_id = _amz_submit_feed(payload, mid)
+
+            with _AMZ_LOCK:
+                _AMZ_TASK.update(
+                    phase="polling", feed_id=feed_id,
+                    message="亚马逊处理中…",
+                )
+
+            result = _amz_wait_feed(feed_id)
+            summary = _amz_parse_result(result)
+            summary["notes"] = notes
+            summary["feed_id"] = feed_id
+
+            msg = (
+                f"上传完成：成功 {summary['success']} / "
+                f"失败 {summary['error']}"
+                + ("（失败原因见下表）" if summary["error"] else "")
+            )
+            with _AMZ_LOCK:
+                _AMZ_TASK.update(phase="done", message=msg, result=summary)
+            _amz_log_add({
+                "at": int(time.time() * 1000),
+                "message": msg,
+                "success": summary["success"],
+                "error": summary["error"],
+                "feed_id": feed_id,
+            })
+
+        except Exception as exc:
+            with _AMZ_LOCK:
+                _AMZ_TASK.update(
+                    phase="error", message=f"上传失败：{exc}",
+                )
+            _amz_log_add({
+                "at": int(time.time() * 1000),
+                "message": f"上传失败：{exc}",
+                "success": 0, "error": 0, "feed_id": "",
+            })
+
+    threading.Thread(target=work, daemon=True).start()
+
+
+# =====================================================
 # HTTP 服务
 # =====================================================
 
@@ -1376,6 +2028,40 @@ class Handler(BaseHTTPRequestHandler):
                     self._json(
                         {"ok": False, "error": f"取图失败：{exc}"}, 502
                     )
+                return
+
+            # ---- 亚马逊上传（D1.4.0）：状态 / 任务进度（不回显密钥） ----
+            if url.path == "/api/amazon/status":
+                c = _amz_cfg()
+                configured = all(
+                    str(c.get(k) or "").strip()
+                    for k in ("client_id", "client_secret",
+                              "refresh_token", "seller_id")
+                )
+                mk = str(c.get("marketplace") or "ATVPDKIKX0DER")
+                info = _MARKETPLACES.get(mk)
+                self._json({
+                    "ok": True,
+                    "configured": configured,
+                    "marketplace": mk,
+                    "marketplace_name": info[2] if info else mk,
+                    "language_tag": info[1] if info else "en_US",
+                    "product_type": str(c.get("product_type") or "PRODUCT"),
+                    "seller_id": str(c.get("seller_id") or ""),
+                    "markets": [
+                        [i, f"{v[2]}（{v[0].upper()}）"]
+                        for i, v in _MARKETPLACES.items()
+                    ],
+                    "task": _amz_task_snap(),
+                    "history": _load_json_file(_AMZ_UPLOADS_PATH, [])[:6]
+                    if isinstance(
+                        _load_json_file(_AMZ_UPLOADS_PATH, []), list
+                    ) else [],
+                })
+                return
+
+            if url.path == "/api/amazon/upload/status":
+                self._json({"ok": True, "task": _amz_task_snap()})
                 return
 
             self._json({"ok": False, "error": "not found"}, 404)
@@ -2188,6 +2874,119 @@ class Handler(BaseHTTPRequestHandler):
                 threading.Thread(
                     target=self.server.shutdown, daemon=True
                 ).start()
+                return
+
+            # ---- 亚马逊上传（D1.4.0） ----
+            if url.path == "/api/amazon/config":
+                # 保存授权配置（空值不覆盖，防止误清）；test=1 顺手自检
+                amz = dict(CONFIG.get("amazon") or {})
+                for k in ("client_id", "client_secret", "refresh_token",
+                          "seller_id", "app_id"):
+                    v = str(body.get(k) or "").strip()
+                    if v:
+                        amz[k] = v
+                mk = str(body.get("marketplace") or "").strip()
+                if mk in _MARKETPLACES:
+                    amz["marketplace"] = mk
+                amz["product_type"] = (
+                    str(body.get("product_type") or "").strip()[:60]
+                    or "PRODUCT"
+                )
+                CONFIG["amazon"] = amz
+                _save_json_file(CONFIG_PATH, CONFIG)
+                _AMZ_TOKEN.update(at="", exp=0.0)
+
+                resp = {"ok": True}
+                if body.get("test"):
+                    try:
+                        resp["verify"] = amz_verify()
+                    except Exception as exc:
+                        resp["verify"] = {"ok": False, "error": str(exc)[:400]}
+                self._json(resp)
+                return
+
+            if url.path == "/api/amazon/authorize/start":
+                c = _amz_cfg()
+                app_id = str(body.get("app_id") or c.get("app_id") or "").strip()
+                client_id = str(
+                    body.get("client_id") or c.get("client_id") or ""
+                ).strip()
+                client_secret = str(
+                    body.get("client_secret") or c.get("client_secret") or ""
+                ).strip()
+                if not (app_id and client_id and client_secret):
+                    self._json({
+                        "ok": False,
+                        "error": (
+                            "先把 App ID / Client ID / Client Secret "
+                            "填好并保存，再点一键授权"
+                        ),
+                    }, 400)
+                    return
+                url_out = _amz_start_authorize(
+                    app_id, client_id, client_secret
+                )
+                self._json({"ok": True, "url": url_out})
+                return
+
+            if url.path == "/api/amazon/authorize/poll":
+                self._json({"ok": True, **_AMZ_AUTHZ})
+                return
+
+            if url.path == "/api/amazon/upload":
+                pids = [
+                    str(p) for p in body.get("pids") or [] if str(p).strip()
+                ]
+                if not pids:
+                    self._json(
+                        {"ok": False, "error": "请先勾选产品"}, 400
+                    )
+                    return
+
+                c = _amz_cfg()
+                with _AMZ_LOCK:
+                    if _AMZ_TASK.get("phase") in (
+                        "building", "uploading", "polling",
+                    ):
+                        self._json({
+                            "ok": False,
+                            "error": "已有一次上传在进行，等它完成",
+                        }, 409)
+                        return
+
+                    if not all(
+                        str(c.get(k) or "").strip()
+                        for k in ("client_id", "client_secret",
+                                  "refresh_token", "seller_id")
+                    ):
+                        self._json({
+                            "ok": False,
+                            "error": "亚马逊授权还没配置好（点「⚙️ 授权设置」）",
+                        }, 400)
+                        return
+
+                    variant_mode = (
+                        body.get("variant_mode")
+                        if body.get("variant_mode") in (
+                            "auto", "single", "variant"
+                        ) else "auto"
+                    )
+                    product_type = (
+                        str(
+                            body.get("product_type")
+                            or c.get("product_type") or "PRODUCT"
+                        ).strip()[:60]
+                        or "PRODUCT"
+                    )
+                    _AMZ_TASK.update(
+                        phase="building", message="准备中…",
+                        total=len(pids), pids=pids,
+                        feed_id="", result=None,
+                        started_at=int(time.time()),
+                    )
+
+                _amz_start_upload(pids, variant_mode, product_type)
+                self._json({"ok": True, "count": len(pids)})
                 return
 
             self._json({"ok": False, "error": "not found"}, 404)

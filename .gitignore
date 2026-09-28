@@ -3,6 +3,7 @@ desktop/config.json
 desktop/session.json
 desktop/index_cache.json
 desktop/index_cache.all.json
+desktop/amazon_uploads.json
 tasks/
 
 # Python 缓存

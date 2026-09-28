@@ -440,3 +440,11 @@ body {
 /* 详情弹窗：分类改为 📂 树选择 */
 .d-cat-pick { display: flex; gap: 6px; align-items: center; }
 .d-cat-pick .inp { flex: 1; min-width: 0; background: #fafbfc; }
+
+/* ---------- V5（D1.4.0）：上传亚马逊 ---------- */
+#amzResult table { border-collapse: collapse; width: 100%; font-size: 12px; }
+#amzResult th, #amzResult td {
+  border: 1px solid #eef0f3; padding: 5px 8px;
+  text-align: left; vertical-align: top; word-break: break-word;
+}
+#amzResult th { background: #fafbfc; color: #555; }

@@ -21,9 +21,10 @@ const S = {
   catDelCtx: null,         // 删除/彻底删除上下文
 };
 
-/* D = 当前详情弹窗的图片编辑状态；IE = 图片编辑器状态 */
+/* D = 当前详情弹窗的图片编辑状态；IE = 图片编辑器状态；AZ = 亚马逊上传 */
 const D = { pid: "", imgs: [], dirty: false, thin: false };
 const IE = { work: null, init: null, idx: -1, isNew: false, zoom: 1, mode: "view" };
+const AZ = { poll: null, authPoll: null, status: null };
 
 const $ = (id) => document.getElementById(id);
 
@@ -344,7 +345,7 @@ function renderPager() {
 function renderSelBar() {
   const ro = readOnly();
   ["btnSelAll", "btnSelNone", "btnOpt", "btnCat", "btnDel",
-   "btnExport", "btnImportToggle"].forEach((id) =>
+   "btnExport", "btnAmz", "btnImportToggle"].forEach((id) =>
     $(id).classList.toggle("hidden", ro));
 
   if (ro) {
@@ -356,6 +357,7 @@ function renderSelBar() {
   $("btnCat").disabled = S.sel.size === 0;
   $("btnDel").disabled = S.sel.size === 0;
   $("btnExport").disabled = S.sel.size === 0;
+  $("btnAmz").disabled = S.sel.size === 0;
 }
 
 /* ---------- 详情：点卡片立刻秒开（列表缓存先画壳，资料到了再填） ---------- */
@@ -1702,9 +1704,167 @@ async function saveAi() {
   }
 }
 
+/* ---------- V5（D1.4.0）：上传亚马逊（SP-API 自动刊登） ---------- */
+
+async function openAmz() {
+  $("dlgAmz").classList.remove("hidden");
+  $("amzProg").classList.add("hidden");
+  $("amzResult").innerHTML = "";
+  $("amzCfgBox").classList.add("hidden");
+  await refreshAmz();
+}
+
+async function refreshAmz() {
+  try {
+    const s = await api("/api/amazon/status");
+    AZ.status = s;
+
+    $("amzStatus").innerHTML = s.configured
+      ? `✅ 已授权 · 站点 <b>${esc(s.marketplace_name)}</b> · 卖家 <b>${esc(s.seller_id)}</b>`
+      : `⚠️ 还没完成亚马逊授权（只需做一次）——点右边「⚙️ 授权设置」`;
+
+    $("azMarket").innerHTML = (s.markets || []).map(([id, label]) =>
+      `<option value="${esc(id)}" ${id === s.marketplace ? "selected" : ""}>${esc(label)}</option>`).join("");
+    $("azSeller").value = s.seller_id || "";
+    $("azType").value = s.product_type === "PRODUCT" ? "" : s.product_type;
+
+    $("azStart").textContent = `📤 开始上传（${S.sel.size} 个产品）`;
+    $("azStart").disabled = !s.configured || S.sel.size === 0;
+
+    const h = s.history || [];
+    $("amzHistory").classList.toggle("hidden", !h.length);
+    $("amzHistory").innerHTML = `<div class="d-sub">最近上传</div>`
+      + h.map((e) => `<div class="d-imghint">${fmtMs(Number(e.at) || 0)} · ${esc(e.message || "")}</div>`).join("");
+
+    const t = s.task;
+    if (t && ["building", "uploading", "polling"].includes(t.phase)) {
+      $("amzProg").classList.remove("hidden");
+      azRenderTask(t);
+      azPollStart();
+    } else if (t && t.phase !== "idle" && t.result) {
+      $("amzProg").classList.remove("hidden");
+      azRenderTask(t);
+    }
+  } catch (e) {
+    $("amzStatus").textContent = "读取授权状态失败：" + e.message;
+  }
+}
+
+async function azSaveCfg(test = true) {
+  try {
+    busy(true, test ? "保存并测试…" : "保存…");
+    const r = await api("/api/amazon/config", {
+      seller_id: $("azSeller").value.trim(),
+      marketplace: $("azMarket").value,
+      client_id: $("azClientId").value.trim(),
+      client_secret: $("azClientSecret").value.trim(),
+      app_id: $("azAppId").value.trim(),
+      test,
+    });
+    const v = r.verify;
+    if (test) {
+      if (v && v.ok) {
+        toast(`✅ 配置有效，已连上亚马逊（店铺参加 ${(v.marketplaces || []).length} 个站点）`, "ok");
+      } else {
+        toast("⚠️ 已保存，但测试没通过：" + ((v && v.error) || "未知错误"), "err", 9000);
+      }
+      await refreshAmz();
+    }
+  } catch (e) {
+    toast(e.message, "err", 7000);
+  } finally {
+    busy(false);
+  }
+}
+
+async function azAuthorize() {
+  try {
+    await azSaveCfg(false);           // 先把表单里的凭证存下来
+    const r = await api("/api/amazon/authorize/start", {});
+    if (r.url) window.open(r.url, "_blank");
+    toast("浏览器里完成授权后会自动回来（登录亚马逊 → 点同意）", "", 8000);
+    clearInterval(AZ.authPoll);
+    AZ.authPoll = setInterval(async () => {
+      try {
+        const p = await api("/api/amazon/authorize/poll");
+        $("amzProg").classList.remove("hidden");
+        $("amzMsg").textContent = p.message || "";
+        if (p.state === "done") {
+          clearInterval(AZ.authPoll);
+          toast("✅ 亚马逊授权成功，可以上传了", "ok");
+          await refreshAmz();
+        } else if (p.state === "error") {
+          clearInterval(AZ.authPoll);
+          toast(p.message, "err", 9000);
+        }
+      } catch (e) { /* 下轮再看 */ }
+    }, 2500);
+  } catch (e) {
+    toast(e.message, "err", 7000);
+  }
+}
+
+async function azStart() {
+  try {
+    busy(true, "提交上传…");
+    await api("/api/amazon/upload", {
+      pids: [...S.sel],
+      variant_mode: $("azVariant").value,
+      product_type: $("azType").value.trim() || "PRODUCT",
+    });
+    $("amzProg").classList.remove("hidden");
+    $("amzResult").innerHTML = "";
+    azPollStart();
+  } catch (e) {
+    toast(e.message, "err", 7000);
+  } finally {
+    busy(false);
+  }
+}
+
+function azPollStart() {
+  clearInterval(AZ.poll);
+  AZ.poll = setInterval(async () => {
+    try {
+      const r = await api("/api/amazon/upload/status");
+      azRenderTask(r.task);
+      if (!["building", "uploading", "polling"].includes(r.task.phase)) {
+        clearInterval(AZ.poll);
+        loadProductsTwice();
+      }
+    } catch (e) { /* 下轮再看 */ }
+  }, 3000);
+}
+
+function azRenderTask(t) {
+  if (!t || t.phase === "idle") return;
+  $("amzProg").classList.remove("hidden");
+  $("amzMsg").textContent = t.message || "";
+  const res = t.result;
+  if (!res) return;
+  const rows = (res.skus || []).map((s) => `<tr>
+      <td>${esc(s.sku)}</td>
+      <td>${String(s.status).toLowerCase() === "success" ? "✅ 成功" : "❌ " + esc(s.status)}</td>
+      <td>${esc((s.issues || []).map((i) => (i.code ? i.code + "：" : "") + i.message).join("；").slice(0, 400))}</td>
+    </tr>`).join("");
+  $("amzResult").innerHTML =
+    `<div class="d-sub">结果：成功 ${res.success} · 失败 ${res.error}</div>`
+    + ((res.feed_issues || []).length
+      ? `<div class="warn">⚠️ ${esc(res.feed_issues.map((i) => i.message).join("；").slice(0, 400))}</div>` : "")
+    + (rows ? `<table><tr><th style="width:150px">SKU</th><th style="width:110px">结果</th><th>原因</th></tr>${rows}</table>` : "")
+    + ((res.notes || []).length
+      ? `<div class="d-imghint">${res.notes.map(esc).join("<br>")}</div>` : "");
+}
+
 /* ---------- 弹窗 ---------- */
 
-function closeModal(id) { $(id).classList.add("hidden"); }
+function closeModal(id) {
+  $(id).classList.add("hidden");
+  if (id === "dlgAmz") {
+    clearInterval(AZ.poll);
+    clearInterval(AZ.authPoll);
+  }
+}
 
 // 详情弹窗防手滑：图片改了没保存就点关闭 → 先问一句。
 // 必须注册在下面通用关闭逻辑之前（同一元素上先注册先执行），
@@ -1844,6 +2004,11 @@ function bindEvents() {
   $("btnDel").onclick = () => { $("delCount").textContent = S.sel.size; $("dlgDel").classList.remove("hidden"); };
   $("btnDelApply").onclick = applyDelete;
   $("btnExport").onclick = doExport;
+  $("btnAmz").onclick = openAmz;
+  $("azCfgToggle").onclick = () => $("amzCfgBox").classList.toggle("hidden");
+  $("azSave").onclick = () => azSaveCfg(true);
+  $("azAuth").onclick = azAuthorize;
+  $("azStart").onclick = azStart;
 
   $("btnImportToggle").onclick = () => $("importPanel").classList.toggle("hidden");
   $("btnImportXlsx").onclick = importXlsx;
