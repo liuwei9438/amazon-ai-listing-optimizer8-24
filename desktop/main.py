@@ -40,7 +40,7 @@ ROOT = APP_DIR.parent                          # 仓库根
 os.chdir(ROOT)                                 # 引擎的 tasks/ 落在根目录
 sys.path.insert(0, str(ROOT))
 
-VERSION = "D1.2.0"
+VERSION = "D1.2.1"
 APP_DIR_NAME = "app"
 
 DEFAULT_CONFIG = {
@@ -417,6 +417,9 @@ def _index_apply_updates(updates: list) -> None:
 
             if "cat" in u:
                 it["cat"] = str(u.get("cat") or "")[:40]
+
+            if "title" in u:
+                it["title"] = str(u.get("title") or "")[:200]
 
             if "img" in u:
                 it["img"] = str(u.get("img") or "")[:400]
@@ -1885,6 +1888,213 @@ class Handler(BaseHTTPRequestHandler):
                 _index_apply_updates([{"pid": pid, "img": main}])
                 _index_heal()
                 self._json({"ok": True, "n": len(final)})
+                return
+
+            if url.path == "/api/product/opt":
+                # 手改 AI 优化结果（标题/短标题/五点/简介）→ /prod_opt_set。
+                # 亮点/SEO/首图/任务号不在编辑范围：从旧记录原样透传，
+                # 别让整体替换把它们清掉。
+                pid = str(body.get("pid") or "").strip()
+                o = body.get("opt")
+
+                if not pid or not isinstance(o, dict):
+                    self._json({"ok": False, "error": "参数不对"}, 400)
+                    return
+
+                title = str(o.get("title") or "").strip()[:600]
+                short = str(o.get("short_title") or "").strip()[:300]
+                desc = str(o.get("description") or "").strip()[:8000]
+                bullets = [
+                    str(b).strip()[:600]
+                    for b in (o.get("bullets") or [])
+                    if str(b or "").strip()
+                ][:8]
+
+                if not (title or bullets or desc):
+                    self._json(
+                        {"ok": False, "error": "标题、五点、简介都空了，至少留一条内容"},
+                        400,
+                    )
+                    return
+
+                try:
+                    data = src_api(
+                        "/prod_list", _prod_auth() | {"pid": pid}, timeout=30,
+                    )
+                except Exception as exc:
+                    self._json({"ok": False, "error": str(exc)}, 502)
+                    return
+
+                rec = (data.get("product") or {}) if data.get("ok") else {}
+
+                if not rec:
+                    self._json({"ok": False, "error": "产品不存在"}, 404)
+                    return
+
+                old = rec.get("opt") or {}
+                opt = {
+                    "title": title,
+                    "short_title": short,
+                    "bullets": bullets,
+                    "description": desc,
+                    "highlight": [
+                        str(h)[:300]
+                        for h in (old.get("highlight") or [])[:12]
+                    ],
+                    "seo": [
+                        str(s)[:200]
+                        for s in (old.get("seo") or [])[:20]
+                    ],
+                    "image": str(old.get("image") or "")[:400],
+                    "task_id": str(old.get("task_id") or "")[:40],
+                }
+
+                try:
+                    resp = src_api(
+                        "/prod_opt_set",
+                        _prod_auth() | {"updates": [{"pid": pid, "opt": opt}]},
+                        timeout=40,
+                    )
+
+                    if not resp.get("ok"):
+                        raise RuntimeError(
+                            str(resp.get("error") or "保存失败")
+                        )
+                except Exception as exc:
+                    self._json({"ok": False, "error": str(exc)}, 502)
+                    return
+
+                _index_heal()
+                self._json({"ok": True})
+                return
+
+            if url.path == "/api/product/text":
+                # 手改原始资料文字（标题/要点1-5/简介）→ 单次原子
+                # /prod_upsert 回写整份 raw。图片字段一行不动地带过、
+                # 不传 img → 主图保持不变（和图片编辑共用同一套原子写法）。
+                pid = str(body.get("pid") or "").strip()
+                rows_in = body.get("rows")
+
+                if not pid or not isinstance(rows_in, list):
+                    self._json({"ok": False, "error": "参数不对"}, 400)
+                    return
+
+                edits: dict[int, tuple] = {}
+
+                for r in rows_in[:60]:
+                    if not isinstance(r, dict):
+                        continue
+
+                    try:
+                        i = int(r.get("i"))
+                    except (TypeError, ValueError):
+                        continue
+
+                    if i < 0:
+                        continue
+
+                    # 要点按 5 个位置保留（第 2 条空着就空着，别往前挪
+                    # ——挪了会和 Excel 的 要点2/要点3 列错位）
+                    bullets = [
+                        str(b).strip()[:600]
+                        for b in (r.get("bullets") or [])[:5]
+                    ]
+
+                    while len(bullets) < 5:
+                        bullets.append("")
+
+                    edits[i] = (
+                        str(r.get("title") or "").strip()[:600],
+                        bullets,
+                        str(r.get("description") or "").strip()[:8000],
+                    )
+
+                if not edits:
+                    self._json({"ok": False, "error": "没有要改的内容"}, 400)
+                    return
+
+                try:
+                    data = src_api(
+                        "/prod_list", _prod_auth() | {"pid": pid}, timeout=30,
+                    )
+                except Exception as exc:
+                    self._json({"ok": False, "error": str(exc)}, 502)
+                    return
+
+                rec = (data.get("product") or {}) if data.get("ok") else {}
+
+                if not rec:
+                    self._json({"ok": False, "error": "产品不存在"}, 404)
+                    return
+
+                raw_rows = rec.get("raw") or []
+
+                if not raw_rows:
+                    self._json({
+                        "ok": False,
+                        "error": (
+                            "这条产品资料不全（没有原始行），改不了文字。"
+                            "重新导入同一份 Excel 补全后即可编辑。"
+                        ),
+                    }, 400)
+                    return
+
+                for i, (t, b, d) in edits.items():
+                    if i >= len(raw_rows):
+                        continue
+
+                    row = raw_rows[i]
+                    rd = dict(row.get("raw_data") or {})
+                    rd["标题(必填)"] = t
+
+                    for k in range(5):
+                        rd[f"要点{k + 1}"] = b[k] if k < len(b) else ""
+
+                    rd["简介"] = d
+                    row["raw_data"] = rd
+                    row["title"] = t
+                    # 派生字段只留非空要点（引擎的 bullets 元组不要空串）
+                    row["bullets"] = [x for x in b if x]
+                    row["description"] = d
+
+                # 产品标题跟着第一行非空标题走（导入归组就是这个规则）
+                new_title = next(
+                    (
+                        str(r.get("title") or "").strip()
+                        for r in raw_rows
+                        if str(r.get("title") or "").strip()
+                    ),
+                    "",
+                )
+                product = {
+                    "pid": pid,
+                    "sku": str(rec.get("sku") or ""),
+                    "title": new_title or str(rec.get("title") or ""),
+                    "model": str(rec.get("model") or ""),
+                    "cat": str(rec.get("cat") or ""),
+                    "kw": str(rec.get("kw") or ""),
+                    "raw": raw_rows,
+                }
+
+                try:
+                    resp = src_api(
+                        "/prod_upsert",
+                        _prod_auth()
+                        | {"by": _logged_user()[:32], "products": [product]},
+                        timeout=90,
+                    )
+
+                    if not resp.get("ok"):
+                        raise RuntimeError(
+                            str(resp.get("error") or "保存失败")
+                        )
+                except Exception as exc:
+                    self._json({"ok": False, "error": str(exc)}, 502)
+                    return
+
+                _index_apply_updates([{"pid": pid, "title": product["title"]}])
+                _index_heal()
+                self._json({"ok": True, "n": len(raw_rows)})
                 return
 
             if url.path == "/api/export":

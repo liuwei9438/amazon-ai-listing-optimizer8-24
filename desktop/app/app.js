@@ -429,6 +429,8 @@ function fillDetail(rec, it) {
   D.imgs = imgs.slice(0, 60);
   D.dirty = false;
   D.thin = !raw.length;
+  D.rec = rec;
+  D.it = it;
 
   const extra =
     `<div class="line">分类：<b>${esc(rec.cat || "未分类")}</b>　资料：<b>${raw.length} 行</b>　状态：<b>${BADGE[st][0]}</b></div>`
@@ -474,14 +476,14 @@ function fillDetail(rec, it) {
     if (opt.description) sec.push(`<div class="txt"><b>简介：</b>\n${esc(opt.description)}</div>`);
     if ((opt.seo || []).length)
       sec.push(`<div class="txt"><b>SEO 关键词：</b>${esc((opt.seo || []).slice(0, 10).join("、"))}</div>`);
-    parts.push(`<div class="d-sec"><h4>🤖 AI 优化结果</h4>${sec.join("")}</div>`);
+    parts.push(`<div class="d-sec" id="dSecOpt"><h4>🤖 AI 优化结果${ro ? "" : ' <button id="dOptEdit" class="btn small">✏️ 编辑</button>'}</h4>${sec.join("")}</div>`);
   } else {
-    parts.push(`<div class="d-sec"><h4>🤖 AI 优化结果</h4><div class="txt" style="color:#999">还没优化过。点上面「🚀 优化这个产品」，跑完结果自动挂上来。</div></div>`);
+    parts.push(`<div class="d-sec" id="dSecOpt"><h4>🤖 AI 优化结果</h4><div class="txt" style="color:#999">还没优化过。点上面「🚀 优化这个产品」，跑完结果自动挂上来。</div></div>`);
   }
 
   // 资料明细：采集/导入的 20 列原始资料全部展示
   if (raw.length) {
-    parts.push(`<div class="d-sec"><h4>📋 资料明细（原始资料 ${raw.length} 行，点行标题展开/收起）</h4>`
+    parts.push(`<div class="d-sec" id="dSecRaw"><h4>📋 资料明细（原始资料 ${raw.length} 行，点行标题展开/收起）${ro ? "" : ' <button id="dRawEdit" class="btn small">✏️ 编辑文字</button>'}</h4>`
       + raw.map((r, idx) => {
           const rd = r.raw_data || {};
           const label = `第 ${idx + 1} 行 · ${String(rd["SKU"] || rd["父SKU(必填)"] || "—").slice(0, 24)} · ${String(rd["标题(必填)"] || "").slice(0, 34)}`;
@@ -666,6 +668,134 @@ function openLightbox(u) {
   };
   im.src = u;
   $("dlgLightbox").classList.remove("hidden");
+}
+
+/* ---------- V3.1（D1.2.1）：AI 结果 / 原始资料 文字手改 ---------- */
+
+async function refillDetail() {
+  /* 保存/取消后重拉资料刷新整个详情（不闪壳） */
+  const pid = D.pid;
+  const it = D.it || S.items.find((x) => String(x.pid) === pid) || { pid };
+  const owner = readOnly() ? String(it.owner || "") : "";
+  const r = await api(`/api/product?pid=${encodeURIComponent(pid)}${owner ? `&owner=${encodeURIComponent(owner)}` : ""}`);
+  fillDetail(r.product || {}, it);
+}
+
+let OE_B = [];   // 编辑中的五点列表（AI 结果）
+
+function collectOE() {
+  OE_B = [...document.querySelectorAll("#oeBullets [data-oe]")].map((el) => el.value);
+}
+
+function renderOeBullets() {
+  const box = $("oeBullets");
+  if (!box) return;
+  box.innerHTML = OE_B.map((b, i) => `<div class="oe-b">
+      <textarea class="inp" rows="2" maxlength="600" data-oe="${i}">${esc(b)}</textarea>
+      <button class="btn small danger" data-oedel="${i}" title="删掉这一条">✕</button>
+    </div>`).join("");
+}
+
+function renderOptEdit() {
+  const sec = $("dSecOpt");
+  if (!sec || !D.rec) return;
+  const opt = D.rec.opt || {};
+  OE_B = (opt.bullets || []).map(String);
+  sec.innerHTML = `<h4>🤖 AI 优化结果（编辑中）</h4>
+    <div class="d-editform">
+      <label>标题</label>
+      <textarea id="oeTitle" class="inp" rows="2" maxlength="600">${esc(opt.title || "")}</textarea>
+      <label>短标题</label>
+      <input id="oeShort" class="inp" maxlength="300" value="${esc(opt.short_title || "")}">
+      <label>五点描述（每条一行，✕ 删掉）</label>
+      <div id="oeBullets"></div>
+      <button id="oeBAdd" class="btn small">➕ 加一条五点</button>
+      <label>简介</label>
+      <textarea id="oeDesc" class="inp" rows="6" maxlength="8000">${esc(opt.description || "")}</textarea>
+      <div class="d-imgbar">
+        <button id="oeSave" class="btn small primary">💾 保存修改</button>
+        <button id="oeCancel" class="btn small">取消</button>
+      </div>
+      <div class="d-imghint">保存立即生效。注意：之后再点「🚀 优化这个产品」重新跑 AI，会把这些手改内容覆盖掉</div>
+    </div>`;
+  renderOeBullets();
+}
+
+async function saveOptEdit() {
+  collectOE();
+  const opt = {
+    title: $("oeTitle").value.trim(),
+    short_title: $("oeShort").value.trim(),
+    bullets: OE_B.map((b) => b.trim()).filter(Boolean).slice(0, 8),
+    description: $("oeDesc").value.trim(),
+  };
+
+  if (!opt.title && !opt.bullets.length && !opt.description) {
+    toast("标题、五点、简介都空了，至少留一条内容", "err");
+    return;
+  }
+
+  try {
+    busy(true, "保存修改…");
+    await api("/api/product/opt", { pid: D.pid, opt });
+    toast("✅ 修改已保存", "ok");
+    await refillDetail();
+    loadProductsTwice();
+  } catch (e) {
+    toast(e.message, "err", 7000);
+  } finally {
+    busy(false);
+  }
+}
+
+function renderRawEdit() {
+  const sec = $("dSecRaw");
+  if (!sec || !D.rec) return;
+  const raw = D.rec.raw || [];
+  sec.innerHTML = `<h4>📋 资料明细（编辑中，${raw.length} 行）</h4>
+    <div class="d-editform">
+    ${raw.map((r, i) => {
+      const rd = r.raw_data || {};
+      const bl = Array.isArray(r.bullets) && r.bullets.length ? r.bullets : ["", "", "", "", ""];
+      const five = [0, 1, 2, 3, 4].map((k) => bl[k] || "");
+      return `<div class="re-row">
+        <b>第 ${i + 1} 行 · ${esc(String(rd["SKU"] || rd["父SKU(必填)"] || "—").slice(0, 30))}</b>
+        <label>标题</label>
+        <textarea id="reT${i}" class="inp" rows="2" maxlength="600">${esc(String(rd["标题(必填)"] || r.title || ""))}</textarea>
+        <label>五点描述（要点 1-5）</label>
+        ${five.map((b, k) => `<textarea id="reB${i}_${k}" class="inp" rows="2" maxlength="600" placeholder="要点${k + 1}">${esc(b)}</textarea>`).join("")}
+        <label>简介</label>
+        <textarea id="reD${i}" class="inp" rows="5" maxlength="8000">${esc(String(rd["简介"] || r.description || ""))}</textarea>
+      </div>`;
+    }).join("")}
+      <div class="d-imgbar">
+        <button id="reSave" class="btn small primary">💾 保存资料</button>
+        <button id="reCancel" class="btn small">取消</button>
+      </div>
+      <div class="d-imghint">这里改的是导入的原始资料（AI 优化的底稿）。已优化过的产品，导出时用的是「AI 优化结果」里的内容</div>
+    </div>`;
+}
+
+async function saveRawEdit() {
+  const raw = (D.rec && D.rec.raw) || [];
+  const rows = raw.map((r, i) => ({
+    i,
+    title: (($("reT" + i) || {}).value || "").trim(),
+    bullets: [0, 1, 2, 3, 4].map((k) => ((($("reB" + i + "_" + k) || {}).value) || "").trim()),
+    description: (($("reD" + i) || {}).value || "").trim(),
+  }));
+
+  try {
+    busy(true, "保存资料…");
+    await api("/api/product/text", { pid: D.pid, rows });
+    toast("✅ 资料已保存", "ok");
+    await refillDetail();
+    loadProductsTwice();
+  } catch (e) {
+    toast(e.message, "err", 7000);
+  } finally {
+    busy(false);
+  }
 }
 
 /* ---------- 图片编辑器（裁剪 / 旋转 / 白底 / 上传） ---------- */
@@ -866,6 +996,16 @@ function bindDetailActs() {
     if (e.target.closest("#dImgDedup")) { dedupImgs(); return; }
     if (e.target.closest("#dImgCopy")) { copyImgLink(); return; }
     if (e.target.closest("#dImgClear")) { clearImgs(); return; }
+
+    if (e.target.closest("#dOptEdit")) { renderOptEdit(); return; }
+    if (e.target.closest("#dRawEdit")) { renderRawEdit(); return; }
+    if (e.target.closest("#oeBAdd")) { collectOE(); OE_B.push(""); renderOeBullets(); return; }
+    const odel = e.target.closest("[data-oedel]");
+    if (odel) { collectOE(); OE_B.splice(+odel.dataset.oedel, 1); renderOeBullets(); return; }
+    if (e.target.closest("#oeSave")) { saveOptEdit(); return; }
+    if (e.target.closest("#oeCancel")) { refillDetail().catch(() => {}); return; }
+    if (e.target.closest("#reSave")) { saveRawEdit(); return; }
+    if (e.target.closest("#reCancel")) { refillDetail().catch(() => {}); return; }
 
     if (e.target.id === "dMainImg") { openLightbox(D.imgs[0] || e.target.dataset.u || ""); return; }
 
