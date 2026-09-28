@@ -294,31 +294,34 @@
   <img id="lbImg" referrerpolicy="no-referrer" alt="">
 </div>
 
-<!-- ============ 上传亚马逊（D1.4.0：SP-API 自动刊登） ============ -->
+<!-- ============ 上传亚马逊（D1.4.1：SP-API 自动刊登 · 多店铺） ============ -->
 <div id="dlgAmz" class="modal hidden">
   <div class="modal-box wide">
     <div class="modal-head"><b>📤 上传产品到亚马逊</b><button class="btn ghost" data-close>✖</button></div>
     <div class="modal-body">
-      <div class="d-imgbar" style="margin:0">
-        <div id="amzStatus" class="ai-status" style="flex:1"></div>
-        <button id="azCfgToggle" class="btn small">⚙️ 授权设置</button>
+      <div id="amzStatus" class="ai-status"></div>
+
+      <div class="form-row"><label>上传店铺</label>
+        <select id="azStore" class="inp" style="flex:1"></select>
+        <button id="azBind" class="btn small" title="绑定一家新店铺（只需做一次）">➕ 绑定新店铺</button>
+        <button id="azStoreDel" class="btn small danger hidden" title="解绑选中的店铺">🗑 解绑</button>
       </div>
 
       <div id="amzCfgBox" class="hidden d-editform">
-        <label>① 卖家 ID（Seller Central → 设置 → 账户信息 → 商家令牌，A 开头）</label>
-        <input id="azSeller" class="inp" placeholder="例如 A1B2C3D4E5F6G7">
-        <label>② 上传站点</label>
+        <div class="d-imghint">绑定 = 这家店授权给咱们系统一次，之后<b>任何电脑</b>登录都能直接传这家店（密钥存在公司服务器，不落电脑）。</div>
+        <label>店铺名称（自己起个好认的，比如「美国店-1」）</label>
+        <input id="azName" class="inp" placeholder="例如：美国店-1" maxlength="40">
+        <label>卖家 ID（Seller Central → 设置 → 账户信息 → 商家令牌，A 开头）</label>
+        <input id="azSeller" class="inp" placeholder="例如 A1B2C3D4E5F6G7" maxlength="40">
+        <label>默认上传站点</label>
         <select id="azMarket" class="inp"></select>
-        <label>③ Client ID / Client Secret（卖家后台「应用程序和服务 → 开发应用程序」的 LWA 凭证）</label>
+        <label>Client ID / Client Secret（这家店卖家后台「应用程序和服务 → 开发应用程序」里的 LWA 凭证）</label>
         <input id="azClientId" class="inp" placeholder="Client ID（amzn1.application-oa2-client.…）">
         <input id="azClientSecret" class="inp" type="password" placeholder="Client Secret">
-        <label>④ App ID（同在开发应用程序页，用于一键授权）</label>
+        <label>App ID（同在「开发应用程序」页）</label>
         <input id="azAppId" class="inp" placeholder="App ID（amzn1.sp.solution.…）">
-        <div class="d-imgbar">
-          <button id="azSave" class="btn small primary">💾 保存并测试</button>
-          <button id="azAuth" class="btn small">🔓 一键授权（拿上传权限）</button>
-        </div>
-        <div class="d-imghint">先填 ①②③ 点「保存并测试」；通过后再点「🔓 一键授权」——会打开亚马逊页面，登录并点同意后自动回来。授权只需做一次，密钥只存这台电脑。后台「开发应用程序」里要把跳转地址(redirect URI)填成 <b>http://localhost:9999/callback</b></div>
+        <button id="azAuth" class="btn small primary wide">🔓 去亚马逊授权并绑定</button>
+        <div class="d-imghint">点按钮会打开亚马逊页面 → 登录这家店 → 点「同意」，成功后自动回来。后台「开发应用程序」里要把跳转地址(redirect URI)填成 <b>http://localhost:9999/callback</b></div>
       </div>
 
       <div class="form-row"><label>变体方式</label>

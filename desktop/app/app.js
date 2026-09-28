@@ -1704,7 +1704,7 @@ async function saveAi() {
   }
 }
 
-/* ---------- V5（D1.4.0）：上传亚马逊（SP-API 自动刊登） ---------- */
+/* ---------- V5（D1.4.1）：上传亚马逊（SP-API · 多店铺，密钥在服务器） ---------- */
 
 async function openAmz() {
   $("dlgAmz").classList.remove("hidden");
@@ -1718,18 +1718,31 @@ async function refreshAmz() {
   try {
     const s = await api("/api/amazon/status");
     AZ.status = s;
+    const stores = s.stores || [];
+    const mkName = (id) => {
+      const m = (s.markets || []).find(([i]) => i === id);
+      return m ? m[1] : id;
+    };
 
-    $("amzStatus").innerHTML = s.configured
-      ? `✅ 已授权 · 站点 <b>${esc(s.marketplace_name)}</b> · 卖家 <b>${esc(s.seller_id)}</b>`
-      : `⚠️ 还没完成亚马逊授权（只需做一次）——点右边「⚙️ 授权设置」`;
+    $("amzStatus").innerHTML = stores.length
+      ? `🏪 已绑定 <b>${stores.length}</b> 家店铺 · 任何电脑登录都能直接传`
+      : (s.srv_err
+        ? `❌ 读店铺清单失败：${esc(s.srv_err)}`
+        : `⚠️ 还没绑定店铺（只需做一次）——点右边「➕ 绑定新店铺」`);
+
+    $("azStore").innerHTML = stores.length
+      ? stores.map((st) =>
+          `<option value="${esc(st.id)}" ${st.id === s.active_store ? "selected" : ""}>`
+          + `${esc(st.name)} · ${esc(mkName(st.marketplace))}</option>`).join("")
+      : `<option value="">（还没绑定店铺）</option>`;
+    $("azStoreDel").classList.toggle("hidden", !s.is_admin || !stores.length);
 
     $("azMarket").innerHTML = (s.markets || []).map(([id, label]) =>
       `<option value="${esc(id)}" ${id === s.marketplace ? "selected" : ""}>${esc(label)}</option>`).join("");
-    $("azSeller").value = s.seller_id || "";
     $("azType").value = s.product_type === "PRODUCT" ? "" : s.product_type;
 
     $("azStart").textContent = `📤 开始上传（${S.sel.size} 个产品）`;
-    $("azStart").disabled = !s.configured || S.sel.size === 0;
+    $("azStart").disabled = !stores.length || S.sel.size === 0;
 
     const h = s.history || [];
     $("amzHistory").classList.toggle("hidden", !h.length);
@@ -1746,30 +1759,29 @@ async function refreshAmz() {
       azRenderTask(t);
     }
   } catch (e) {
-    $("amzStatus").textContent = "读取授权状态失败：" + e.message;
+    $("amzStatus").textContent = "读取店铺状态失败：" + e.message;
   }
 }
 
-async function azSaveCfg(test = true) {
+async function azSelectStore() {
   try {
-    busy(true, test ? "保存并测试…" : "保存…");
-    const r = await api("/api/amazon/config", {
-      seller_id: $("azSeller").value.trim(),
-      marketplace: $("azMarket").value,
-      client_id: $("azClientId").value.trim(),
-      client_secret: $("azClientSecret").value.trim(),
-      app_id: $("azAppId").value.trim(),
-      test,
-    });
-    const v = r.verify;
-    if (test) {
-      if (v && v.ok) {
-        toast(`✅ 配置有效，已连上亚马逊（店铺参加 ${(v.marketplaces || []).length} 个站点）`, "ok");
-      } else {
-        toast("⚠️ 已保存，但测试没通过：" + ((v && v.error) || "未知错误"), "err", 9000);
-      }
-      await refreshAmz();
-    }
+    await api("/api/amazon/store/select", { id: $("azStore").value });
+    await refreshAmz();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function azUnbind() {
+  const id = $("azStore").value;
+  const st = ((AZ.status && AZ.status.stores) || []).find((x) => x.id === id);
+  if (!id) return;
+  if (!confirm(`确定解绑「${st ? st.name : id}」？解绑后所有电脑都不能再传这家店（可重新绑定）。`)) return;
+  try {
+    busy(true, "解绑…");
+    await api("/api/amazon/store/delete", { id });
+    toast("🗑 已解绑", "ok");
+    await refreshAmz();
+    setTimeout(refreshAmz, 8000);
+    setTimeout(refreshAmz, 30000);
   } catch (e) {
     toast(e.message, "err", 7000);
   } finally {
@@ -1779,10 +1791,16 @@ async function azSaveCfg(test = true) {
 
 async function azAuthorize() {
   try {
-    await azSaveCfg(false);           // 先把表单里的凭证存下来
-    const r = await api("/api/amazon/authorize/start", {});
+    const r = await api("/api/amazon/authorize/start", {
+      name: $("azName").value.trim(),
+      seller_id: $("azSeller").value.trim(),
+      marketplace: $("azMarket").value,
+      client_id: $("azClientId").value.trim(),
+      client_secret: $("azClientSecret").value.trim(),
+      app_id: $("azAppId").value.trim(),
+    });
     if (r.url) window.open(r.url, "_blank");
-    toast("浏览器里完成授权后会自动回来（登录亚马逊 → 点同意）", "", 8000);
+    toast("浏览器里完成授权后会自动回来（登录这家店的亚马逊 → 点同意）", "", 8000);
     clearInterval(AZ.authPoll);
     AZ.authPoll = setInterval(async () => {
       try {
@@ -1791,8 +1809,10 @@ async function azAuthorize() {
         $("amzMsg").textContent = p.message || "";
         if (p.state === "done") {
           clearInterval(AZ.authPoll);
-          toast("✅ 亚马逊授权成功，可以上传了", "ok");
+          toast("✅ 绑定成功，这家店在任何电脑都能传了", "ok", 6000);
           await refreshAmz();
+          setTimeout(refreshAmz, 8000);    // KV 边缘同步最长约 60 秒，
+          setTimeout(refreshAmz, 30000);   // 多看两遍兜底
         } else if (p.state === "error") {
           clearInterval(AZ.authPoll);
           toast(p.message, "err", 9000);
@@ -1809,6 +1829,7 @@ async function azStart() {
     busy(true, "提交上传…");
     await api("/api/amazon/upload", {
       pids: [...S.sel],
+      store: $("azStore").value,
       variant_mode: $("azVariant").value,
       product_type: $("azType").value.trim() || "PRODUCT",
     });
@@ -2005,8 +2026,9 @@ function bindEvents() {
   $("btnDelApply").onclick = applyDelete;
   $("btnExport").onclick = doExport;
   $("btnAmz").onclick = openAmz;
-  $("azCfgToggle").onclick = () => $("amzCfgBox").classList.toggle("hidden");
-  $("azSave").onclick = () => azSaveCfg(true);
+  $("azBind").onclick = () => $("amzCfgBox").classList.toggle("hidden");
+  $("azStore").onchange = azSelectStore;
+  $("azStoreDel").onclick = azUnbind;
   $("azAuth").onclick = azAuthorize;
   $("azStart").onclick = azStart;
 

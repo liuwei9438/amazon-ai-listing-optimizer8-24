@@ -40,7 +40,7 @@ ROOT = APP_DIR.parent                          # 仓库根
 os.chdir(ROOT)                                 # 引擎的 tasks/ 落在根目录
 sys.path.insert(0, str(ROOT))
 
-VERSION = "D1.4.0"
+VERSION = "D1.4.1"
 APP_DIR_NAME = "app"
 
 DEFAULT_CONFIG = {
@@ -141,9 +141,10 @@ def setup_proxy() -> None:
     PROXY_MODE = "proxy"
 
 
-def src_api(path: str, payload: dict, timeout: int = 30) -> dict:
+def src_api(path: str, payload: dict, timeout: int = 30, base: str = "") -> dict:
     """调 Worker（语义对齐 services.sourcing.src_api）：
-    浏览器 UA 防 Cloudflare 拦截；瞬态失败 1.5 秒后重试一次。"""
+    浏览器 UA 防 Cloudflare 拦截；瞬态失败 1.5 秒后重试一次。
+    base 非空时覆盖 CONFIG["server"]（店铺接口测试用）。"""
     headers = {
         "Content-Type": "application/json",
         "User-Agent": (
@@ -152,11 +153,12 @@ def src_api(path: str, payload: dict, timeout: int = 30) -> dict:
             "Chrome/126.0.0.0 Safari/537.36"
         ),
     }
+    root = base or CONFIG["server"]
 
     for attempt in (1, 2):
         try:
             resp = requests.post(
-                CONFIG["server"] + path,
+                root + path,
                 json=payload,
                 headers=headers,
                 timeout=timeout,
@@ -1131,7 +1133,11 @@ def _export_pids(pids: list) -> tuple[str, bytes] | None:
 
 # =====================================================
 # 亚马逊 SP-API 上传（刊登）：LWA 令牌 + JSON_LISTINGS_FEED
-# 凭证只存本机 config.json；worker 端零改动。
+# D1.4.1：店铺密钥存在服务器（worker /amz_store），桌面端每次
+# 上传只拿 1 小时短命令牌——换电脑、换网络都能传多个店铺；
+# 员工机上拿不到 refresh_token/Client Secret。
+# 本机 config 的 amazon 段仅作旧数据/测试兜底（store_server
+# 是隐藏的店铺接口测试覆盖项）。
 # =====================================================
 
 _MARKETPLACES = {           # marketplaceId → (区域, 语言, 名称)
@@ -1161,7 +1167,9 @@ _AMZ_TASK = {
     "message": "", "total": 0, "pids": [],
     "feed_id": "", "result": None, "started_at": 0,
 }
-_AMZ_TOKEN = {"at": "", "exp": 0.0}
+_AMZ_TOKEN = {"at": "", "exp": 0.0}       # 旧本机凭证路径的令牌缓存
+_AMZ_TOKENS = {}                          # 店铺id → {at,exp}（服务器短令牌）
+_AMZ_RUN = {"store": None, "mid": "", "seller_id": ""}   # 当前上传上下文
 _AMZ_AUTHZ = {"state": "idle", "message": "", "url": ""}
 _AUTHZ_PORT = 9999
 _AMZ_UPLOADS_PATH = APP_DIR / "amazon_uploads.json"
@@ -1171,12 +1179,69 @@ def _amz_cfg() -> dict:
     return CONFIG.get("amazon") or {}
 
 
+def _amz_srv() -> str:
+    """店铺接口的服务器地址（默认跟主服务器同源）。"""
+    return (
+        str(_amz_cfg().get("store_server") or "").strip()
+        or CONFIG["server"]
+    )
+
+
+def _amz_store_api(payload: dict, timeout: int = 30) -> dict:
+    body = _prod_auth() | payload
+    return src_api("/amz_store", body, timeout=timeout, base=_amz_srv())
+
+
+def _amz_stores() -> tuple[list, str]:
+    """服务器上的店铺清单（无密钥）。返回 (stores, 错误信息)。
+    刚绑定完 KV 边缘缓存可能还没同步（约 60 秒）——把授权流程
+    刚拿到的店铺乐观合并进来。"""
+    try:
+        r = _amz_store_api({"action": "list"})
+    except Exception as exc:
+        return [], f"连不上服务器：{exc}"[:200]
+    if not r.get("ok"):
+        return [], str(r.get("error") or "读取失败")[:200]
+    stores = list(r.get("stores") or [])
+    just = _AMZ_AUTHZ.get("store") or {}
+    if (
+        _AMZ_AUTHZ.get("state") == "done"
+        and just.get("id")
+        and not any(str(s.get("id")) == str(just.get("id"))
+                    for s in stores)
+    ):
+        stores = [just] + stores
+    return stores, ""
+
+
+def _amz_store_save(store: dict) -> dict:
+    try:
+        return _amz_store_api({"action": "save", "store": store})
+    except Exception as exc:
+        return {"ok": False, "error": f"连不上服务器：{exc}"[:300]}
+
+
+def _amz_store_delete(sid: str) -> dict:
+    try:
+        return _amz_store_api({"action": "delete", "id": sid})
+    except Exception as exc:
+        return {"ok": False, "error": f"连不上服务器：{exc}"[:300]}
+
+
+def _amz_active_store(stores: list) -> dict | None:
+    sid = str(_amz_cfg().get("active_store") or "")
+    for s in stores:
+        if str(s.get("id")) == sid:
+            return s
+    return stores[0] if stores else None
+
+
 def _amz_spapi_host() -> str:
     base = str(_amz_cfg().get("spapi_base") or "").strip()
     if base:
         return base.rstrip("/")
     region = str(_amz_cfg().get("region") or "na").lower()
-    mk = str(_amz_cfg().get("marketplace") or "")
+    mk = _AMZ_RUN.get("mid") or str(_amz_cfg().get("marketplace") or "")
     if mk in _MARKETPLACES:
         region = _MARKETPLACES[mk][0]
     return f"https://sellingpartnerapi-{region}.amazon.com"
@@ -1193,7 +1258,29 @@ def _amz_task_snap() -> dict:
 
 
 def amz_token() -> str:
-    """LWA 访问令牌（约 1 小时有效，本地缓存自动续）。"""
+    """LWA 访问令牌（约 1 小时有效，自动续）。
+    当前上传上下文有绑定店铺 → 向服务器拿短令牌（密钥不落地）；
+    否则走本机 config 里的旧凭证。"""
+    store = _AMZ_RUN.get("store")
+    if store and store.get("id"):
+        sid = str(store["id"])
+        now = time.time()
+        c = _AMZ_TOKENS.get(sid) or {}
+        if c.get("at") and now < float(c.get("exp") or 0) - 120:
+            return c["at"]
+        r = _amz_store_api({"action": "token", "id": sid}, timeout=25)
+        at = str(r.get("access_token") or "") if r.get("ok") else ""
+        if not at:
+            raise RuntimeError(
+                "拿店铺令牌失败："
+                + str(r.get("error") or "服务器没返回令牌")[:300]
+            )
+        _AMZ_TOKENS[sid] = {
+            "at": at,
+            "exp": now + float(r.get("expires_in") or 3600),
+        }
+        return at
+
     c = _amz_cfg()
     if not all(str(c.get(k) or "").strip() for k in (
         "refresh_token", "client_id", "client_secret",
@@ -1279,7 +1366,10 @@ def _amz_api(method: str, path: str, token: str, payload=None):
 
 # ---- 一键授权：本地 9999 端口接亚马逊跳回来的授权码，自动换令牌 ----
 
-def _amz_start_authorize(app_id: str, client_id: str, client_secret: str) -> str:
+def _amz_start_authorize(
+    app_id: str, client_id: str, client_secret: str,
+    bind: dict | None = None,
+) -> str:
     global _AMZ_AUTHZ
 
     if _AMZ_AUTHZ.get("state") == "running":
@@ -1349,13 +1439,33 @@ def _amz_start_authorize(app_id: str, client_id: str, client_secret: str) -> str
                         raise RuntimeError(
                             str(tok.get("error_description") or tok)[:300]
                         )
-                    amz = dict(CONFIG.get("amazon") or {})
-                    amz["refresh_token"] = rt
-                    CONFIG["amazon"] = amz
-                    _save_json_file(CONFIG_PATH, CONFIG)
-                    _AMZ_TOKEN.update(at="", exp=0.0)
+                    # D1.4.1：密钥不落本机，直接存到服务器——这样
+                    # 换电脑、员工机都能用，拿不走密钥本身。
+                    b = bind or {}
+                    saved = _amz_store_save({
+                        "name": str(b.get("name") or "店铺"),
+                        "seller_id": str(b.get("seller_id") or ""),
+                        "marketplace": str(
+                            b.get("marketplace") or "ATVPDKIKX0DER"
+                        ),
+                        "client_id": client_id,
+                        "client_secret": client_secret,
+                        "refresh_token": rt,
+                        "app_id": app_id,
+                    })
+                    if not saved.get("ok"):
+                        raise RuntimeError(
+                            "授权成功了，但保存到服务器失败："
+                            + str(saved.get("error") or "")[:250]
+                        )
+                    _AMZ_TOKENS.clear()
                     _AMZ_AUTHZ.update(
-                        state="done", message="✅ 授权成功，已自动保存",
+                        state="done",
+                        message=(
+                            "✅ 授权成功，店铺已绑定到服务器"
+                            "（换电脑也能直接用）"
+                        ),
+                        store=(saved.get("store") or {}),
                     )
                 except Exception as exc:
                     _AMZ_AUTHZ.update(
@@ -1704,7 +1814,10 @@ def _amz_start_upload(
                 )
 
             c = _amz_cfg()
-            mid = str(c.get("marketplace") or "ATVPDKIKX0DER")
+            mid = (
+                _AMZ_RUN.get("mid")
+                or str(c.get("marketplace") or "ATVPDKIKX0DER")
+            )
             info = _MARKETPLACES.get(mid, ("na", "en_US", ""))
 
             messages, notes = _amz_build_messages(
@@ -1717,7 +1830,10 @@ def _amz_start_upload(
 
             payload = {
                 "header": {
-                    "sellerId": str(c.get("seller_id") or ""),
+                    "sellerId": (
+                        _AMZ_RUN.get("seller_id")
+                        or str(c.get("seller_id") or "")
+                    ),
                     "version": "2.0",
                     "issueLocale": "en_US",
                 },
@@ -2030,7 +2146,7 @@ class Handler(BaseHTTPRequestHandler):
                     )
                 return
 
-            # ---- 亚马逊上传（D1.4.0）：状态 / 任务进度（不回显密钥） ----
+            # ---- 亚马逊上传（D1.4.1）：店铺清单 / 任务进度（不回显密钥） ----
             if url.path == "/api/amazon/status":
                 c = _amz_cfg()
                 configured = all(
@@ -2038,16 +2154,28 @@ class Handler(BaseHTTPRequestHandler):
                     for k in ("client_id", "client_secret",
                               "refresh_token", "seller_id")
                 )
-                mk = str(c.get("marketplace") or "ATVPDKIKX0DER")
+                stores, srv_err = _amz_stores()
+                active = _amz_active_store(stores)
+                mk = (
+                    str(active.get("marketplace") or "")
+                    if active else ""
+                ) or str(c.get("marketplace") or "ATVPDKIKX0DER")
                 info = _MARKETPLACES.get(mk)
                 self._json({
                     "ok": True,
-                    "configured": configured,
+                    "configured": bool(stores) or configured,
+                    "stores": stores,
+                    "active_store": active.get("id") if active else "",
+                    "srv_err": srv_err,
                     "marketplace": mk,
                     "marketplace_name": info[2] if info else mk,
                     "language_tag": info[1] if info else "en_US",
                     "product_type": str(c.get("product_type") or "PRODUCT"),
-                    "seller_id": str(c.get("seller_id") or ""),
+                    "seller_id": (
+                        str(active.get("seller_id") or "")
+                        if active else str(c.get("seller_id") or "")
+                    ),
+                    "is_admin": is_admin(),
                     "markets": [
                         [i, f"{v[2]}（{v[0].upper()}）"]
                         for i, v in _MARKETPLACES.items()
@@ -2914,19 +3042,66 @@ class Handler(BaseHTTPRequestHandler):
                 client_secret = str(
                     body.get("client_secret") or c.get("client_secret") or ""
                 ).strip()
-                if not (app_id and client_id and client_secret):
+                name = str(body.get("name") or "").strip()[:40]
+                seller_id = str(body.get("seller_id") or "").strip()[:40]
+                marketplace = str(body.get("marketplace") or "").strip()
+                if marketplace not in _MARKETPLACES:
+                    marketplace = "ATVPDKIKX0DER"
+                if not (app_id and client_id and client_secret
+                        and seller_id and name):
                     self._json({
                         "ok": False,
                         "error": (
-                            "先把 App ID / Client ID / Client Secret "
-                            "填好并保存，再点一键授权"
+                            "先把 店铺名称 / 卖家ID / App ID / "
+                            "Client ID / Client Secret 都填好，再点授权绑定"
                         ),
                     }, 400)
                     return
                 url_out = _amz_start_authorize(
-                    app_id, client_id, client_secret
+                    app_id, client_id, client_secret,
+                    bind={
+                        "name": name,
+                        "seller_id": seller_id,
+                        "marketplace": marketplace,
+                    },
                 )
                 self._json({"ok": True, "url": url_out})
+                return
+
+            # 选中店铺（本机记住默认用哪家店传）
+            if url.path == "/api/amazon/store/select":
+                sid = str(body.get("id") or "").strip()
+                amz = dict(CONFIG.get("amazon") or {})
+                amz["active_store"] = sid
+                CONFIG["amazon"] = amz
+                _save_json_file(CONFIG_PATH, CONFIG)
+                self._json({"ok": True})
+                return
+
+            # 解绑店铺（仅管理员——worker 校验 admin_key）
+            if url.path == "/api/amazon/store/delete":
+                sid = str(body.get("id") or "").strip()
+                if not sid:
+                    self._json({"ok": False, "error": "缺少店铺 id"}, 400)
+                    return
+                r = _amz_store_delete(sid)
+                if not r.get("ok"):
+                    self._json(
+                        {"ok": False, "error": str(r.get("error") or "")[:300]},
+                        400,
+                    )
+                    return
+                # 别让乐观合并把刚解绑的店铺又「复活」了
+                just = _AMZ_AUTHZ.get("store") or {}
+                if str(just.get("id") or "") == sid:
+                    _AMZ_AUTHZ["store"] = {}
+                _AMZ_TOKENS.pop(sid, None)
+                amz = dict(CONFIG.get("amazon") or {})
+                if amz.get("active_store") == sid:
+                    amz["active_store"] = ""
+                    CONFIG["amazon"] = amz
+                    _save_json_file(CONFIG_PATH, CONFIG)
+                self._json({"ok": True})
                 return
 
             if url.path == "/api/amazon/authorize/poll":
@@ -2954,16 +3129,49 @@ class Handler(BaseHTTPRequestHandler):
                         }, 409)
                         return
 
-                    if not all(
+                    # 店铺优先：服务器绑定的店铺；没绑过且本机有旧凭证
+                    # 才走本机路径（测试/旧数据兜底）
+                    stores, srv_err = _amz_stores()
+                    sid = str(body.get("store") or "").strip()
+                    store = next(
+                        (s for s in stores if str(s.get("id")) == sid),
+                        None,
+                    )
+                    if not store:
+                        store = _amz_active_store(stores)
+                    legacy_ok = all(
                         str(c.get(k) or "").strip()
                         for k in ("client_id", "client_secret",
                                   "refresh_token", "seller_id")
-                    ):
+                    )
+                    if not store and not legacy_ok:
                         self._json({
                             "ok": False,
-                            "error": "亚马逊授权还没配置好（点「⚙️ 授权设置」）",
+                            "error": (
+                                "还没绑定店铺（点「➕ 绑定新店铺」，"
+                                "只需做一次）"
+                                if not srv_err
+                                else f"读店铺清单失败：{srv_err}"
+                            ),
                         }, 400)
                         return
+
+                    mk = str(body.get("marketplace") or "").strip()
+                    if mk not in _MARKETPLACES:
+                        mk = ""
+                    _AMZ_RUN.update(
+                        store=store,
+                        mid=mk
+                        or (
+                            str(store.get("marketplace") or "")
+                            if store else ""
+                        )
+                        or str(c.get("marketplace") or "ATVPDKIKX0DER"),
+                        seller_id=(
+                            str(store.get("seller_id") or "")
+                            if store else str(c.get("seller_id") or "")
+                        ),
+                    )
 
                     variant_mode = (
                         body.get("variant_mode")
