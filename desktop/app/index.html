@@ -172,6 +172,57 @@
   </div>
 </div>
 
+<!-- ============ 图片编辑 ============ -->
+<div id="dlgImgEdit" class="modal hidden">
+  <div class="modal-box wide">
+    <div class="modal-head"><b id="ieTitle">🖼 编辑图片</b><button class="btn ghost" data-close>✖</button></div>
+    <div class="modal-body">
+      <div class="ie-bar">
+        <button id="ieRotL" class="btn small">↺ 左转90°</button>
+        <button id="ieRotR" class="btn small">↻ 右转90°</button>
+        <button id="ieCrop" class="btn small">✂️ 裁剪</button>
+        <button id="ieWhite" class="btn small">▦ 白底主图 800×800</button>
+        <button id="ieReset" class="btn small">↺ 还原</button>
+        <span class="spacer"></span>
+        <button id="ieDl" class="btn small">⬇️ 下载</button>
+        <button id="ieUse" class="btn small primary">✅ 用这张</button>
+      </div>
+      <div id="ieStage" class="ie-stage">
+        <canvas id="ieCanvas"></canvas>
+        <div id="ieCropBox" class="ie-cropbox hidden"></div>
+      </div>
+      <div id="ieCropBar" class="ie-bar hidden">
+        <span id="ieCropSize" class="ie-info">按住鼠标拖出要保留的部分</span>
+        <span class="spacer"></span>
+        <button id="ieCropOk" class="btn small primary">✓ 应用裁剪</button>
+        <button id="ieCropCancel" class="btn small">取消</button>
+      </div>
+      <div id="ieInfo" class="ie-info">滚轮缩放</div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 添加图片 ============ -->
+<div id="dlgImgAdd" class="modal hidden">
+  <div class="modal-box">
+    <div class="modal-head"><b>➕ 添加图片</b><button class="btn ghost" data-close>✖</button></div>
+    <div class="modal-body">
+      <input id="iaUrl" class="inp" placeholder="粘贴图片网址（https://…）">
+      <button id="iaUrlOk" class="btn primary wide">➕ 添加这张网图</button>
+      <div class="imp-note">— 或 —</div>
+      <input id="iaFile" type="file" accept="image/*" class="inp">
+      <button id="iaFileOk" class="btn wide">🖼 选本地图 → 先编辑再添加</button>
+      <div class="imp-note">本地图会自动上传到公司服务器，变成所有设备都能看的图片链接。</div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 大图预览 ============ -->
+<div id="dlgLightbox" class="lightbox hidden" data-close>
+  <button class="btn ghost lb-close" data-close>✖ 关闭</button>
+  <img id="lbImg" referrerpolicy="no-referrer" alt="">
+</div>
+
 <div id="toasts" class="toasts"></div>
 <div id="busy" class="busy hidden"><div class="busy-box"><div class="spin"></div><span id="busyText">处理中…</span></div></div>
 

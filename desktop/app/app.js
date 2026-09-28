@@ -12,6 +12,10 @@ const S = {
   pollTimer: null, taskOpen: false,
 };
 
+/* D = 当前详情弹窗的图片编辑状态；IE = 图片编辑器状态 */
+const D = { pid: "", imgs: [], dirty: false, thin: false };
+const IE = { work: null, init: null, idx: -1, isNew: false, zoom: 1, mode: "view" };
+
 const $ = (id) => document.getElementById(id);
 
 /* ---------- 工具 ---------- */
@@ -357,13 +361,23 @@ function dEditRow(cat, status) {
     </div>`;
 }
 
+/* 图片加载失败兜底：直连不行 → 本机代理拉一遍 → 再不行藏起来（格子还在，可删） */
+window.imgFail = function (el) {
+  if (!el.dataset.p2 && el.dataset.u) {
+    el.dataset.p2 = "1";
+    el.src = "/api/image/proxy?u=" + encodeURIComponent(el.dataset.u);
+  } else {
+    el.style.visibility = "hidden";
+  }
+};
+
 function dHead(img, title, sku, model, extra) {
   return `<div class="d-head">
     <div class="d-img-wrap">
-      <div class="d-img">${img
-        ? `<img id="dMainImg" referrerpolicy="no-referrer" src="${esc(img)}" onerror="this.remove()">`
-        : "（无图片）"}</div>
-      <div id="dThumbs" class="d-thumbs"></div>
+      <div class="d-img" title="点图片看大图">${img
+        ? `<img id="dMainImg" referrerpolicy="no-referrer" src="${esc(img)}" data-u="${esc(img)}"
+               onerror="imgFail(this)" style="cursor:zoom-in">`
+        : '<span id="dMainBox">（无图片）</span>'}</div>
     </div>
     <div class="d-info">
       <div class="line"><b>${esc(String(title || "（无标题）").slice(0, 90))}</b></div>
@@ -400,7 +414,7 @@ function fillDetail(rec, it) {
   const status = ["wait", "found", "none"].includes(String(rec.status)) ? String(rec.status) : "wait";
   const st = stateOf({ has_opt: !!(opt.title || (opt.bullets || []).length), n_rows: raw.length });
 
-  // 图片集：产品图 + 简介图，去重
+  // 图片集：产品图 + 简介图，去重（第一张 = 主图）
   const imgs = [];
   raw.forEach((r) => {
     (r.image_urls || []).concat(r.detail_image_urls || []).forEach((u) => {
@@ -408,7 +422,13 @@ function fillDetail(rec, it) {
       if (u && !imgs.includes(u)) imgs.push(u.slice(0, 500));
     });
   });
-  const mainImg = String(opt.image || rec.img || imgs[0] || "").trim();
+  if (rec.img && !imgs.includes(String(rec.img).trim())) imgs.unshift(String(rec.img).trim().slice(0, 500));
+  const mainImg = String(rec.img || opt.image || imgs[0] || "").trim();
+
+  D.pid = String(rec.pid || it.pid || "");
+  D.imgs = imgs.slice(0, 60);
+  D.dirty = false;
+  D.thin = !raw.length;
 
   const extra =
     `<div class="line">分类：<b>${esc(rec.cat || "未分类")}</b>　资料：<b>${raw.length} 行</b>　状态：<b>${BADGE[st][0]}</b></div>`
@@ -419,6 +439,28 @@ function fillDetail(rec, it) {
   const parts = [dHead(mainImg, rec.title || it.title, rec.sku, it.model, extra)];
 
   if (!ro) parts.push(dEditRow(rec.cat, status));
+
+  // 图片集（ERP 式：可删/可加/拖动排序/点图编辑；只读视图=缩略图条）
+  const canEdit = !ro && !D.thin;
+  parts.push(
+    `<div class="d-sec"><h4>🖼 图片集（共 ${imgs.length} 张${canEdit ? "" : " · 只读"}）</h4>`
+    + (canEdit
+      ? `<div id="dSlots" class="d-slots"></div>
+         <div class="d-imgbar">
+           <button id="dImgSave" class="btn small primary" disabled>💾 保存图片修改</button>
+           <button id="dImgDedup" class="btn small">🧹 清理重复</button>
+           <button id="dImgCopy" class="btn small">🔗 复制主图链接</button>
+           <button id="dImgClear" class="btn small danger">🗑 清空图片</button>
+         </div>
+         <div class="d-imghint">第 1 张=主图（白底 800×800 最佳）· 拖动格子调顺序 · 点图片=编辑（裁剪/旋转/白底）· ✕ 删除 · ⭐ 设为主图 · 改完点「💾 保存图片修改」</div>`
+      : `<div class="d-thumbs">${imgs.slice(0, 24).map((u) =>
+          `<img src="${esc(u)}" data-thumb="${esc(u)}" loading="lazy" referrerpolicy="no-referrer"
+                onerror="imgFail(this)" data-u="${esc(u)}" title="点击看大图">`).join("")}</div>`
+        + (D.thin
+          ? `<div class="d-imghint">⚠️ 资料不全（只有主图）。用「📥 导入产品」传同一份 Excel 补全后，这里就能删/加/编辑图片。</div>`
+          : `<div class="d-imghint">只读视图 — 切回「我的库」才能编辑图片。</div>`))
+    + `</div>`
+  );
 
   // AI 结果
   if (opt.title || (opt.bullets || []).length || opt.description) {
@@ -471,16 +513,362 @@ function fillDetail(rec, it) {
   $("dBody").innerHTML = parts.join("");
   $("dBody").dataset.pid = String(rec.pid || it.pid || "");
 
-  // 缩略图条（点了换主图）
-  $("dThumbs").innerHTML = imgs.slice(0, 24).map((u) =>
-    `<img src="${esc(u)}" data-thumb="${esc(u)}" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()" title="点击看大图">`
-  ).join("");
+  if (canEdit) renderSlots();   // 可编辑格子条（拖动/删除/编辑/添加）
 
   bindDetailActs();
 }
 
+/* ---------- V3（D1.2.0）：图片集格子 + 编辑器 ---------- */
+
+function markDirty() {
+  D.dirty = true;
+  const b = $("dImgSave");
+  if (b) b.disabled = false;
+}
+
+function syncMainImg() {
+  const m = $("dMainImg");
+  if (!m) return;
+  const u = D.imgs[0] || "";
+  if (u) {
+    m.style.display = "";
+    m.dataset.u = u;
+    delete m.dataset.p2;
+    m.src = u;
+  } else {
+    m.style.display = "none";
+  }
+}
+
+function renderSlots() {
+  const box = $("dSlots");
+  if (!box) return;
+
+  box.innerHTML = D.imgs.map((u, i) => `<div class="slot${i === 0 ? " ismain" : ""}" draggable="true" data-i="${i}"
+      title="点一下=编辑这张 · ✕=删除 · ⭐=设为主图 · 拖动调顺序">
+      <img src="${esc(u)}" loading="lazy" referrerpolicy="no-referrer" onerror="imgFail(this)" data-u="${esc(u)}">
+      ${i === 0 ? '<span class="mb">主图</span>' : ""}
+      <span class="star" data-main="${i}" title="${i === 0 ? "已是主图" : "设为主图"}">⭐</span>
+      <span class="del" data-del="${i}" title="删除这张">✕</span>
+    </div>`).join("")
+    + `<div class="slot add" data-add="1" title="添加图片（网址 / 本地图）">📷<i>添加</i></div>`;
+
+  box.ondragstart = (e) => {
+    const s = e.target.closest(".slot[data-i]");
+    if (!s) return;
+    e.dataTransfer.setData("text/plain", s.dataset.i);
+    e.dataTransfer.effectAllowed = "move";
+  };
+  box.ondragover = (e) => {
+    e.preventDefault();
+    const s = e.target.closest(".slot[data-i]");
+    if (s) s.classList.add("dragover");
+  };
+  box.ondragleave = (e) => {
+    const s = e.target.closest(".slot[data-i]");
+    if (s) s.classList.remove("dragover");
+  };
+  box.ondrop = (e) => {
+    e.preventDefault();
+    const s = e.target.closest(".slot[data-i]");
+    const from = +e.dataTransfer.getData("text/plain");
+    if (s && !Number.isNaN(from)) moveImg(from, +s.dataset.i);
+  };
+
+  const save = $("dImgSave");
+  if (save) save.disabled = !D.dirty;
+  syncMainImg();
+}
+
+function delImg(i) {
+  if (i < 0 || i >= D.imgs.length) return;
+  D.imgs.splice(i, 1);
+  markDirty();
+  renderSlots();
+}
+
+function setMain(i) {
+  if (i <= 0 || i >= D.imgs.length) return;
+  const [u] = D.imgs.splice(i, 1);
+  D.imgs.unshift(u);
+  markDirty();
+  renderSlots();
+}
+
+function moveImg(from, to) {
+  if (from === to || from < 0 || to < 0 || from >= D.imgs.length || to >= D.imgs.length) return;
+  const [u] = D.imgs.splice(from, 1);
+  D.imgs.splice(to, 0, u);
+  markDirty();
+  renderSlots();
+}
+
+function dedupImgs() {
+  const before = D.imgs.length;
+  D.imgs = [...new Set(D.imgs)];
+  if (D.imgs.length !== before) {
+    markDirty();
+    toast(`🧹 清理了 ${before - D.imgs.length} 张重复图片`);
+  } else {
+    toast("没有发现重复图片");
+  }
+  renderSlots();
+}
+
+function clearImgs() {
+  if (!D.imgs.length) { toast("本来就没有图片"); return; }
+  if (!confirm(`确定清空全部 ${D.imgs.length} 张图片？\n（点「💾 保存图片修改」后才真正生效）`)) return;
+  D.imgs = [];
+  markDirty();
+  renderSlots();
+}
+
+async function copyImgLink() {
+  const u = D.imgs[0] || "";
+  if (!u) { toast("没有图片可复制", "err"); return; }
+  try {
+    await navigator.clipboard.writeText(u);
+    toast("✅ 主图链接已复制", "ok");
+  } catch (e) {
+    toast(u, "", 9000);
+  }
+}
+
+async function saveImages() {
+  if (!D.dirty) { toast("没有要保存的修改"); return; }
+  try {
+    busy(true, "保存图片修改…");
+    await api("/api/product/images", { pid: D.pid, imgs: D.imgs });
+    D.dirty = false;
+    const b = $("dImgSave");
+    if (b) b.disabled = true;
+    toast("✅ 图片修改已保存（列表缩略图稍后跟着变）", "ok");
+    loadProductsTwice();
+  } catch (e) {
+    toast(e.message, "err", 7000);
+  } finally {
+    busy(false);
+  }
+}
+
+function openAddImg() {
+  $("iaUrl").value = "";
+  $("iaFile").value = "";
+  $("dlgImgAdd").classList.remove("hidden");
+}
+
+function openLightbox(u) {
+  if (!u) return;
+  const im = $("lbImg");
+  im.onerror = () => {
+    im.onerror = null;
+    im.src = "/api/image/proxy?u=" + encodeURIComponent(u);
+  };
+  im.src = u;
+  $("dlgLightbox").classList.remove("hidden");
+}
+
+/* ---------- 图片编辑器（裁剪 / 旋转 / 白底 / 上传） ---------- */
+
+function loadImg(src) {
+  return new Promise((ok, no) => {
+    const im = new Image();
+    im.onload = () => ok(im);
+    im.onerror = no;
+    im.src = src;
+  });
+}
+
+/* 图片 → 画布（超过 2000px 压一压；透明底垫白，导出 jpg 才不发黑） */
+function imgToCanvas(im) {
+  const w = im.naturalWidth || im.width || 1;
+  const h = im.naturalHeight || im.height || 1;
+  const k = Math.min(1, 2000 / Math.max(w, h));
+  const c = document.createElement("canvas");
+  c.width = Math.max(1, Math.round(w * k));
+  c.height = Math.max(1, Math.round(h * k));
+  const x = c.getContext("2d");
+  x.fillStyle = "#fff";
+  x.fillRect(0, 0, c.width, c.height);
+  x.drawImage(im, 0, 0, c.width, c.height);
+  return c;
+}
+
+function copyCanvas(src) {
+  const c = document.createElement("canvas");
+  c.width = src.width;
+  c.height = src.height;
+  c.getContext("2d").drawImage(src, 0, 0);
+  return c;
+}
+
+async function openImgEditor(i, isNew, dataUrl) {
+  const u = isNew ? "" : D.imgs[i];
+  if (!isNew && !u) return;
+  const src = dataUrl || "/api/image/proxy?u=" + encodeURIComponent(u);
+  busy(true, "读取图片…");
+  try {
+    const im = await loadImg(src);
+    IE.work = imgToCanvas(im);
+    IE.init = copyCanvas(IE.work);
+    IE.idx = isNew ? -1 : i;
+    IE.isNew = !!isNew;
+    IE.zoom = 1;
+    endCrop();
+    $("ieTitle").textContent = isNew
+      ? "🖼 新图片（编辑好点「✅ 用这张」）"
+      : `🖼 编辑第 ${i + 1} 张图片`;
+    $("dlgImgEdit").classList.remove("hidden");
+    requestAnimationFrame(draw);
+  } catch (e) {
+    toast("图片读取失败（网络原因）。可先把图下载到电脑，再用「📷 添加 → 本地图」", "err", 7000);
+  } finally {
+    busy(false);
+  }
+}
+
+function draw() {
+  if (!IE.work) return;
+  const stage = $("ieStage");
+  const cv = $("ieCanvas");
+  const w = IE.work.width;
+  const h = IE.work.height;
+  const maxW = Math.max(220, stage.clientWidth - 26);
+  const fit = Math.min(maxW / w, 430 / h, 1.5) * IE.zoom;
+  const dw = Math.max(1, Math.round(w * fit));
+  const dh = Math.max(1, Math.round(h * fit));
+  cv.width = dw;
+  cv.height = dh;
+  const x = cv.getContext("2d");
+  x.imageSmoothingEnabled = true;
+  x.imageSmoothingQuality = "high";
+  x.drawImage(IE.work, 0, 0, dw, dh);
+  $("ieInfo").textContent = `当前 ${w}×${h} 像素 · 显示 ${Math.round(fit * 100)}%（滚轮缩放）`;
+}
+
+function rotateWork(dir) {
+  if (!IE.work) return;
+  const w = IE.work;
+  const c = document.createElement("canvas");
+  c.width = w.height;
+  c.height = w.width;
+  const x = c.getContext("2d");
+  if (dir > 0) { x.translate(c.width, 0); x.rotate(Math.PI / 2); }
+  else { x.translate(0, c.height); x.rotate(-Math.PI / 2); }
+  x.drawImage(w, 0, 0);
+  IE.work = c;
+  IE.zoom = 1;
+  draw();
+}
+
+/* 主图白底：等比缩放进 800×800 白底画布（第 1 张主图的标准格式） */
+function whiteMain() {
+  if (!IE.work) return;
+  const c = document.createElement("canvas");
+  c.width = 800;
+  c.height = 800;
+  const x = c.getContext("2d");
+  x.fillStyle = "#fff";
+  x.fillRect(0, 0, 800, 800);
+  const w = IE.work;
+  const k = Math.min(800 / w.width, 800 / w.height);
+  const dw = w.width * k;
+  const dh = w.height * k;
+  x.drawImage(w, (800 - dw) / 2, (800 - dh) / 2, dw, dh);
+  IE.work = c;
+  IE.zoom = 1;
+  draw();
+  toast("已生成 800×800 白底主图（点「✅ 用这张」替换）");
+}
+
+function startCrop() {
+  if (!IE.work) return;
+  IE.mode = "crop";
+  $("ieCropBar").classList.remove("hidden");
+  $("ieStage").classList.add("cropping");
+  $("ieCropBox").classList.add("hidden");
+  $("ieCropSize").textContent = "按住鼠标拖出要保留的部分";
+}
+
+function endCrop() {
+  IE.mode = "view";
+  $("ieCropBar").classList.add("hidden");
+  $("ieCropBox").classList.add("hidden");
+  $("ieStage").classList.remove("cropping");
+}
+
+function applyCrop() {
+  if (!IE.work) return;
+  const box = $("ieCropBox");
+  const stage = $("ieStage");
+  const cv = $("ieCanvas");
+  if (box.classList.contains("hidden")) { toast("先在图上拖出要保留的区域", "err"); return; }
+  const sr = stage.getBoundingClientRect();
+  const cr = cv.getBoundingClientRect();
+  const bx = parseFloat(box.style.left) - (cr.left - sr.left);
+  const by = parseFloat(box.style.top) - (cr.top - sr.top);
+  const bw = parseFloat(box.style.width);
+  const bh = parseFloat(box.style.height);
+  const kx = IE.work.width / cr.width;
+  const ky = IE.work.height / cr.height;
+  const sx = Math.max(0, Math.round(bx * kx));
+  const sy = Math.max(0, Math.round(by * ky));
+  const sw = Math.min(IE.work.width - sx, Math.round(bw * kx));
+  const sh = Math.min(IE.work.height - sy, Math.round(bh * ky));
+  if (sw < 8 || sh < 8) { toast("选区太小了", "err"); return; }
+  const c = document.createElement("canvas");
+  c.width = sw;
+  c.height = sh;
+  c.getContext("2d").drawImage(IE.work, sx, sy, sw, sh, 0, 0, sw, sh);
+  IE.work = c;
+  IE.zoom = 1;
+  endCrop();
+  draw();
+}
+
+async function useEdited() {
+  if (!IE.work) return;
+  try {
+    busy(true, "上传图片…");
+    const b64 = IE.work.toDataURL("image/jpeg", 0.92).split(",")[1] || "";
+    const r = await api("/api/image/put", { pid: D.pid, ct: "image/jpeg", data_b64: b64 });
+    const url = String(r.url || "");
+    if (!url) throw new Error("服务器没返回图片链接");
+    if (IE.isNew) D.imgs.push(url);
+    else D.imgs[IE.idx] = url;
+    markDirty();
+    closeModal("dlgImgEdit");
+    renderSlots();
+    toast(IE.isNew ? "✅ 已加入图片集" : "✅ 已替换这张图", "ok");
+    toast("记得点「💾 保存图片修改」才真正保存", "", 6000);
+  } catch (e) {
+    toast(e.message, "err", 7000);
+  } finally {
+    busy(false);
+  }
+}
+
 function bindDetailActs() {
   $("dBody").onclick = (e) => {
+    const del = e.target.closest("[data-del]");
+    if (del) { delImg(+del.dataset.del); return; }
+
+    const star = e.target.closest("[data-main]");
+    if (star) { setMain(+star.dataset.main); return; }
+
+    const add = e.target.closest("[data-add]");
+    if (add) { openAddImg(); return; }
+
+    const slot = e.target.closest(".slot[data-i]");
+    if (slot) { openImgEditor(+slot.dataset.i); return; }
+
+    if (e.target.closest("#dImgSave")) { saveImages(); return; }
+    if (e.target.closest("#dImgDedup")) { dedupImgs(); return; }
+    if (e.target.closest("#dImgCopy")) { copyImgLink(); return; }
+    if (e.target.closest("#dImgClear")) { clearImgs(); return; }
+
+    if (e.target.id === "dMainImg") { openLightbox(D.imgs[0] || e.target.dataset.u || ""); return; }
+
     const th = e.target.closest("[data-thumb]");
     if (th && $("dMainImg")) $("dMainImg").src = th.dataset.thumb;
   };
@@ -738,6 +1126,17 @@ async function saveAi() {
 
 function closeModal(id) { $(id).classList.add("hidden"); }
 
+// 详情弹窗防手滑：图片改了没保存就点关闭 → 先问一句。
+// 必须注册在下面通用关闭逻辑之前（同一元素上先注册先执行），
+// 用 stopImmediatePropagation 拦掉通用关闭。
+$("dlgDetail").addEventListener("click", (e) => {
+  const closing = e.target === $("dlgDetail") || e.target.closest("[data-close]");
+  if (closing && D.dirty && !confirm("图片修改还没保存，关闭会丢掉这些调整。确定关闭？")) {
+    e.preventDefault();
+    e.stopImmediatePropagation();
+  }
+}, true);
+
 document.querySelectorAll(".modal").forEach((m) => {
   m.addEventListener("click", (e) => {
     if (e.target === m || e.target.closest("[data-close]")) m.classList.add("hidden");
@@ -827,6 +1226,93 @@ function bindEvents() {
     S.taskOpen = false;
     $("taskCard").classList.add("hidden");
   };
+
+  /* ----- V3：添加图片 / 图片编辑器 ----- */
+  $("iaUrlOk").onclick = () => {
+    const u = $("iaUrl").value.trim();
+    if (!/^https?:\/\//i.test(u)) { toast("先粘贴 http/https 开头的图片网址", "err"); return; }
+    D.imgs.push(u.slice(0, 500));
+    markDirty();
+    closeModal("dlgImgAdd");
+    renderSlots();
+    toast("已加入图片集（点「💾 保存图片修改」生效）");
+  };
+
+  $("iaFileOk").onclick = async () => {
+    const f = $("iaFile").files[0];
+    if (!f) { toast("先选择一个图片文件", "err"); return; }
+    if (f.size > 8 * 1024 * 1024) { toast("图片太大（超过 8MB）", "err"); return; }
+    const dataUrl = await new Promise((ok, no) => {
+      const r = new FileReader();
+      r.onload = () => ok(String(r.result));
+      r.onerror = no;
+      r.readAsDataURL(f);
+    }).catch(() => "");
+    closeModal("dlgImgAdd");
+    if (dataUrl) openImgEditor(-1, true, dataUrl);
+    else toast("本地文件读取失败", "err");
+  };
+
+  $("ieRotL").onclick = () => rotateWork(-1);
+  $("ieRotR").onclick = () => rotateWork(1);
+  $("ieCrop").onclick = startCrop;
+  $("ieCropOk").onclick = applyCrop;
+  $("ieCropCancel").onclick = endCrop;
+  $("ieWhite").onclick = whiteMain;
+  $("ieReset").onclick = () => {
+    if (IE.work && IE.init) {
+      IE.work = copyCanvas(IE.init);
+      IE.zoom = 1;
+      draw();
+      toast("已还原到刚打开时的样子");
+    }
+  };
+  $("ieDl").onclick = () => {
+    if (!IE.work) return;
+    const a = document.createElement("a");
+    a.href = IE.work.toDataURL("image/jpeg", 0.92);
+    a.download = `${D.pid || "image"}_${Date.now() % 10000}.jpg`;
+    a.click();
+  };
+  $("ieUse").onclick = useEdited;
+
+  const stage = $("ieStage");
+  stage.addEventListener("wheel", (e) => {
+    e.preventDefault();
+    if (!IE.work) return;
+    IE.zoom = Math.max(0.2, Math.min(6, IE.zoom * (e.deltaY < 0 ? 1.15 : 1 / 1.15)));
+    draw();
+  }, { passive: false });
+
+  let cropDrag = null;
+  stage.addEventListener("mousedown", (e) => {
+    if (IE.mode !== "crop" || !IE.work) return;
+    const cr = $("ieCanvas").getBoundingClientRect();
+    cropDrag = {
+      cr,
+      x0: Math.min(Math.max(e.clientX - cr.left, 0), cr.width),
+      y0: Math.min(Math.max(e.clientY - cr.top, 0), cr.height),
+    };
+    e.preventDefault();
+  });
+  stage.addEventListener("mousemove", (e) => {
+    if (!cropDrag) return;
+    const { cr, x0, y0 } = cropDrag;
+    const x1 = Math.min(Math.max(e.clientX - cr.left, 0), cr.width);
+    const y1 = Math.min(Math.max(e.clientY - cr.top, 0), cr.height);
+    const sr = stage.getBoundingClientRect();
+    const box = $("ieCropBox");
+    box.classList.remove("hidden");
+    box.style.left = (cr.left - sr.left + Math.min(x0, x1)) + "px";
+    box.style.top = (cr.top - sr.top + Math.min(y0, y1)) + "px";
+    box.style.width = Math.abs(x1 - x0) + "px";
+    box.style.height = Math.abs(y1 - y0) + "px";
+    const kx = IE.work.width / cr.width;
+    const ky = IE.work.height / cr.height;
+    $("ieCropSize").textContent =
+      `裁剪后约 ${Math.round(Math.abs(x1 - x0) * kx)}×${Math.round(Math.abs(y1 - y0) * ky)} 像素`;
+  });
+  window.addEventListener("mouseup", () => { cropDrag = null; });
 }
 
 bindEvents();

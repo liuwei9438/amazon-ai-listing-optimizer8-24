@@ -238,6 +238,71 @@ body {
 }
 @keyframes shine { to { background-position: -200% 0; } }
 
+/* ---------- V3（D1.2.0）：图片集编辑（ERP 式格子）+ 图片编辑器 ---------- */
+.d-slots { display: flex; gap: 8px; flex-wrap: wrap; }
+.slot {
+  position: relative; width: 64px; height: 64px;
+  border: 1px solid #e6e8eb; border-radius: 8px; background: #fafafa;
+  cursor: pointer; overflow: hidden; flex-shrink: 0;
+}
+.slot img { width: 100%; height: 100%; object-fit: contain; }
+.slot:hover { border-color: #ff9900; }
+.slot.dragover { border-color: #ff9900; box-shadow: 0 0 0 2px #ff990066; }
+.slot .del, .slot .star {
+  position: absolute; top: 2px; width: 18px; height: 18px; line-height: 17px;
+  text-align: center; background: rgba(20,28,40,.62); color: #fff;
+  border-radius: 50%; font-size: 11px; display: none; z-index: 2;
+}
+.slot .del { right: 2px; }
+.slot .star { left: 2px; }
+.slot:hover .del, .slot.ismain:hover .star { display: block; }
+.slot .del:hover { background: #c0392b; }
+.slot .star:hover { background: #ff9900; color: #232f3e; }
+.slot .mb {
+  position: absolute; bottom: 0; left: 0; right: 0; z-index: 1;
+  background: rgba(255,153,0,.92); color: #232f3e;
+  font-size: 10px; font-weight: 800; text-align: center;
+}
+.slot.add {
+  display: flex; flex-direction: column; align-items: center;
+  justify-content: center; color: #98a2ad; border-style: dashed;
+  font-size: 20px; line-height: 1.1; user-select: none;
+}
+.slot.add i { font-style: normal; font-size: 11px; }
+.slot.add:hover { color: #ff9900; border-color: #ff9900; }
+.d-imgbar { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; align-items: center; }
+.d-imghint { font-size: 12px; color: #999; margin-top: 5px; }
+.d-sec .d-thumbs { display: flex; gap: 6px; flex-wrap: wrap; }
+.d-sec .d-thumbs img {
+  width: 52px; height: 52px; object-fit: contain;
+  border: 1px solid #e6e8eb; border-radius: 7px;
+  background: #fafafa; cursor: pointer;
+}
+.d-sec .d-thumbs img:hover { border-color: #ff9900; }
+
+/* 图片编辑器 */
+.ie-bar { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.ie-stage {
+  position: relative; background: #f2f3f5; border: 1px solid #e6e8eb;
+  border-radius: 10px; min-height: 320px; display: flex;
+  align-items: center; justify-content: center; overflow: hidden;
+}
+.ie-stage canvas { display: block; }
+.ie-stage.cropping { cursor: crosshair; }
+.ie-cropbox {
+  position: absolute; border: 2px dashed #ff9900;
+  background: rgba(255,153,0,.13); pointer-events: none; z-index: 3;
+}
+.ie-info { font-size: 12px; color: #888; }
+
+/* 大图预览 */
+.lightbox {
+  position: fixed; inset: 0; background: rgba(10,14,20,.92); z-index: 500;
+  display: flex; align-items: center; justify-content: center; cursor: zoom-out;
+}
+.lightbox img { max-width: 94vw; max-height: 90vh; }
+.lightbox .lb-close { position: absolute; top: 14px; right: 18px; }
+
 /* toast / busy */
 .toasts { position: fixed; right: 16px; top: 60px; z-index: 400; display: flex; flex-direction: column; gap: 8px; }
 .toast {

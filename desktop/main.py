@@ -40,7 +40,7 @@ ROOT = APP_DIR.parent                          # 仓库根
 os.chdir(ROOT)                                 # 引擎的 tasks/ 落在根目录
 sys.path.insert(0, str(ROOT))
 
-VERSION = "D1.1.0"
+VERSION = "D1.2.0"
 APP_DIR_NAME = "app"
 
 DEFAULT_CONFIG = {
@@ -417,6 +417,9 @@ def _index_apply_updates(updates: list) -> None:
 
             if "cat" in u:
                 it["cat"] = str(u.get("cat") or "")[:40]
+
+            if "img" in u:
+                it["img"] = str(u.get("img") or "")[:400]
 
             if "status" in u:
                 it["status"] = str(u.get("status") or "wait")
@@ -1277,6 +1280,87 @@ class Handler(BaseHTTPRequestHandler):
                 })
                 return
 
+            if url.path == "/api/image/proxy":
+                # 图片代理：浏览器直连加载不了的图（跨域编辑要读像素、
+                # 个别域名被卡）走本机 Python 拉一遍再吐给页面。
+                target = (q.get("u") or [""])[0].strip()
+                parsed = urlparse(target)
+                host = (parsed.hostname or "").lower()
+
+                if parsed.scheme not in ("http", "https") or not host:
+                    self._json({"ok": False, "error": "网址不对"}, 400)
+                    return
+
+                if (
+                    host in ("localhost", "::1")
+                    or host.startswith(
+                        ("127.", "192.168.", "10.", "169.254.", "0.")
+                    )
+                ):
+                    self._json({"ok": False, "error": "不允许的地址"}, 403)
+                    return
+
+                headers = {
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/126.0.0.0 Safari/537.36"
+                    ),
+                    "Referer": parsed.scheme + "://" + host + "/",
+                }
+
+                def _pull() -> requests.Response:
+                    return requests.get(
+                        target, timeout=25, headers=headers
+                    )
+
+                try:
+                    try:
+                        resp = _pull()
+                    except Exception:
+                        # 直连失败 → 本地代理再试一次（PROXY_MODE=proxy
+                        # 时环境变量已带代理，这里不会重复）
+                        if (
+                            PROXY_MODE == "direct"
+                            and CONFIG.get("proxy")
+                        ):
+                            resp = requests.get(
+                                target,
+                                timeout=25,
+                                headers=headers,
+                                proxies={
+                                    "http": CONFIG["proxy"],
+                                    "https": CONFIG["proxy"],
+                                },
+                            )
+                        else:
+                            raise
+
+                    ctype = str(
+                        resp.headers.get("Content-Type") or ""
+                    ).split(";")[0].strip().lower()
+
+                    if resp.status_code != 200 or not ctype.startswith(
+                        "image/"
+                    ):
+                        self._json(
+                            {"ok": False, "error": "取不到图片"}, 502
+                        )
+                        return
+
+                    if len(resp.content) > 8 * 1024 * 1024:
+                        self._json(
+                            {"ok": False, "error": "图片超过 8MB"}, 413
+                        )
+                        return
+
+                    self._send(200, resp.content, ctype)
+                except Exception as exc:
+                    self._json(
+                        {"ok": False, "error": f"取图失败：{exc}"}, 502
+                    )
+                return
+
             self._json({"ok": False, "error": "not found"}, 404)
 
         except BrokenPipeError:
@@ -1642,6 +1726,165 @@ class Handler(BaseHTTPRequestHandler):
                         TASK["message"] = f"写回失败：{exc}"
 
                     self._json({"ok": False, "error": str(exc)}, 502)
+                return
+
+            if url.path == "/api/image/put":
+                # 编辑好的图片 / 本地新图 → 传 Worker 拿公开 HTTPS 链接
+                pid = re.sub(
+                    r"[^a-z0-9_-]", "", str(body.get("pid") or "edit").lower()
+                )[:40] or "edit"
+                ct = str(body.get("ct") or "image/jpeg")
+
+                if not ct.startswith("image/"):
+                    ct = "image/jpeg"
+
+                data_b64 = str(body.get("data_b64") or "")
+
+                if not data_b64:
+                    self._json(
+                        {"ok": False, "error": "没有图片数据"}, 400
+                    )
+                    return
+
+                if len(data_b64) > 4400000:
+                    self._json(
+                        {"ok": False, "error": "图片太大（超过 3MB）"}, 413
+                    )
+                    return
+
+                try:
+                    base64.b64decode(data_b64)
+                except Exception:
+                    self._json(
+                        {"ok": False, "error": "图片数据无效"}, 400
+                    )
+                    return
+
+                resp = src_api(
+                    "/img_put",
+                    _prod_auth()
+                    | {"pid": pid, "ct": ct, "data_b64": data_b64},
+                    timeout=60,
+                )
+                self._json(resp)
+                return
+
+            if url.path == "/api/product/images":
+                # 保存图片集修改：重排 raw 各行的 产品图/简介图 →
+                # /prod_upsert 回写（同 pid 合并更新，优化结果/标记不动），
+                # 再用 /prod_update 同步主图（清空时也能清掉卡片缩略图）。
+                pid = str(body.get("pid") or "").strip()
+                imgs_in = body.get("imgs")
+
+                if not pid or not isinstance(imgs_in, list):
+                    self._json(
+                        {"ok": False, "error": "参数不对"}, 400
+                    )
+                    return
+
+                final: list[str] = []
+                seen: set[str] = set()
+
+                for u in imgs_in[:60]:
+                    u = str(u or "").strip()[:500]
+
+                    if u.startswith(("http://", "https://")) and u not in seen:
+                        seen.add(u)
+                        final.append(u)
+
+                try:
+                    data = src_api(
+                        "/prod_list", _prod_auth() | {"pid": pid},
+                        timeout=30,
+                    )
+                except Exception as exc:
+                    self._json({"ok": False, "error": str(exc)}, 502)
+                    return
+
+                rec = (data.get("product") or {}) if data.get("ok") else {}
+
+                if not rec:
+                    self._json(
+                        {"ok": False, "error": "产品不存在"}, 404
+                    )
+                    return
+
+                raw_rows = rec.get("raw") or []
+
+                if not raw_rows:
+                    self._json({
+                        "ok": False,
+                        "error": (
+                            "这条产品资料不全（没有原始行），改不了图片。"
+                            "重新导入同一份 Excel 补全后即可编辑。"
+                        ),
+                    }, 400)
+                    return
+
+                # 逐行保留还在最终清单里的图（行内顺序不变）——导出和
+                # 网页版仍能看到每行自己的 产品图/简介图。整份清单的
+                # 顺序存在第一行的 image_urls：前端拼图集时逐行去重，
+                # 第一行的完整顺序就是显示顺序（拖动排序才存得住）。
+                final_set = set(final)
+
+                for row in raw_rows:
+                    iu = [
+                        u for u in (row.get("image_urls") or [])
+                        if str(u) in final_set
+                    ]
+                    diu = [
+                        u for u in (row.get("detail_image_urls") or [])
+                        if str(u) in final_set
+                    ]
+                    row["image_urls"] = iu
+                    row["detail_image_urls"] = diu
+                    rd = dict(row.get("raw_data") or {})
+                    rd["产品图"] = "\n".join(iu)
+                    rd["简介图"] = "\n".join(diu)
+                    row["raw_data"] = rd
+
+                first = raw_rows[0]
+                first["image_urls"] = list(final)
+                first["raw_data"] = dict(first.get("raw_data") or {})
+                first["raw_data"]["产品图"] = "\n".join(final)
+
+                main = final[0] if final else ""
+                product = {
+                    "pid": pid,
+                    "sku": str(rec.get("sku") or ""),
+                    "title": str(rec.get("title") or ""),
+                    "model": str(rec.get("model") or ""),
+                    "cat": str(rec.get("cat") or ""),
+                    "kw": str(rec.get("kw") or ""),
+                    "raw": raw_rows,
+                }
+                # 主图跟 raw 一次原子写完（upsert 不收空值，清空场景
+                # 用 img_clear 显式清——绝不再补一发 prod_update 改图，
+                # 那个读-改-写会撞 KV 旧副本把新 raw 冲掉）
+                if main:
+                    product["img"] = main
+                else:
+                    product["img_clear"] = True
+
+                try:
+                    resp = src_api(
+                        "/prod_upsert",
+                        _prod_auth()
+                        | {"by": _logged_user()[:32], "products": [product]},
+                        timeout=90,
+                    )
+
+                    if not resp.get("ok"):
+                        raise RuntimeError(
+                            str(resp.get("error") or "保存图片失败")
+                        )
+                except Exception as exc:
+                    self._json({"ok": False, "error": str(exc)}, 502)
+                    return
+
+                _index_apply_updates([{"pid": pid, "img": main}])
+                _index_heal()
+                self._json({"ok": True, "n": len(final)})
                 return
 
             if url.path == "/api/export":
