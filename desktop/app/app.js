@@ -115,7 +115,11 @@ function enterApp() {
   $("btnAi").classList.toggle("hidden", !p.admin);
   $("selScope").classList.toggle("hidden", !p.admin);
   S.sel = new Set(JSON.parse(localStorage.getItem("wz_sel") || "[]"));
-  loadProducts();                       // 磁盘缓存瞬间出列表
+  loadProducts()                        // 磁盘缓存瞬间出列表
+    .then(() => {
+      const m = location.hash.match(/^#pid=(.+)$/);  // 深链/自测：#pid=xxx 直接开详情
+      if (m) openDetail(decodeURIComponent(m[1]));
+    });
   setTimeout(() => loadProducts(true), 1200);  // 随后拉最新
   pollTask();  // 万一上次任务还在跑
 }
@@ -288,8 +292,7 @@ function renderGrid() {
       <div class="t" title="${esc(it.title)}">${esc(String(it.title || "（无标题）").slice(0, 60))}</div>
       <div class="meta">${meta}</div>
       <div class="acts">
-        ${ro ? "" : `<button class="btn ${on ? "on" : ""}" data-act="sel">${on ? "☑ 已选中" : "☐ 选择"}</button>`}
-        <button class="btn" data-act="det">📄 详情</button>
+        ${ro ? `<span class="hint">👁 点卡片看详情</span>` : `<button class="btn ${on ? "on" : ""}" data-act="sel">${on ? "☑ 已选中" : "☐ 选择"}</button>`}
       </div>
     </div>`;
   }).join("");
@@ -324,62 +327,100 @@ function renderSelBar() {
   $("btnExport").disabled = S.sel.size === 0;
 }
 
-/* ---------- 详情 ---------- */
+/* ---------- 详情：点卡片立刻秒开（列表缓存先画壳，资料到了再填） ---------- */
 
-async function openDetail(pid) {
-  try {
-    busy(true, "读取产品…");
-    const it = S.items.find((x) => String(x.pid) === String(pid)) || {};
-    const owner = readOnly() ? String(it.owner || "") : "";
-    const r = await api(
-      `/api/product?pid=${encodeURIComponent(pid)}${owner ? `&owner=${encodeURIComponent(owner)}` : ""}`
-    );
-    renderDetail(r.product || {}, it);
-    $("dlgDetail").classList.remove("hidden");
-  } catch (e) {
-    toast(e.message, "err");
-  } finally {
-    busy(false);
-  }
+function openDetail(pid) {
+  pid = String(pid);
+  const it = S.items.find((x) => String(x.pid) === pid) || { pid };
+  renderDetailShell(it);
+  $("dlgDetail").classList.remove("hidden");
+
+  const owner = readOnly() ? String(it.owner || "") : "";
+  api(`/api/product?pid=${encodeURIComponent(pid)}${owner ? `&owner=${encodeURIComponent(owner)}` : ""}`)
+    .then((r) => fillDetail(r.product || {}, it))
+    .catch((e) => {
+      const el = $("dLoading");
+      if (el) el.innerHTML = `<div class="warn">⚠️ 详细资料读取失败：${esc(e.message)}（基础信息还在，关掉重开一次即可）</div>`;
+    });
 }
 
-function renderDetail(rec, it) {
-  const opt = rec.opt || {};
-  const raw = rec.raw || [];
-  const ro = readOnly();
-  const status = ["wait", "found", "none"].includes(String(rec.status)) ? String(rec.status) : "wait";
-  const st = stateOf(it.pid ? it : { has_opt: !!opt.title, n_rows: raw.length });
-
-  const img = String(opt.image || rec.img || "").trim();
-  const parts = [];
-
-  parts.push(`<div class="d-head">
-    <div class="d-img">${img
-      ? `<img referrerpolicy="no-referrer" src="${esc(img)}" onerror="this.remove()">`
-      : "（无图片）"}</div>
-    <div class="d-info">
-      <div class="line"><b>${esc(String(rec.title || "（无标题）").slice(0, 90))}</b></div>
-      <div class="line">SKU：<b>${esc(rec.sku || "—")}</b>　型号：<b>${esc(rec.model || "—")}</b></div>
-      <div class="line">分类：<b>${esc(rec.cat || "未分类")}</b>　资料：<b>${raw.length} 行</b>
-      　状态：<b>${BADGE[st][0]}</b></div>
-      ${opt.at ? `<div class="line">上次优化：${fmtMs(opt.at)}</div>` : ""}
-      ${readOnly() && rec.owner ? `<div class="line">👤 ${esc(rec.owner)}</div>` : ""}
-    </div>
-  </div>`);
-
-  if (!ro) {
-    parts.push(`<div class="d-edit">
+function dEditRow(cat, status) {
+  return `<div class="d-edit">
       <div>标记<select id="dStatus" class="inp">
         <option value="wait" ${status === "wait" ? "selected" : ""}>⚪ 待找货</option>
         <option value="found" ${status === "found" ? "selected" : ""}>✅ 已找到</option>
         <option value="none" ${status === "none" ? "selected" : ""}>❌ 没找到</option>
       </select></div>
-      <div class="grow">分类<input id="dCat" class="inp" value="${esc(rec.cat || "")}" maxlength="40"></div>
+      <div class="grow">分类<input id="dCat" class="inp" value="${esc(cat || "")}" maxlength="40"></div>
       <button id="dSave" class="btn primary">💾 保存标记</button>
       <button id="dOpt1" class="btn">🚀 优化这个产品</button>
-    </div>`);
-  }
+    </div>`;
+}
 
+function dHead(img, title, sku, model, extra) {
+  return `<div class="d-head">
+    <div class="d-img-wrap">
+      <div class="d-img">${img
+        ? `<img id="dMainImg" referrerpolicy="no-referrer" src="${esc(img)}" onerror="this.remove()">`
+        : "（无图片）"}</div>
+      <div id="dThumbs" class="d-thumbs"></div>
+    </div>
+    <div class="d-info">
+      <div class="line"><b>${esc(String(title || "（无标题）").slice(0, 90))}</b></div>
+      <div class="line">SKU：<b>${esc(sku || "—")}</b>　型号：<b>${esc(model || "—")}</b></div>
+      ${extra}
+    </div>
+  </div>`;
+}
+
+/* 秒开的壳：全部来自列表缓存，零网络请求 */
+function renderDetailShell(it) {
+  const st = stateOf(it);
+  const extra =
+    `<div class="line">分类：<b>${esc(it.cat || "未分类")}</b>　资料：<b>${Number(it.n_rows) || 0} 行</b>　状态：<b>${BADGE[st][0]}</b></div>`
+    + (readOnly() && it.owner ? `<div class="line">👤 ${esc(String(it.owner).slice(0, 16))}</div>` : "");
+
+  $("dTitle").textContent = "📋 产品详情";
+  $("dBody").innerHTML =
+    dHead(String(it.img || "").trim(), it.title, it.sku, it.model, extra)
+    + (readOnly() ? "" : dEditRow(
+        it.cat,
+        ["wait", "found", "none"].includes(String(it.status)) ? String(it.status) : "wait",
+      ))
+    + `<div id="dLoading" class="d-sec"><div class="skel"></div><div class="skel" style="width:70%"></div><div class="skel" style="width:45%"></div></div>`;
+  $("dBody").dataset.pid = String(it.pid || "");
+  bindDetailActs();
+}
+
+/* 资料到了：完整重画（图片集 + AI 结果 + 资料明细 + 变体） */
+function fillDetail(rec, it) {
+  const opt = rec.opt || {};
+  const raw = rec.raw || [];
+  const ro = readOnly();
+  const status = ["wait", "found", "none"].includes(String(rec.status)) ? String(rec.status) : "wait";
+  const st = stateOf({ has_opt: !!(opt.title || (opt.bullets || []).length), n_rows: raw.length });
+
+  // 图片集：产品图 + 简介图，去重
+  const imgs = [];
+  raw.forEach((r) => {
+    (r.image_urls || []).concat(r.detail_image_urls || []).forEach((u) => {
+      u = String(u || "").trim();
+      if (u && !imgs.includes(u)) imgs.push(u.slice(0, 500));
+    });
+  });
+  const mainImg = String(opt.image || rec.img || imgs[0] || "").trim();
+
+  const extra =
+    `<div class="line">分类：<b>${esc(rec.cat || "未分类")}</b>　资料：<b>${raw.length} 行</b>　状态：<b>${BADGE[st][0]}</b></div>`
+    + (opt.at ? `<div class="line">上次优化：${fmtMs(opt.at)}</div>` : "")
+    + `<div class="line">导入：${fmtMs(rec.created)}　更新：${fmtMs(rec.updated)}</div>`
+    + (ro && rec.owner ? `<div class="line">👤 ${esc(rec.owner)}</div>` : "");
+
+  const parts = [dHead(mainImg, rec.title || it.title, rec.sku, it.model, extra)];
+
+  if (!ro) parts.push(dEditRow(rec.cat, status));
+
+  // AI 结果
   if (opt.title || (opt.bullets || []).length || opt.description) {
     const sec = [];
     if (opt.title) sec.push(`<div class="txt"><b>标题：</b>${esc(opt.title)}</div>`);
@@ -392,12 +433,32 @@ function renderDetail(rec, it) {
     if ((opt.seo || []).length)
       sec.push(`<div class="txt"><b>SEO 关键词：</b>${esc((opt.seo || []).slice(0, 10).join("、"))}</div>`);
     parts.push(`<div class="d-sec"><h4>🤖 AI 优化结果</h4>${sec.join("")}</div>`);
-  } else if (raw.length) {
-    parts.push(`<div class="d-sec"><h4>🤖 AI 优化结果</h4><div class="txt" style="color:#999">还没优化过。勾选后点「🚀 AI 优化」，结果会挂在这个产品上。</div></div>`);
   } else {
-    parts.push(`<div class="d-sec"><div class="warn">⚠️ 资料不全：旧库数据没有存完整资料。重新导入同一份 Excel 即可补全（相同 SKU 自动合并）。</div></div>`);
+    parts.push(`<div class="d-sec"><h4>🤖 AI 优化结果</h4><div class="txt" style="color:#999">还没优化过。点上面「🚀 优化这个产品」，跑完结果自动挂上来。</div></div>`);
   }
 
+  // 资料明细：采集/导入的 20 列原始资料全部展示
+  if (raw.length) {
+    parts.push(`<div class="d-sec"><h4>📋 资料明细（原始资料 ${raw.length} 行，点行标题展开/收起）</h4>`
+      + raw.map((r, idx) => {
+          const rd = r.raw_data || {};
+          const label = `第 ${idx + 1} 行 · ${String(rd["SKU"] || rd["父SKU(必填)"] || "—").slice(0, 24)} · ${String(rd["标题(必填)"] || "").slice(0, 34)}`;
+          const rows = Object.entries(rd)
+            .filter(([k, v]) => v !== "" && v != null && k !== "产品图" && k !== "简介图")
+            .map(([k, v]) => `<tr><td class="k">${esc(k)}</td><td>${
+              k === "参考网址" && String(v).startsWith("http")
+                ? `<a href="${esc(String(v))}" target="_blank" rel="noopener">${esc(String(v).slice(0, 60))}</a>`
+                : esc(String(v))
+            }</td></tr>`)
+            .join("");
+          return `<details class="rawrow"${idx === 0 ? " open" : ""}><summary>${esc(label)}</summary><table>${rows || '<tr><td>（空行）</td></tr>'}</table></details>`;
+        }).join("")
+      + `</div>`);
+  } else {
+    parts.push(`<div class="d-sec"><div class="warn">⚠️ 资料不全：这条产品没存完整资料。用「📥 导入产品」传同一份 Excel 即可补全（相同 SKU 自动合并，不会重复）。</div></div>`);
+  }
+
+  // 变体
   const vars = rec.variants || [];
   if (vars.length) {
     parts.push(`<div class="d-sec"><h4>变体（${vars.length} 个）</h4>
@@ -406,22 +467,33 @@ function renderDetail(rec, it) {
       </table></div>`);
   }
 
-  $("dBody").innerHTML = parts.join("");
   $("dTitle").textContent = "📋 产品详情";
+  $("dBody").innerHTML = parts.join("");
   $("dBody").dataset.pid = String(rec.pid || it.pid || "");
 
-  const bind = (id, fn) => {
-    const el = $(id);
-    if (el) el.onclick = fn;
+  // 缩略图条（点了换主图）
+  $("dThumbs").innerHTML = imgs.slice(0, 24).map((u) =>
+    `<img src="${esc(u)}" data-thumb="${esc(u)}" loading="lazy" referrerpolicy="no-referrer" onerror="this.remove()" title="点击看大图">`
+  ).join("");
+
+  bindDetailActs();
+}
+
+function bindDetailActs() {
+  $("dBody").onclick = (e) => {
+    const th = e.target.closest("[data-thumb]");
+    if (th && $("dMainImg")) $("dMainImg").src = th.dataset.thumb;
   };
-  bind("dSave", saveDetailMark);
-  bind("dOpt1", () => {
+  const save = $("dSave");
+  if (save) save.onclick = saveDetailMark;
+  const opt1 = $("dOpt1");
+  if (opt1) opt1.onclick = () => {
     const pid = $("dBody").dataset.pid;
     S.sel = new Set([pid]);
     saveSel();
     closeModal("dlgDetail");
     startOptimize();
-  });
+  };
 }
 
 async function saveDetailMark() {
@@ -706,16 +778,18 @@ function bindEvents() {
   };
 
   $("grid").addEventListener("click", (e) => {
+    const card = e.target.closest(".card");
+    if (!card) return;
     const btn = e.target.closest("[data-act]");
-    if (!btn) return;
-    const pid = btn.closest(".card").dataset.pid;
 
-    if (btn.dataset.act === "det") {
-      openDetail(pid);
-    } else {
+    if (btn && btn.dataset.act === "sel") {
+      const pid = card.dataset.pid;
       if (S.sel.has(pid)) S.sel.delete(pid); else S.sel.add(pid);
       saveSel(); renderGrid(); renderSelBar();
+      return;
     }
+
+    openDetail(card.dataset.pid);   // 点图片/标题/卡片任何地方 → 立刻展开详情
   });
 
   $("btnSelAll").onclick = () => {

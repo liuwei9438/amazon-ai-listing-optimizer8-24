@@ -210,6 +210,34 @@ body {
 .d-edit > div { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: #666; }
 .ai-status { font-size: 13px; color: #555; background: #f4f6f8; border-radius: 9px; padding: 8px 12px; }
 
+/* ---------- V2：点卡片开详情 + 详情图片集 / 资料明细 ---------- */
+.card { cursor: pointer; transition: border-color .15s, box-shadow .15s; }
+.card:hover { border-color: #ff9900; box-shadow: 0 4px 18px rgba(255,153,0,.16); }
+.card .acts .hint { font-size: 12px; color: #999; align-self: center; }
+.d-img-wrap { width: 236px; min-width: 236px; }
+.d-thumbs {
+  display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px;
+  max-height: 118px; overflow-y: auto;
+}
+.d-thumbs img {
+  width: 52px; height: 52px; object-fit: contain;
+  border: 1px solid #e6e8eb; border-radius: 7px;
+  background: #fafafa; cursor: pointer;
+}
+.d-thumbs img:hover { border-color: #ff9900; }
+.d-sec details.rawrow {
+  border: 1px solid #eef0f3; border-radius: 9px;
+  padding: 6px 10px; margin-bottom: 6px;
+}
+.d-sec details.rawrow summary { cursor: pointer; font-weight: 600; font-size: 13px; }
+.d-sec table td.k { background: #fafbfc; color: #555; white-space: nowrap; width: 120px; }
+.skel {
+  height: 14px; border-radius: 7px; margin: 10px 0;
+  background: linear-gradient(90deg,#eef0f3 25%,#e2e6ea 50%,#eef0f3 75%);
+  background-size: 200% 100%; animation: shine 1.2s infinite;
+}
+@keyframes shine { to { background-position: -200% 0; } }
+
 /* toast / busy */
 .toasts { position: fixed; right: 16px; top: 60px; z-index: 400; display: flex; flex-direction: column; gap: 8px; }
 .toast {
