@@ -509,30 +509,52 @@ function fillDetail(rec, it) {
     parts.push(`<div class="d-sec" id="dSecOpt"><h4>🤖 AI 优化结果</h4><div class="txt" style="color:#999">还没优化过。点上面「🚀 优化这个产品」，跑完结果自动挂上来。</div></div>`);
   }
 
-  // 资料明细：采集/导入的 20 列原始资料全部展示
+  // 资料明细（智赢式合并）：变体们的资料是一样的，公共部分只显示
+  // 一份；各行值不同的列（通常是 SKU）单独列一张「变体 SKU」表。
   if (raw.length) {
-    parts.push(`<div class="d-sec" id="dSecRaw"><h4>📋 资料明细（原始资料 ${raw.length} 行，点行标题展开/收起）${ro ? "" : ' <button id="dRawEdit" class="btn small">✏️ 编辑文字</button>'}</h4>`
-      + raw.map((r, idx) => {
-          const rd = r.raw_data || {};
-          const label = `第 ${idx + 1} 行 · ${String(rd["SKU"] || rd["父SKU(必填)"] || "—").slice(0, 24)} · ${String(rd["标题(必填)"] || "").slice(0, 34)}`;
-          const rows = Object.entries(rd)
-            .filter(([k, v]) => v !== "" && v != null && k !== "产品图" && k !== "简介图")
-            .map(([k, v]) => `<tr><td class="k">${esc(k)}</td><td>${
-              k === "参考网址" && String(v).startsWith("http")
-                ? `<a href="${esc(String(v))}" target="_blank" rel="noopener">${esc(String(v).slice(0, 60))}</a>`
-                : esc(String(v))
-            }</td></tr>`)
-            .join("");
-          return `<details class="rawrow"${idx === 0 ? " open" : ""}><summary>${esc(label)}</summary><table>${rows || '<tr><td>（空行）</td></tr>'}</table></details>`;
-        }).join("")
+    const keyOrder = [];
+    raw.forEach((r) => {
+      Object.keys(r.raw_data || {}).forEach((k) => {
+        if (!keyOrder.includes(k)) keyOrder.push(k);
+      });
+    });
+    const val = (r, k) => String((r.raw_data || {})[k] ?? "");
+    const hasAny = (k) => raw.some((r) => val(r, k) !== "");
+    const showable = (k) => k !== "产品图" && k !== "简介图" && hasAny(k);
+    const isCommon = (k) => raw.every((r) => val(r, k) === val(raw[0], k));
+    const commonKeys = keyOrder.filter((k) => showable(k) && isCommon(k));
+    const varKeys = keyOrder.filter((k) => showable(k) && !isCommon(k));
+
+    const cell = (k, v) =>
+      k === "参考网址" && String(v).startsWith("http")
+        ? `<a href="${esc(String(v))}" target="_blank" rel="noopener">${esc(String(v).slice(0, 60))}</a>`
+        : esc(String(v));
+    const commonTable = commonKeys.length
+      ? `<table>${commonKeys.map((k) =>
+          `<tr><td class="k">${esc(k)}</td><td>${cell(k, val(raw[0], k))}</td></tr>`).join("")}</table>`
+      : `<div class="d-imghint">（除变体列外没有其他资料）</div>`;
+    const multi = raw.length > 1;
+    const varTable = multi && varKeys.length
+      ? `<div class="d-sub">变体 SKU（${raw.length} 个，只有这些列各不相同）</div>
+         <table class="vartbl"><tr><th style="width:34px">#</th>${varKeys.map((k) => `<th>${esc(k)}</th>`).join("")}</tr>`
+        + raw.map((r, i) => `<tr><td class="k">${i + 1}</td>${
+            varKeys.map((k) => `<td>${cell(k, val(r, k))}</td>`).join("")
+          }</tr>`).join("")
+        + `</table>
+         <div class="d-sub">公共资料（${raw.length} 个变体共用这一份）</div>`
+      : "";
+
+    parts.push(`<div class="d-sec" id="dSecRaw"><h4>📋 资料明细${multi ? `（公共资料 1 份 + 变体 ${raw.length} 个 SKU）` : "（原始资料 1 行）"}${ro ? "" : ' <button id="dRawEdit" class="btn small">✏️ 编辑文字</button>'}</h4>`
+      + (multi ? varTable + commonTable : commonTable)
       + `</div>`);
   } else {
     parts.push(`<div class="d-sec"><div class="warn">⚠️ 资料不全：这条产品没存完整资料。用「📥 导入产品」传同一份 Excel 即可补全（相同 SKU 自动合并，不会重复）。</div></div>`);
   }
 
-  // 变体
+  // 变体（兜底：只有资料不全、没有 raw 行时才显示这张表；
+  // 正常产品的变体已并进上面「资料明细」的变体 SKU 表，不再重复）
   const vars = rec.variants || [];
-  if (vars.length) {
+  if (vars.length && !raw.length) {
     parts.push(`<div class="d-sec"><h4>变体（${vars.length} 个）</h4>
       <table><tr><th>SKU</th><th>属性</th><th>标题</th></tr>
       ${vars.map((v) => `<tr><td>${esc(v.sku || "")}</td><td>${esc(v.attr || "")}</td><td>${esc(String(v.title || "").slice(0, 40))}</td></tr>`).join("")}
@@ -780,38 +802,34 @@ function renderRawEdit() {
   const sec = $("dSecRaw");
   if (!sec || !D.rec) return;
   const raw = D.rec.raw || [];
-  sec.innerHTML = `<h4>📋 资料明细（编辑中，${raw.length} 行）</h4>
+  const r0 = raw[0] || {};
+  const rd = r0.raw_data || {};
+  const bl = Array.isArray(r0.bullets) && r0.bullets.length ? r0.bullets : ["", "", "", "", ""];
+  const five = [0, 1, 2, 3, 4].map((k) => bl[k] || "");
+  sec.innerHTML = `<h4>📋 资料明细（编辑公共资料，共 ${raw.length} 行）</h4>
     <div class="d-editform">
-    ${raw.map((r, i) => {
-      const rd = r.raw_data || {};
-      const bl = Array.isArray(r.bullets) && r.bullets.length ? r.bullets : ["", "", "", "", ""];
-      const five = [0, 1, 2, 3, 4].map((k) => bl[k] || "");
-      return `<div class="re-row">
-        <b>第 ${i + 1} 行 · ${esc(String(rd["SKU"] || rd["父SKU(必填)"] || "—").slice(0, 30))}</b>
-        <label>标题</label>
-        <textarea id="reT${i}" class="inp" rows="2" maxlength="600">${esc(String(rd["标题(必填)"] || r.title || ""))}</textarea>
-        <label>五点描述（要点 1-5）</label>
-        ${five.map((b, k) => `<textarea id="reB${i}_${k}" class="inp" rows="2" maxlength="600" placeholder="要点${k + 1}">${esc(b)}</textarea>`).join("")}
-        <label>简介</label>
-        <textarea id="reD${i}" class="inp" rows="5" maxlength="8000">${esc(String(rd["简介"] || r.description || ""))}</textarea>
-      </div>`;
-    }).join("")}
+      <label>标题</label>
+      <textarea id="reT" class="inp" rows="2" maxlength="600">${esc(String(rd["标题(必填)"] || r0.title || ""))}</textarea>
+      <label>五点描述（要点 1-5）</label>
+      ${five.map((b, k) => `<textarea id="reB${k}" class="inp" rows="2" maxlength="600" placeholder="要点${k + 1}">${esc(b)}</textarea>`).join("")}
+      <label>简介</label>
+      <textarea id="reD" class="inp" rows="5" maxlength="8000">${esc(String(rd["简介"] || r0.description || ""))}</textarea>
       <div class="d-imgbar">
         <button id="reSave" class="btn small primary">💾 保存资料</button>
         <button id="reCancel" class="btn small">取消</button>
       </div>
-      <div class="d-imghint">这里改的是导入的原始资料（AI 优化的底稿）。已优化过的产品，导出时用的是「AI 优化结果」里的内容</div>
+      <div class="d-imghint">变体的公共资料是同一份：保存后应用到全部 ${raw.length} 行（各变体自己的 SKU 不变）。这里改的是导入的原始资料（AI 优化的底稿）；已优化过的产品，导出时用的是「AI 优化结果」里的内容</div>
     </div>`;
 }
 
 async function saveRawEdit() {
   const raw = (D.rec && D.rec.raw) || [];
-  const rows = raw.map((r, i) => ({
-    i,
-    title: (($("reT" + i) || {}).value || "").trim(),
-    bullets: [0, 1, 2, 3, 4].map((k) => ((($("reB" + i + "_" + k) || {}).value) || "").trim()),
-    description: (($("reD" + i) || {}).value || "").trim(),
-  }));
+  const one = {
+    title: (($("reT") || {}).value || "").trim(),
+    bullets: [0, 1, 2, 3, 4].map((k) => ((($("reB" + k) || {}).value) || "").trim()),
+    description: (($("reD") || {}).value || "").trim(),
+  };
+  const rows = raw.map((r, i) => ({ i, ...one }));
 
   try {
     busy(true, "保存资料…");
