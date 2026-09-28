@@ -40,7 +40,7 @@ ROOT = APP_DIR.parent                          # 仓库根
 os.chdir(ROOT)                                 # 引擎的 tasks/ 落在根目录
 sys.path.insert(0, str(ROOT))
 
-VERSION = "D1.2.1"
+VERSION = "D1.3.0"
 APP_DIR_NAME = "app"
 
 DEFAULT_CONFIG = {
@@ -416,7 +416,7 @@ def _index_apply_updates(updates: list) -> None:
             hit = True
 
             if "cat" in u:
-                it["cat"] = str(u.get("cat") or "")[:40]
+                it["cat"] = str(u.get("cat") or "")[:120]
 
             if "title" in u:
                 it["title"] = str(u.get("title") or "")[:200]
@@ -1266,6 +1266,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._json(data)
                 return
 
+            # 分类库（D1.3.0 智赢式分类树）：全局共享文档，
+            # 首次读取自动预置智赢同款 8 顶级分类。
+            if url.path == "/api/cats":
+                if not _logged_user():
+                    self._json({"ok": False, "error": "未登录"}, 401)
+                    return
+
+                resp = src_api(
+                    "/cat_lib", _prod_auth() | {"action": "get"},
+                    timeout=30,
+                )
+                self._json(resp)
+                return
+
             if url.path == "/api/optimize/status":
                 self._json({"ok": True, "task": _poll_task()})
                 return
@@ -1435,6 +1449,24 @@ class Handler(BaseHTTPRequestHandler):
 
             if not _logged_user():
                 self._json({"ok": False, "error": "未登录"}, 401)
+                return
+
+            if url.path == "/api/cats":
+                # 保存分类树（新建/改名/删除/恢复——前端算好整棵树传上来）
+                lib_in = body.get("lib")
+
+                if not isinstance(lib_in, dict):
+                    self._json(
+                        {"ok": False, "error": "分类数据不对"}, 400
+                    )
+                    return
+
+                resp = src_api(
+                    "/cat_lib",
+                    _prod_auth() | {"action": "save", "lib": lib_in},
+                    timeout=30,
+                )
+                self._json(resp)
                 return
 
             if url.path == "/api/products/refresh":

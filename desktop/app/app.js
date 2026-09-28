@@ -10,6 +10,15 @@ const S = {
   scope: "",
   filtered: null,
   pollTimer: null, taskOpen: false,
+  /* D1.3.0 智赢式分类 */
+  view: "list",            // list / cat / recycle
+  lib: null,               // {nodes:[{name,parent}], deleted:[{path,at}], rev}
+  viewCat: "",             // 分类视图当前选中（""=全部，"__none__"=未分类）
+  expanded: null,          // Set 展开路径（localStorage 记忆）
+  treeQ: "",               // 分类搜索
+  moveCtx: null,           // 移动分类弹窗上下文
+  catEditCtx: null,        // 新增/修改分类上下文
+  catDelCtx: null,         // 删除/彻底删除上下文
 };
 
 /* D = 当前详情弹窗的图片编辑状态；IE = 图片编辑器状态 */
@@ -119,6 +128,8 @@ function enterApp() {
   $("btnAi").classList.toggle("hidden", !p.admin);
   $("selScope").classList.toggle("hidden", !p.admin);
   S.sel = new Set(JSON.parse(localStorage.getItem("wz_sel") || "[]"));
+  S.expanded = new Set(JSON.parse(localStorage.getItem("wz_tree_open") || "[]"));
+  loadCats();                            // 分类树（全局共享，预置智赢 8 顶级）
   loadProducts()                        // 磁盘缓存瞬间出列表
     .then(() => {
       const m = location.hash.match(/^#pid=(.+)$/);  // 深链/自测：#pid=xxx 直接开详情
@@ -189,10 +200,19 @@ function computeFiltered() {
     ? now - days[S.date] * 86400000 : null;
   const needle = S.q.replace(/\s+/g, "").toLowerCase();
 
+  /* 分类筛选：值是分类路径（"3C数码/手机壳"），选中父分类=含全部子孙；
+     "__none__" = 未分类。列表视图用 selCat（S.cat），分类视图用树（S.viewCat） */
+  const catSel = S.view === "cat" ? S.viewCat : S.cat;
+
   let list = S.items.filter((it) => {
     if (S.status && stateOf(it) !== S.status) return false;
 
-    if (S.cat && (it.cat || "未分类") !== S.cat) return false;
+    if (catSel === "__none__") {
+      if (String(it.cat || "").trim()) return false;
+    } else if (catSel) {
+      const c = String(it.cat || "");
+      if (c !== catSel && !c.startsWith(catSel + "/")) return false;
+    }
 
     if (lo !== null) {
       const c = Number(it.created) || 0;
@@ -226,6 +246,10 @@ function renderAll() {
   renderGrid();
   renderPager();
   renderSelBar();
+  applyView();
+  renderTree();
+  renderCatHead();
+  renderRecycle();
 }
 
 function renderTabs() {
@@ -252,15 +276,18 @@ function renderTabs() {
 }
 
 function renderCatSelect() {
-  const cats = [...S.cats];
-  if (S.items.some((it) => !String(it.cat || "").trim())
-      && !cats.includes("未分类")) cats.push("未分类");
-
+  /* 下拉也按树形缩进展示（智赢是级联，桌面窄下拉用全角空格缩进平替） */
+  const rows = treeRows().rows;
+  const cur = S.cat;
+  const has = !cur || cur === "__none__" || rows.some((r) => r.path === cur);
   $("selCat").innerHTML =
     `<option value="">全部分类</option>` +
-    cats.map((c) =>
-      `<option value="${esc(c)}" ${S.cat === c ? "selected" : ""}>${esc(c)}</option>`
-    ).join("");
+    `<option value="__none__" ${cur === "__none__" ? "selected" : ""}>未分类</option>` +
+    rows.map((r) =>
+      `<option value="${esc(r.path)}" ${cur === r.path ? "selected" : ""}>` +
+      `${"　".repeat(r.depth)}${esc(r.name)}${r.total ? `（${r.total}）` : ""}</option>`
+    ).join("") +
+    (has ? "" : `<option value="${esc(cur)}" selected>${esc(cur)}</option>`);
 }
 
 function renderGrid() {
@@ -281,7 +308,7 @@ function renderGrid() {
     const srcSt = String(it.status || "");
     const meta = [
       `SKU：${esc(String(it.sku || "—").slice(0, 24))}　型号：${esc(String(it.model || "—").slice(0, 20))}`,
-      `分类：${esc(String(it.cat || "未分类").slice(0, 20))}（资料 ${Number(it.n_rows) || 0} 行）`,
+      `分类：${esc(String(it.cat || "未分类").slice(0, 44))}（资料 ${Number(it.n_rows) || 0} 行）`,
       optMs ? `优化时间：${fmtMs(optMs)}` : "",
       srcSt === "found" ? "✅ 已找到供应商" : srcSt === "none" ? "❌ 没找到供应商" : "",
       ro && it.owner ? `<span class="owner">👤 ${esc(String(it.owner).slice(0, 16))}</span>` : "",
@@ -355,7 +382,8 @@ function dEditRow(cat, status) {
         <option value="found" ${status === "found" ? "selected" : ""}>✅ 已找到</option>
         <option value="none" ${status === "none" ? "selected" : ""}>❌ 没找到</option>
       </select></div>
-      <div class="grow">分类<input id="dCat" class="inp" value="${esc(cat || "")}" maxlength="40"></div>
+      <div class="grow d-cat-pick">分类<input id="dCat" class="inp" value="${esc(cat || "")}" maxlength="120" placeholder="点 📂 从分类树选择" readonly>
+        <button class="btn" onclick="openMove({ single: true, fill: 'dCat' })" title="从分类树选择">📂</button></div>
       <button id="dSave" class="btn primary">💾 保存标记</button>
       <button id="dOpt1" class="btn">🚀 优化这个产品</button>
     </div>`;
@@ -1042,25 +1070,419 @@ async function saveDetailMark() {
   }
 }
 
-/* ---------- 批量动作 ---------- */
+/* ---------- 分类树（D1.3.0 智赢式，严格对齐智赢交互） ----------
+   数据：S.lib = {nodes:[{name,parent}], deleted, rev}（全局共享，worker 存）；
+   产品的 cat 存完整路径（"3C数码/手机壳"）。树 = 文档定义 ∪ 产品里
+   实际出现的路径（老数据的单名字自动成为顶级分类，零迁移）。 */
 
-async function applyCat() {
-  const name = $("catInput").value.trim();
-  if (!name) { toast("先填分类名", "err"); return; }
+async function loadCats() {
+  try {
+    const r = await api("/api/cats");
+    S.lib = r.lib || { nodes: [], deleted: [], rev: 0 };
+    if (S.items.length || S.view !== "list") renderAll();
+  } catch (e) { /* 树拉不到不挡产品列表 */ }
+}
+
+async function saveLib(mut) {
+  const lib = {
+    nodes: (S.lib?.nodes || []).map((n) => ({ name: n.name, parent: n.parent })),
+    deleted: (S.lib?.deleted || []).map((d) => ({ path: d.path, at: d.at })),
+    rev: S.lib?.rev || 0,
+  };
+  mut(lib);
+  const r = await api("/api/cats", { lib });
+  S.lib = { nodes: lib.nodes, deleted: lib.deleted, rev: r.rev || lib.rev + 1 };
+  renderAll();
+}
+
+function buildTree() {
+  const root = { name: "", path: "", parent: "", children: new Map(), depth: -1 };
+  const ensure = (path) => {
+    if (!path) return root;
+    let node = root, p = "";
+    for (const seg of String(path).split("/")) {
+      p = p ? p + "/" + seg : seg;
+      if (!node.children.has(seg)) {
+        node.children.set(seg, {
+          name: seg, path: p, parent: node.path, children: new Map(), depth: node.depth + 1,
+        });
+      }
+      node = node.children.get(seg);
+    }
+    return node;
+  };
+  (S.lib?.nodes || []).forEach((n) => {
+    if (n && n.name) ensure(n.parent ? n.parent + "/" + n.name : n.name);
+  });
+  S.items.forEach((it) => {
+    const c = String(it.cat || "").trim();
+    if (c && !c.startsWith("/")) ensure(c);
+  });
+  return root;
+}
+
+/* 树的扁平行序列（渲染/计数/下拉共用） */
+function treeRows() {
+  const root = buildTree();
+  const exact = new Map();          // 路径 → 本类精确产品数
+  let none = 0;
+  S.items.forEach((it) => {
+    const c = String(it.cat || "").trim();
+    if (c) exact.set(c, (exact.get(c) || 0) + 1);
+    else none++;
+  });
+
+  const rows = [];
+  const walk = (node) => {
+    const kids = [...node.children.values()];
+    kids.sort((a, b) => a.name.localeCompare(b.name, "zh-Hans-CN"));
+    kids.forEach((k) => {
+      let total = exact.get(k.path) || 0;
+      rows.push(k);
+      walk(k);
+      // total 回填：父 = 自己 + 子孙（利用 rows 顺序回头算太绕，递归返回）
+      total += k._sub || 0;
+      k._total = total;
+      node._sub = (node._sub || 0) + total;
+    });
+  };
+  walk(root);
+  root._sub = root._sub || 0;
+  return { rows, root, exact, none };
+}
+
+function catLabel(path) {
+  return path === "__none__" ? "未分类" : (path || "全部产品");
+}
+
+/* 渲染树。target "#catTree"（管理树）或 "#moveTree"（弹窗单选树） */
+function renderTree(target = "#catTree") {
+  const box = $(target.slice(1));
+  if (!box) return;
+  const picker = target === "#moveTree";
+  const { rows, exact, none } = treeRows();
+  const q = S.treeQ.trim().toLowerCase();
+
+  const matchSet = new Set();        // 搜索命中 + 祖先链
+  if (q) {
+    rows.forEach((r) => {
+      if (r.name.toLowerCase().includes(q) || r.path.toLowerCase().includes(q)) {
+        let p = r.path;
+        while (p) { matchSet.add(p); const i = p.lastIndexOf("/"); p = i < 0 ? "" : p.slice(0, i); }
+        matchSet.add(r.path);
+        // 命中节点的子孙也显示
+        rows.forEach((r2) => { if (r2.path.startsWith(r.path + "/")) matchSet.add(r2.path); });
+      }
+    });
+  }
+  const visible = (r) => !q || matchSet.has(r.path);
+
+  const special = picker
+    ? `<div class="tree-node sp ${S.moveCtx?.sel === "__none__" ? "picked" : ""}" data-pick="__none__">
+         <span class="tw"></span><span class="tn">未分类</span><span class="tc">${none}</span></div>`
+    : `<div class="tree-node sp ${S.viewCat === "" ? "on" : ""}" data-zpath="">
+         <span class="tw"></span><span class="tn">全部产品</span><span class="tc">${S.items.length}</span></div>
+       <div class="tree-node sp ${S.viewCat === "__none__" ? "on" : ""}" data-zpath="__none__">
+         <span class="tw"></span><span class="tn">未分类</span><span class="tc">${none}</span></div>`;
+
+  const nodeHtml = (r) => {
+    const hasKids = r.children.size > 0;
+    const isOpen = picker || q ? true : S.expanded.has(r.path);
+    const cnt = exact.get(r.path) || 0;
+    return `<div class="tree-node ${!picker && S.viewCat === r.path ? "on" : ""} ${picker && S.moveCtx?.sel === r.path ? "picked" : ""}"
+        data-zpath="${esc(r.path)}" data-depth="${r.depth}" style="padding-left:${8 + r.depth * 16}px">
+        <span class="tw ${hasKids ? "" : "leaf"}" data-toggle="${esc(r.path)}">${isOpen ? "▾" : "▸"}</span>
+        <span class="tn" title="${esc(r.path)}">${esc(r.name)}</span>
+        <span class="tc">${cnt || ""}</span>
+        ${picker ? "" : `<span class="ti">
+          <button class="tib" data-tact="ren" title="修改名称">✏️</button>
+          <button class="tib" data-tact="add" title="新增子分类">📁+</button>
+          <button class="tib" data-tact="del" title="删除分类">🗑</button>
+        </span>`}
+      </div>`;
+  };
+
+  /* 深度优先渲染，父收起时子孙不输出 */
+  const out = [];
+  const emit = (r) => {
+    if (!visible(r)) return;
+    out.push(nodeHtml(r));
+    const isOpen = q || S.expanded.has(r.path);
+    if (isOpen) [...r.children.values()]
+      .sort((a, b) => a.name.localeCompare(b.name, "zh-Hans-CN"))
+      .forEach(emit);
+  };
+  if (!picker) {
+    const root = buildTree();
+    [...root.children.values()]
+      .sort((a, b) => a.name.localeCompare(b.name, "zh-Hans-CN"))
+      .forEach(emit);
+  } else {
+    rows.forEach((r) => {
+      /* 弹窗树：默认全展开（智赢弹窗就是全展开可滚） */
+      const hasKids = r.children.size > 0;
+      out.push(nodeHtml(r));
+    });
+  }
+
+  box.innerHTML = special + out.join("");
+}
+
+/* ---------- 分类 CRUD（对齐智赢：悬停图标 → 弹窗 → 确定） ---------- */
+
+function openCatEdit(ctx) {   // {mode:"add", parent} | {mode:"ren", path, name}
+  S.catEditCtx = ctx;
+  $("catEditTitle").textContent = ctx.mode === "add" ? "新增分类" : "修改分类";
+  $("ceParent").value = ctx.mode === "add"
+    ? (ctx.parent ? catLabel(ctx.parent) : "（顶级分类）")
+    : (ctx.path.includes("/") ? ctx.path.slice(0, ctx.path.lastIndexOf("/")) : "（顶级分类）");
+  $("ceName").value = ctx.mode === "ren" ? ctx.name : "";
+  $("dlgCatEdit").classList.remove("hidden");
+  setTimeout(() => $("ceName").focus(), 50);
+}
+
+async function catEditOk() {
+  const ctx = S.catEditCtx;
+  const name = $("ceName").value.trim();
+  if (!ctx) return;
+  if (!name) { toast("先填分类名称", "err"); return; }
+  if (name.includes("/")) { toast("分类名称里不能有 /", "err"); return; }
 
   try {
-    busy(true, "设置分类…");
-    await api("/api/products/update", {
-      updates: [...S.sel].map((pid) => ({ pid, cat: name })),
-    });
-    closeModal("dlgCat");
-    await loadProductsTwice();
-    toast(`✅ 已设置分类：${name}`, "ok");
+    if (ctx.mode === "add") {
+      const parent = ctx.parent || "";
+      if ((S.lib?.nodes || []).some((n) => n.parent === parent && n.name === name)) {
+        toast("这个分类已经存在了", "err"); return;
+      }
+      busy(true, "新增分类…");
+      await saveLib((lib) => lib.nodes.push({ name, parent }));
+      if (parent) S.expanded.add(parent);
+      localStorage.setItem("wz_tree_open", JSON.stringify([...S.expanded]));
+      toast(`✅ 已新增分类：${parent ? parent + "/" : ""}${name}`, "ok");
+    } else {
+      /* 改名：文档节点 + 产品 cat 前缀一起改 */
+      const oldPath = ctx.path;
+      const slash = oldPath.lastIndexOf("/");
+      const parent = slash < 0 ? "" : oldPath.slice(0, slash);
+      if ((S.lib?.nodes || []).some((n) => n.parent === parent && n.name === name)) {
+        toast("同级已经有同名分类了", "err"); return;
+      }
+      const newPath = parent ? parent + "/" + name : name;
+      const rePath = (p) => p === oldPath ? newPath
+        : p.startsWith(oldPath + "/") ? newPath + p.slice(oldPath.length) : p;
+      busy(true, "修改分类（含分类下的产品）…");
+      const updates = S.items
+        .filter((it) => {
+          const c = String(it.cat || "");
+          return c === oldPath || c.startsWith(oldPath + "/");
+        })
+        .map((it) => ({ pid: it.pid, cat: rePath(String(it.cat)) }));
+      if (updates.length) {
+        await api("/api/products/update", { updates });
+      }
+      /* 文档树重建：每个节点的完整路径过一遍 rePath 再拆回 name/parent */
+      await saveLib((lib) => {
+        lib.nodes = (S.lib?.nodes || []).map((n) => {
+          const full = rePath(n.parent ? n.parent + "/" + n.name : n.name);
+          const i = full.lastIndexOf("/");
+          return i < 0 ? { name: full, parent: "" }
+            : { name: full.slice(i + 1), parent: full.slice(0, i) };
+        });
+      });
+      S.expanded.add(newPath);
+      localStorage.setItem("wz_tree_open", JSON.stringify([...S.expanded]));
+      if (S.cat === oldPath) S.cat = newPath;
+      if (S.viewCat === oldPath) S.viewCat = newPath;
+      await loadProductsTwice();
+      toast(`✅ 已改为：${newPath}（${updates.length} 个产品跟着改）`, "ok");
+    }
+    closeModal("dlgCatEdit");
   } catch (e) {
     toast(e.message, "err");
   } finally {
     busy(false);
   }
+}
+
+function openCatDel(ctx) {    // {mode:"del", path} | {mode:"purge", path}
+  S.catDelCtx = ctx;
+  const { rows } = treeRows();
+  if (ctx.mode === "purge") {
+    $("catDelTip").innerHTML =
+      `此操作将会<b>彻底删除</b>该分类「${esc(ctx.path)}」，请谨慎操作`;
+  } else {
+    const node = rows.find((r) => r.path === ctx.path);
+    const nSub = rows.filter((r) => r.path.startsWith(ctx.path + "/")).length;
+    const nProd = S.items.filter((it) => {
+      const c = String(it.cat || "");
+      return c === ctx.path || c.startsWith(ctx.path + "/");
+    }).length;
+    $("catDelTip").innerHTML =
+      `此操作将会删除该分类「${esc(ctx.path)}」，请谨慎操作` +
+      (nSub ? `<br>其下 ${nSub} 个子分类会一起删除` : "") +
+      (nProd ? `<br>分类下的 <b>${nProd}</b> 个产品会变成「未分类」（产品不会被删除）` : "");
+  }
+  $("dlgCatDel").classList.remove("hidden");
+}
+
+async function catDelOk() {
+  const ctx = S.catDelCtx;
+  if (!ctx) return;
+  try {
+    if (ctx.mode === "purge") {
+      busy(true, "彻底删除…");
+      await saveLib((lib) => {
+        lib.deleted = lib.deleted.filter((d) => d.path !== ctx.path);
+      });
+      toast(`🗑 已彻底删除：${ctx.path}`, "ok");
+    } else {
+      busy(true, "删除分类…");
+      const path = ctx.path;
+      const updates = S.items
+        .filter((it) => {
+          const c = String(it.cat || "");
+          return c === path || c.startsWith(path + "/");
+        })
+        .map((it) => ({ pid: it.pid, cat: "" }));
+      if (updates.length) await api("/api/products/update", { updates });
+      await saveLib((lib) => {
+        lib.nodes = lib.nodes.filter((n) => {
+          const full = n.parent ? n.parent + "/" + n.name : n.name;
+          return full !== path && !full.startsWith(path + "/");
+        });
+        lib.deleted.push({ path, at: Date.now() });
+      });
+      if (S.cat === path || S.cat.startsWith(path + "/")) S.cat = "";
+      if (S.viewCat === path || S.viewCat.startsWith(path + "/")) S.viewCat = "";
+      await loadProductsTwice();
+      toast(`🗑 已删除分类：${path}（进了回收站，可恢复）`, "ok");
+    }
+    closeModal("dlgCatDel");
+  } catch (e) {
+    toast(e.message, "err");
+  } finally {
+    busy(false);
+  }
+}
+
+async function recycleRestore(path) {
+  try {
+    busy(true, "恢复分类…");
+    await saveLib((lib) => {
+      /* 路径上缺的段都补回来（父分类被删过也不悬空） */
+      let p = "";
+      String(path).split("/").forEach((seg) => {
+        const parent = p;
+        p = p ? p + "/" + seg : seg;
+        if (!lib.nodes.some((n) => n.parent === parent && n.name === seg)) {
+          lib.nodes.push({ name: seg, parent });
+        }
+      });
+      lib.deleted = lib.deleted.filter((d) => d.path !== path);
+    });
+    toast(`✅ 已恢复分类：${path}`, "ok");
+  } catch (e) {
+    toast(e.message, "err");
+  } finally {
+    busy(false);
+  }
+}
+
+function renderRecycle() {
+  const box = $("recycleBox");
+  if (!box || S.view !== "recycle") return;
+  const list = [...(S.lib?.deleted || [])].sort((a, b) => (b.at || 0) - (a.at || 0));
+  $("recycleEmpty").classList.toggle("hidden", list.length > 0);
+  $("recycleBody").innerHTML = list.map((d) => {
+    const p = String(d.path || "");
+    const i = p.lastIndexOf("/");
+    return `<tr>
+      <td>${esc(i < 0 ? p : p.slice(i + 1))}</td>
+      <td>${esc(i < 0 ? "—" : p.slice(0, i))}</td>
+      <td>${fmtMs(Number(d.at) || 0)}</td>
+      <td><button class="btn small" data-rstore="${esc(p)}">恢复</button>
+          <button class="btn small danger" data-rdel="${esc(p)}">删除</button></td>
+    </tr>`;
+  }).join("");
+}
+
+/* ---------- 移动分类（勾选产品 → 🏷 → 树里选，对齐智赢弹窗） ---------- */
+
+function openMove(ctx = {}) {   // {} = 批量（S.sel）；{single:true, fill:"dCat"} = 单产品
+  if (!ctx.single && S.sel.size === 0) { toast("先勾选产品", "err"); return; }
+  S.moveCtx = { ...ctx, sel: null };
+  $("moveTip").textContent = ctx.single
+    ? "请选择分类"
+    : `请为选中的 ${S.sel.size} 个产品选择分类`;
+  S.treeQ = "";
+  $("treeQ") && ($("treeQ").value = "");
+  renderTree("#moveTree");
+  $("dlgMove").classList.remove("hidden");
+}
+
+async function moveOk() {
+  const ctx = S.moveCtx;
+  if (!ctx) return;
+  const sel = ctx.sel;
+  if (sel === null || sel === undefined) { toast("先在树里点一个分类", "err"); return; }
+  const cat = sel === "__none__" ? "" : sel;
+
+  try {
+    if (ctx.single) {
+      const inp = $(ctx.fill);
+      if (inp) inp.value = cat;
+      closeModal("dlgMove");
+      return;
+    }
+    busy(true, `移动 ${S.sel.size} 个产品…`);
+    await api("/api/products/update", {
+      updates: [...S.sel].map((pid) => ({ pid, cat })),
+    });
+    closeModal("dlgMove");
+    await loadProductsTwice();
+    toast(`✅ 已移动分类：${cat || "未分类"}`, "ok");
+  } catch (e) {
+    toast(e.message, "err");
+  } finally {
+    busy(false);
+  }
+}
+
+/* ---------- 三视图（产品列表 / 产品分类 / 分类回收站） ---------- */
+
+function applyView() {
+  const v = S.view;
+  $("sidenav").querySelectorAll(".nav-item").forEach((el) =>
+    el.classList.toggle("on", el.dataset.view === v));
+  $("catPanel").classList.toggle("hidden", v === "list");
+  $("catHead").classList.toggle("hidden", v !== "cat");
+  $("recycleBox").classList.toggle("hidden", v !== "recycle");
+  $("selCat").classList.toggle("hidden", v === "cat");   // 分类视图用树筛，不重复
+
+  const showProducts = v !== "recycle";   // 回收站视图只看回收表格
+  $("statusTabs").classList.toggle("hidden", !showProducts);
+  $("dateTabs").classList.toggle("hidden", !showProducts);
+  $("filterRow").classList.toggle("hidden", !showProducts);
+  $("selbar").classList.toggle("hidden", !showProducts);
+  $("grid").classList.toggle("hidden", !showProducts);
+  $("pager").classList.toggle("hidden", !showProducts);
+  $("importPanel").classList.add("hidden");
+  if (!showProducts) $("empty").classList.add("hidden");
+}
+
+function setView(v) {
+  S.view = v;
+  if (v === "list") S.viewCat = "";
+  renderAll();
+}
+
+function renderCatHead() {
+  if (S.view !== "cat") return;
+  const list = S.filtered || [];
+  $("catHead").innerHTML =
+    `<b>🗂 分类产品：${esc(catLabel(S.viewCat))}</b>` +
+    `<span class="cat-head-n">${list.length} 个产品</span>` +
+    (readOnly() ? "" : `　<span class="hint">勾选产品后点「🏷 移动分类」把它们分到这里</span>`);
 }
 
 async function applyDelete() {
@@ -1340,8 +1762,67 @@ function bindEvents() {
   $("btnSelNone").onclick = () => { S.sel.clear(); saveSel(); renderGrid(); renderSelBar(); };
 
   $("btnOpt").onclick = startOptimize;
-  $("btnCat").onclick = () => { $("catInput").value = ""; $("dlgCat").classList.remove("hidden"); };
-  $("btnCatApply").onclick = applyCat;
+  $("btnCat").onclick = () => openMove();           // 🏷 移动分类（树选择）
+  $("moveOk").onclick = moveOk;
+  $("ceOk").onclick = catEditOk;
+  $("catDelOk").onclick = catDelOk;
+
+  /* 侧栏三视图（产品列表 / 产品分类 / 分类回收站） */
+  $("sidenav").addEventListener("click", (e) => {
+    const it = e.target.closest(".nav-item");
+    if (it) setView(it.dataset.view);
+  });
+
+  /* 分类树：点行选中筛选、箭头展开、悬停图标 CRUD */
+  $("treeQ").oninput = (e) => {
+    S.treeQ = e.target.value;
+    renderTree();
+  };
+  $("catTree").addEventListener("click", (e) => {
+    const tib = e.target.closest("[data-tact]");
+    const tw = e.target.closest("[data-toggle]");
+    const row = e.target.closest(".tree-node");
+    if (tib && row) {
+      const path = row.dataset.zpath;
+      const { rows } = treeRows();
+      const node = rows.find((r) => r.path === path);
+      const name = node ? node.name : path.slice(path.lastIndexOf("/") + 1);
+      if (tib.dataset.tact === "add") openCatEdit({ mode: "add", parent: path });
+      if (tib.dataset.tact === "ren") openCatEdit({ mode: "ren", path, name });
+      if (tib.dataset.tact === "del") openCatDel({ mode: "del", path });
+      return;
+    }
+    if (tw) {
+      const p = tw.dataset.toggle;
+      if (S.expanded.has(p)) S.expanded.delete(p); else S.expanded.add(p);
+      localStorage.setItem("wz_tree_open", JSON.stringify([...S.expanded]));
+      renderTree();
+      return;
+    }
+    if (row && row.dataset.zpath !== undefined) {
+      S.viewCat = row.dataset.zpath;
+      S.page = 0;
+      renderAll();
+    }
+  });
+
+  /* 移动分类弹窗树：单选（未分类行 data-pick，节点行 data-zpath） */
+  $("moveTree").addEventListener("click", (e) => {
+    const tw = e.target.closest("[data-toggle]");
+    if (tw) return;                       // 弹窗里树全展开，箭头不动
+    const row = e.target.closest(".tree-node");
+    if (!row) return;
+    S.moveCtx.sel = row.dataset.pick || row.dataset.zpath;
+    renderTree("#moveTree");
+  });
+
+  /* 回收站：恢复 / 彻底删除 */
+  $("recycleBody").addEventListener("click", (e) => {
+    const rs = e.target.closest("[data-rstore]");
+    const rd = e.target.closest("[data-rdel]");
+    if (rs) recycleRestore(rs.dataset.rstore);
+    if (rd) openCatDel({ mode: "purge", path: rd.dataset.rdel });
+  });
   $("btnDel").onclick = () => { $("delCount").textContent = S.sel.size; $("dlgDel").classList.remove("hidden"); };
   $("btnDelApply").onclick = applyDelete;
   $("btnExport").onclick = doExport;
