@@ -19,12 +19,16 @@ const S = {
   moveCtx: null,           // 移动分类弹窗上下文
   catEditCtx: null,        // 新增/修改分类上下文
   catDelCtx: null,         // 删除/彻底删除上下文
+  /* D1.5.0 刊登词典（智赢式） */
+  words: [],               // [{bad,fix,at,by}] 侵权词对照表（全局共享）
+  ptmap: [],               // [{cat,pt,at,by}] 分类→亚马逊商品类型
 };
 
 /* D = 当前详情弹窗的图片编辑状态；IE = 图片编辑器状态；AZ = 亚马逊上传 */
 const D = { pid: "", imgs: [], dirty: false, thin: false };
 const IE = { work: null, init: null, idx: -1, isNew: false, zoom: 1, mode: "view" };
 const AZ = { poll: null, authPoll: null, status: null };
+const SCAN = { hits: null };   // D1.5.0 侵权扫描结果
 
 const $ = (id) => document.getElementById(id);
 
@@ -131,6 +135,7 @@ function enterApp() {
   S.sel = new Set(JSON.parse(localStorage.getItem("wz_sel") || "[]"));
   S.expanded = new Set(JSON.parse(localStorage.getItem("wz_tree_open") || "[]"));
   loadCats();                            // 分类树（全局共享，预置智赢 8 顶级）
+  loadDict();                            // 刊登词典（侵权词 + 分类映射）
   loadProducts()                        // 磁盘缓存瞬间出列表
     .then(() => {
       const m = location.hash.match(/^#pid=(.+)$/);  // 深链/自测：#pid=xxx 直接开详情
@@ -251,6 +256,7 @@ function renderAll() {
   renderTree();
   renderCatHead();
   renderRecycle();
+  renderWords();
 }
 
 function renderTabs() {
@@ -388,6 +394,7 @@ function dEditRow(cat, status) {
         <button class="btn" onclick="openMove({ single: true, fill: 'dCat' })" title="从分类树选择">📂</button></div>
       <button id="dSave" class="btn primary">💾 保存标记</button>
       <button id="dOpt1" class="btn">🚀 优化这个产品</button>
+      <button id="dScan" class="btn">🛡 查侵权</button>
     </div>`;
 }
 
@@ -1070,6 +1077,8 @@ function bindDetailActs() {
     closeModal("dlgDetail");
     startOptimize();
   };
+  const scan = $("dScan");
+  if (scan) scan.onclick = openScan;
 }
 
 async function saveDetailMark() {
@@ -1426,6 +1435,251 @@ function renderRecycle() {
   }).join("");
 }
 
+/* ---------- 刊登词典（D1.5.0 智赢式）：侵权词 + 分类→商品类型 ---------- */
+
+async function loadDict() {
+  try {
+    const [w, p] = await Promise.all([
+      api("/api/dict", { kind: "words" }),
+      api("/api/dict", { kind: "ptmap" }),
+    ]);
+    S.words = (w.doc && w.doc.pairs) || [];
+    S.ptmap = (p.doc && p.doc.map) || [];
+  } catch (e) {
+    /* 词典读不到不挡别的功能 */
+    S.words = [];
+    S.ptmap = [];
+  }
+  renderWords();
+}
+
+function renderWords() {
+  if (S.view !== "words" || !$("wordsBox")) return;
+  const ro = readOnly();
+  document.querySelectorAll(".words-addrow").forEach((el) =>
+    el.classList.toggle("hidden", ro));
+
+  const wl = [...S.words].sort((a, b) => (b.at || 0) - (a.at || 0));
+  $("wzEmpty").classList.toggle("hidden", wl.length > 0);
+  $("wzBody").innerHTML = wl.map((w, i) => `<tr>
+      <td>${i + 1}</td>
+      <td><b style="color:#c62828">${esc(w.bad)}</b></td>
+      <td>${esc(w.fix) || "<i style='color:#999'>（删除）</i>"}</td>
+      <td>${fmtMs(Number(w.at) || 0)}${w.by ? " · " + esc(w.by) : ""}</td>
+      <td>${ro ? "" : `<button class="btn small danger" data-wdel="${esc(w.bad)}">删除</button>`}</td>
+    </tr>`).join("");
+
+  const pl = [...S.ptmap].sort((a, b) => (b.at || 0) - (a.at || 0));
+  $("ptEmpty").classList.toggle("hidden", pl.length > 0);
+  $("ptBody").innerHTML = pl.map((m, i) => `<tr>
+      <td>${i + 1}</td>
+      <td>${esc(m.cat)}</td>
+      <td><b>${esc(m.pt)}</b></td>
+      <td>${fmtMs(Number(m.at) || 0)}${m.by ? " · " + esc(m.by) : ""}</td>
+      <td>${ro ? "" : `<button class="btn small danger" data-pdel="${esc(m.cat)}">删除</button>`}</td>
+    </tr>`).join("");
+}
+
+async function saveDict(kind, doc) {
+  await api("/api/dict", { kind, doc });
+  await loadDict();
+}
+
+async function wzAddWord() {
+  const bad = $("wzBad").value.trim();
+  const fix = $("wzFix").value.trim();
+  if (!bad) { toast("侵权词不能为空", "err"); return; }
+  const old = S.words.find((w) => w.bad.toLowerCase() === bad.toLowerCase());
+  if (old && !confirm(`「${bad}」已在表里（当前替换成「${old.fix || "删除"}」），要覆盖吗？`)) return;
+  try {
+    busy(true, "保存…");
+    const pairs = S.words.filter((w) => w.bad.toLowerCase() !== bad.toLowerCase());
+    pairs.push({ bad, fix, at: Date.now(), by: (S.profile || {}).user || "" });
+    await saveDict("words", { pairs });
+    $("wzBad").value = "";
+    $("wzFix").value = "";
+    toast(old ? "✅ 已更新" : "✅ 已添加（上传时自动替换）", "ok");
+  } catch (e) {
+    toast(e.message, "err", 7000);
+  } finally {
+    busy(false);
+  }
+}
+
+async function wzDelWord(bad) {
+  if (!confirm(`确定删除侵权词「${bad}」？`)) return;
+  try {
+    busy(true, "删除…");
+    await saveDict("words", {
+      pairs: S.words.filter((w) => w.bad !== bad),
+    });
+    toast("🗑 已删除", "ok");
+  } catch (e) {
+    toast(e.message, "err", 7000);
+  } finally {
+    busy(false);
+  }
+}
+
+async function ptAddMap() {
+  const cat = $("ptCat").value.trim();
+  const pt = $("ptPt").value.trim();
+  if (!cat || !pt) { toast("分类和商品类型都要填", "err"); return; }
+  const old = S.ptmap.find((m) => m.cat === cat);
+  if (old && old.pt !== pt && !confirm(`「${cat}」已映射到 ${old.pt}，改成 ${pt} 吗？`)) return;
+  try {
+    busy(true, "保存…");
+    const map = S.ptmap.filter((m) => m.cat !== cat);
+    map.push({ cat, pt, at: Date.now(), by: (S.profile || {}).user || "" });
+    await saveDict("ptmap", { map });
+    $("ptCat").value = "";
+    $("ptPt").value = "";
+    toast(old ? "✅ 已更新映射" : "✅ 已添加映射（上传时自动填类型）", "ok");
+  } catch (e) {
+    toast(e.message, "err", 7000);
+  } finally {
+    busy(false);
+  }
+}
+
+async function ptDelMap(cat) {
+  if (!confirm(`确定删除「${cat}」的类型映射？`)) return;
+  try {
+    busy(true, "删除…");
+    await saveDict("ptmap", { map: S.ptmap.filter((m) => m.cat !== cat) });
+    toast("🗑 已删除", "ok");
+  } catch (e) {
+    toast(e.message, "err", 7000);
+  } finally {
+    busy(false);
+  }
+}
+
+/* ---------- 侵权扫描（D1.5.0 智赢式：详情里查一遍 → 一键替换） ---------- */
+
+function wordHits(text) {
+  const low = String(text ?? "").toLowerCase();
+  const out = [];
+  for (const p of S.words || []) {
+    const bad = String(p.bad || "").toLowerCase();
+    if (!bad) continue;
+    const n = low.split(bad).length - 1;
+    if (n > 0) out.push({ bad: p.bad, fix: p.fix || "", n });
+  }
+  return out;
+}
+
+function openScan() {
+  if (!D.rec) { toast("资料还在加载，稍等一下再点", "", 3000); return; }
+  if (!(S.words || []).length) {
+    toast("侵权词库还是空的：先到左边「🛡 侵权词库」里把踩过坑的品牌词加进去", "", 7000);
+    return;
+  }
+  const rec = D.rec;
+  const raw = rec.raw || [];
+  const opt = rec.opt || {};
+  const hits = [];
+
+  const addAll = (where, text) => {
+    wordHits(text).forEach((h) => hits.push({ where, ...h }));
+  };
+
+  raw.forEach((r, i) => {
+    const rd = r.raw_data || {};
+    const pre = raw.length > 1 ? `原始资料·第${i + 1}行·` : "原始资料·";
+    addAll(pre + "标题", rd["标题(必填)"]);
+    for (let b = 1; b <= 5; b++) addAll(pre + `要点${b}`, rd[`要点${b}`]);
+    addAll(pre + "简介", rd["简介"]);
+  });
+  if (opt.title || (opt.bullets || []).length || opt.description) {
+    addAll("AI结果·标题", opt.title);
+    (opt.bullets || []).forEach((b, i) => addAll(`AI结果·要点${i + 1}`, b));
+    addAll("AI结果·简介", opt.description);
+  }
+
+  SCAN.hits = hits;
+  const name = esc(rec.title || rec.sku || rec.pid || "");
+  $("scanTip").innerHTML = hits.length
+    ? `「${name}」发现 <b>${hits.length}</b> 处侵权词。替换会写进已存资料（原始资料 + AI 结果都改）；上传亚马逊时也会按词表自动替换。`
+    : `「${name}」里没发现侵权词，很干净 ✅`;
+  $("scanBody").innerHTML = hits.map((h) => `<tr>
+      <td>${esc(h.where)}</td>
+      <td><b style="color:#c62828">${esc(h.bad)}</b></td>
+      <td>${esc(h.fix) || "<i style='color:#999'>（删除）</i>"}</td>
+      <td>${h.n}</td>
+    </tr>`).join("");
+  $("scanOk").classList.toggle("hidden", !hits.length || readOnly());
+  $("dlgScan").classList.remove("hidden");
+}
+
+function applyWordsTo(t) {
+  let s = String(t ?? "");
+  for (const p of S.words || []) {
+    if (!p.bad) continue;
+    const rx = new RegExp(String(p.bad).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
+    s = s.replace(rx, () => p.fix || "");
+  }
+  return s;
+}
+
+async function scanReplace() {
+  const rec = D.rec;
+  if (!rec || !(SCAN.hits || []).length) return;
+
+  try {
+    busy(true, "替换中…");
+    let total = 0;
+
+    // ① 原始资料：整份 raw 按行回写（要点位置不动，和手改文字同一原子写法）
+    const raw = rec.raw || [];
+    if (raw.length) {
+      const rows = raw.map((r, i) => {
+        const rd = r.raw_data || {};
+        return {
+          i,
+          title: applyWordsTo(rd["标题(必填)"]),
+          bullets: [1, 2, 3, 4, 5].map((b) => applyWordsTo(rd[`要点${b}`])),
+          description: applyWordsTo(rd["简介"]),
+        };
+      });
+      await api("/api/product/text", { pid: D.pid, rows });
+      raw.forEach((r) => {
+        const rd = r.raw_data || {};
+        total += wordHits(rd["标题(必填)"]).length
+          + [1, 2, 3, 4, 5].reduce(
+            (s, b) => s + wordHits(rd[`要点${b}`]).length, 0)
+          + wordHits(rd["简介"]).length;
+      });
+    }
+
+    // ② AI 结果：短标题一起换；亮点/SEO 服务器端原样透传
+    const opt = rec.opt || {};
+    if (opt.title || (opt.bullets || []).length || opt.description) {
+      const o2 = {
+        title: applyWordsTo(opt.title),
+        short_title: applyWordsTo(opt.short_title),
+        bullets: (opt.bullets || []).map((b) => applyWordsTo(b)),
+        description: applyWordsTo(opt.description),
+      };
+      if (o2.title || o2.bullets.filter(Boolean).length || o2.description) {
+        await api("/api/product/opt", { pid: D.pid, opt: o2 });
+        total += wordHits(opt.title).length
+          + (opt.bullets || []).reduce((s, b) => s + wordHits(b).length, 0)
+          + wordHits(opt.description).length;
+      }
+    }
+
+    closeModal("dlgScan");
+    toast(`🛡 已替换 ${total} 处`, "ok", 7000);
+    await refillDetail();
+    loadProductsTwice();
+  } catch (e) {
+    toast(e.message, "err", 7000);
+  } finally {
+    busy(false);
+  }
+}
+
 /* ---------- 移动分类（勾选产品 → 🏷 → 树里选，对齐智赢弹窗） ---------- */
 
 function openMove(ctx = {}) {   // {} = 批量（S.sel）；{single:true, fill:"dCat"} = 单产品
@@ -1474,12 +1728,13 @@ function applyView() {
   const v = S.view;
   $("sidenav").querySelectorAll(".nav-item").forEach((el) =>
     el.classList.toggle("on", el.dataset.view === v));
-  $("catPanel").classList.toggle("hidden", v === "list");
+  $("catPanel").classList.toggle("hidden", v === "list" || v === "words");
   $("catHead").classList.toggle("hidden", v !== "cat");
   $("recycleBox").classList.toggle("hidden", v !== "recycle");
-  $("selCat").classList.toggle("hidden", v === "cat");   // 分类视图用树筛，不重复
+  $("wordsBox").classList.toggle("hidden", v !== "words");
+  $("selCat").classList.toggle("hidden", v === "cat" || v === "words");   // 分类视图用树筛，不重复
 
-  const showProducts = v !== "recycle";   // 回收站视图只看回收表格
+  const showProducts = v !== "recycle" && v !== "words";   // 回收站/词典视图只看自己的表格
   $("statusTabs").classList.toggle("hidden", !showProducts);
   $("dateTabs").classList.toggle("hidden", !showProducts);
   $("filterRow").classList.toggle("hidden", !showProducts);
@@ -1741,6 +1996,20 @@ async function refreshAmz() {
       `<option value="${esc(id)}" ${id === s.marketplace ? "selected" : ""}>${esc(label)}</option>`).join("");
     $("azType").value = s.product_type === "PRODUCT" ? "" : s.product_type;
 
+    // D1.5.0：分类→商品类型映射，自动填（精确路径优先，其次顶级段）
+    if (!$("azType").value) {
+      let pt = "";
+      for (const pid of S.sel) {
+        const it = (S.items || []).find((x) => x.pid === pid);
+        const cat = it && it.cat;
+        if (!cat) continue;
+        const m = (S.ptmap || []).find((x) => x.cat === cat)
+          || (S.ptmap || []).find((x) => cat.startsWith(x.cat + "/"));
+        if (m) { pt = m.pt; break; }
+      }
+      if (pt) $("azType").value = pt;
+    }
+
     $("azStart").textContent = `📤 开始上传（${S.sel.size} 个产品）`;
     $("azStart").disabled = !stores.length || S.sel.size === 0;
 
@@ -1966,11 +2235,22 @@ function bindEvents() {
   $("ceOk").onclick = catEditOk;
   $("catDelOk").onclick = catDelOk;
 
-  /* 侧栏三视图（产品列表 / 产品分类 / 分类回收站） */
+  /* 侧栏视图（产品列表 / 产品分类 / 分类回收站 / 侵权词库） */
   $("sidenav").addEventListener("click", (e) => {
     const it = e.target.closest(".nav-item");
     if (it) setView(it.dataset.view);
   });
+
+  /* 刊登词典（D1.5.0）：添加/删除 + 侵权扫描确认 */
+  $("wzAdd").onclick = wzAddWord;
+  $("ptAdd").onclick = ptAddMap;
+  $("wordsBox").addEventListener("click", (e) => {
+    const d = e.target.closest("[data-wdel]");
+    if (d) { wzDelWord(d.dataset.wdel); return; }
+    const p = e.target.closest("[data-pdel]");
+    if (p) ptDelMap(p.dataset.pdel);
+  });
+  $("scanOk").onclick = scanReplace;
 
   /* 分类树：点行选中筛选、箭头展开、悬停图标 CRUD */
   $("treeQ").oninput = (e) => {

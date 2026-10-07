@@ -40,7 +40,7 @@ ROOT = APP_DIR.parent                          # 仓库根
 os.chdir(ROOT)                                 # 引擎的 tasks/ 落在根目录
 sys.path.insert(0, str(ROOT))
 
-VERSION = "D1.4.1"
+VERSION = "D1.5.0"
 APP_DIR_NAME = "app"
 
 DEFAULT_CONFIG = {
@@ -1510,13 +1510,53 @@ def _amz_start_authorize(
 
 # ---- 刊登数据：产品 → JSON_LISTINGS_FEED 的 messages ----
 
+def _dict_words() -> list:
+    """读服务器上的侵权词对照表 [(bad, fix)]（worker /dict，全公司
+    共享，智赢「侵权词替换」同款）。读不到就当没有——词典服务故障
+    不该挡住上传。"""
+    try:
+        r = src_api(
+            "/dict", _prod_auth() | {"kind": "words", "action": "get"},
+            timeout=20,
+        )
+        if r.get("ok"):
+            doc = r.get("doc") or {}
+            return [
+                (str(p.get("bad") or ""), str(p.get("fix") or ""))
+                for p in (doc.get("pairs") or [])
+            ]
+    except Exception:
+        pass
+    return []
+
+
+def _apply_words(text: str, pairs: list) -> tuple[str, int]:
+    """按对照表替换（大小写不敏感）。返回 (新文本, 替换次数)。"""
+    n = 0
+    for bad, fix in pairs:
+        if not bad:
+            continue
+        text, k = re.subn(
+            re.escape(bad),
+            (fix or "").replace("\\", "\\\\"),
+            text, flags=re.IGNORECASE,
+        )
+        n += k
+    return text, n
+
+
 def _amz_build_messages(
     products: list, mid: str, lang: str,
-    variant_mode: str, product_type: str,
+    variant_mode: str, product_type: str, words: list | None = None,
 ) -> tuple[list, list]:
     """返回 (messages, notes)。内容来源：AI 优化结果优先，没有就
     原始资料。图片只收 https（亚马逊要公网可下载）。变体：>1 行且
-    行行有颜色 → 父子变体（颜色主题），否则各行独立单品。"""
+    行行有颜色 → 父子变体（颜色主题），否则各行独立单品。
+    words=侵权词对照表：上传内容里自动替换（只改这次提交的 feed，
+    不动已存资料——和智赢刊登时替换一个道理）。"""
+
+    pairs = words or []
+    hits = 0
 
     def txt(v, cap):
         return [{
@@ -1536,6 +1576,7 @@ def _amz_build_messages(
         return out
 
     def content_of(p, r):
+        nonlocal hits
         opt = p.get("opt") or {}
         rd = r.get("raw_data") or {}
         title = str(
@@ -1553,7 +1594,14 @@ def _amz_build_messages(
             opt.get("description") or rd.get("简介")
             or r.get("description") or "",
         ).strip()
-        return title, bullets[:5], desc
+        if pairs:
+            title, k1 = _apply_words(title, pairs)
+            bullets, ks = zip(*(
+                _apply_words(b, pairs) for b in bullets
+            )) if bullets else ((), ())
+            desc, k2 = _apply_words(desc, pairs)
+            hits += k1 + k2 + sum(ks)
+        return title, list(bullets)[:5], desc
 
     messages: list = []
     notes: list = []
@@ -1820,8 +1868,10 @@ def _amz_start_upload(
             )
             info = _MARKETPLACES.get(mid, ("na", "en_US", ""))
 
+            words = _dict_words()   # 侵权词对照（读不到=空，不挡上传）
             messages, notes = _amz_build_messages(
                 products, mid, info[1], variant_mode, product_type,
+                words=words,
             )
             if not messages:
                 raise RuntimeError(
@@ -2280,6 +2330,29 @@ class Handler(BaseHTTPRequestHandler):
                     _prod_auth() | {"action": "save", "lib": lib_in},
                     timeout=30,
                 )
+                self._json(resp)
+                return
+
+            if url.path == "/api/dict":
+                # 刊登词典（D1.5.0 智赢式）：kind=words 侵权词对照表 /
+                # kind=ptmap 分类→商品类型映射。带 doc=保存，不带=读取。
+                kind = str(body.get("kind") or "")
+                doc_in = body.get("doc")
+
+                if kind not in ("words", "ptmap") or (
+                    doc_in is not None and not isinstance(doc_in, dict)
+                ):
+                    self._json({"ok": False, "error": "参数不对"}, 400)
+                    return
+
+                payload = _prod_auth() | {"kind": kind}
+                if doc_in is None:
+                    payload["action"] = "get"
+                else:
+                    payload["action"] = "save"
+                    payload["doc"] = doc_in
+
+                resp = src_api("/dict", payload, timeout=30)
                 self._json(resp)
                 return
 

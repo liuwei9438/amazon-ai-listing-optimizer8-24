@@ -437,6 +437,10 @@ body {
 }
 .recycle-table th { color: #888; font-size: 12px; background: #fafbfc; }
 
+/* 侵权词库（D1.5.0）：添加行 */
+.words-addrow { display: flex; gap: 8px; margin-bottom: 12px; }
+.words-addrow .inp { flex: 1; min-width: 0; }
+
 /* 详情弹窗：分类改为 📂 树选择 */
 .d-cat-pick { display: flex; gap: 6px; align-items: center; }
 .d-cat-pick .inp { flex: 1; min-width: 0; background: #fafbfc; }
