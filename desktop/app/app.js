@@ -1991,6 +1991,12 @@ async function refreshAmz() {
           + `${esc(st.name)} · ${esc(mkName(st.marketplace))}</option>`).join("")
       : `<option value="">（还没绑定店铺）</option>`;
     $("azStoreDel").classList.toggle("hidden", !s.is_admin || !stores.length);
+    $("azMgmtBtn").classList.toggle("hidden", !stores.length);
+    $("azAppBox").classList.toggle("hidden", !s.is_admin || !!s.app_set);
+    if (!$("azMgmt").classList.contains("hidden")) azMgmtRender();
+    $("azEanBox").innerHTML = s.ean
+      ? `🏷 EAN 条码池 · 前缀(厂商编号) <b>${esc(s.ean.prefix || "未初始化")}</b> 已锁定 · 已用 ${s.ean.used} · 剩余 ${s.ean.remaining} · 上传时自动补码，产品↔码永久绑定（重传不换码）`
+      : "";
 
     $("azMarket").innerHTML = (s.markets || []).map(([id, label]) =>
       `<option value="${esc(id)}" ${id === s.marketplace ? "selected" : ""}>${esc(label)}</option>`).join("");
@@ -2058,38 +2064,137 @@ async function azUnbind() {
   }
 }
 
+/* D1.6.0 智赢式授权：链接给用户复制 → 店铺自己的环境里登录同意 →
+   把跳转网址粘回来。绝不在本机自动打开授权页（IP 不同=关联风险）。 */
 async function azAuthorize() {
   try {
     const r = await api("/api/amazon/authorize/start", {
       name: $("azName").value.trim(),
       seller_id: $("azSeller").value.trim(),
       marketplace: $("azMarket").value,
-      client_id: $("azClientId").value.trim(),
-      client_secret: $("azClientSecret").value.trim(),
-      app_id: $("azAppId").value.trim(),
     });
-    if (r.url) window.open(r.url, "_blank");
-    toast("浏览器里完成授权后会自动回来（登录这家店的亚马逊 → 点同意）", "", 8000);
-    clearInterval(AZ.authPoll);
-    AZ.authPoll = setInterval(async () => {
-      try {
-        const p = await api("/api/amazon/authorize/poll");
-        $("amzProg").classList.remove("hidden");
-        $("amzMsg").textContent = p.message || "";
-        if (p.state === "done") {
-          clearInterval(AZ.authPoll);
-          toast("✅ 绑定成功，这家店在任何电脑都能传了", "ok", 6000);
-          await refreshAmz();
-          setTimeout(refreshAmz, 8000);    // KV 边缘同步最长约 60 秒，
-          setTimeout(refreshAmz, 30000);   // 多看两遍兜底
-        } else if (p.state === "error") {
-          clearInterval(AZ.authPoll);
-          toast(p.message, "err", 9000);
-        }
-      } catch (e) { /* 下轮再看 */ }
-    }, 2500);
+    $("azAuthUrl").value = r.url || "";
+    $("azPaste").value = "";
+    $("azReceipt").innerHTML = "";
+    $("azPasteBox").classList.remove("hidden");
+    toast("链接已生成：复制 → 去店铺自己的浏览器打开 → 同意 → 把跳转网址粘回来", "", 9000);
   } catch (e) {
     toast(e.message, "err", 7000);
+  }
+}
+
+async function azCopy() {
+  const t = $("azAuthUrl").value;
+  if (!t) return;
+  try {
+    await navigator.clipboard.writeText(t);
+    toast("📋 已复制，去这家店自己的浏览器里粘贴打开", "ok");
+  } catch (e) {
+    $("azAuthUrl").select();
+    document.execCommand("copy");
+    toast("📋 已复制，去这家店自己的浏览器里粘贴打开", "ok");
+  }
+}
+
+async function azFinish() {
+  const pasted = $("azPaste").value.trim();
+  if (!pasted) { toast("先粘上「点同意之后」跳转到的完整网址", "err", 6000); return; }
+  let r = null;
+  try {
+    busy(true, "绑定中…");
+    try {
+      r = await api("/api/amazon/authorize/finish", { url: pasted });
+    } catch (e) {
+      r = { ok: false, message: e.message };
+    }
+    azReceipt(r);
+    if (r.ok) {
+      toast("✅ 绑定成功！这家店在任何电脑都能传了", "ok", 6000);
+      $("azPasteBox").classList.add("hidden");
+      await refreshAmz();
+      setTimeout(refreshAmz, 8000);    // KV 边缘同步最长约 60 秒，
+      setTimeout(refreshAmz, 30000);   // 多看两遍兜底
+    }
+  } finally {
+    busy(false);
+  }
+}
+
+function azReceipt(r) {
+  const st = r.store || {};
+  $("azReceipt").innerHTML = r.ok
+    ? `<div class="az-ok">✅ 授权成功！<b>${esc(st.name || "店铺")}</b> 已绑定并安全保存在服务器（换电脑免重绑）· ${fmtMs(Number(st.at) || 0)}</div>`
+    : `<div class="warn">❌ ${esc(r.message || "绑定没成功，请重新走一遍")}</div>`;
+}
+
+async function azAppSave() {
+  try {
+    busy(true, "保存应用凭证…");
+    await api("/api/amazon/app/save", {
+      app_id: $("azAppId").value.trim(),
+      client_id: $("azClientId").value.trim(),
+      client_secret: $("azClientSecret").value.trim(),
+    });
+    $("azAppId").value = $("azClientId").value = $("azClientSecret").value = "";
+    $("azAppBox").classList.add("hidden");
+    toast("🔧 应用凭证已存到服务器（全公司一次就好），现在可以绑店了", "ok", 7000);
+    await refreshAmz();
+  } catch (e) {
+    toast(e.message, "err", 7000);
+  } finally {
+    busy(false);
+  }
+}
+
+function azMgmtToggle() {
+  $("azMgmt").classList.toggle("hidden");
+  if (!$("azMgmt").classList.contains("hidden")) azMgmtRender();
+}
+
+function azMgmtRender() {
+  const s = AZ.status || {};
+  const stores = s.stores || [];
+  const mkName = (id) => {
+    const m = (s.markets || []).find(([i]) => i === id);
+    return m ? m[1] : id;
+  };
+  $("azMgmtBody").innerHTML = stores.map((st) => `<tr>
+      <td>${esc(st.name)}</td>
+      <td>${esc(mkName(st.marketplace))}</td>
+      <td>${esc(st.seller_id)}</td>
+      <td>${fmtMs(Number(st.at) || 0)}</td>
+      <td id="aztok-${esc(st.id)}">－</td>
+      <td>
+        <button class="btn small" onclick="azTestStore('${esc(st.id)}')">测连接</button>
+        ${s.is_admin ? `<button class="btn small danger" onclick="azUnbindId('${esc(st.id)}','${esc(st.name)}')">解绑</button>` : ""}
+      </td>
+    </tr>`).join("");
+}
+
+async function azTestStore(id) {
+  const cell = $("aztok-" + id);
+  if (cell) cell.textContent = "测…";
+  try {
+    const r = await api("/api/amazon/store/test", { id });
+    if (cell) cell.innerHTML = r.token_ok ? "✅ 可用" : `❌ ${esc((r.error || "失败").slice(0, 60))}`;
+  } catch (e) {
+    if (cell) cell.innerHTML = `❌ ${esc(e.message.slice(0, 60))}`;
+  }
+}
+
+async function azUnbindId(id, name) {
+  if (!confirm(`确定解绑「${name}」？解绑后所有电脑都不能再传这家店（可重新绑定）。`)) return;
+  try {
+    busy(true, "解绑…");
+    await api("/api/amazon/store/delete", { id });
+    toast("🗑 已解绑", "ok");
+    await refreshAmz();
+    setTimeout(refreshAmz, 8000);
+    setTimeout(refreshAmz, 30000);
+  } catch (e) {
+    toast(e.message, "err", 7000);
+  } finally {
+    busy(false);
   }
 }
 
@@ -2156,14 +2261,13 @@ function closeModal(id) {
   }
 }
 
-// 详情弹窗防手滑：图片改了没保存就点关闭 → 先问一句。
-// 必须注册在下面通用关闭逻辑之前（同一元素上先注册先执行），
-// 用 stopImmediatePropagation 拦掉通用关闭。
+// 详情弹窗关闭（D1.6.0 修复「✕ 点不掉」）：✕/遮罩一律直接关，
+// 有没保存的图片调整也不再拦——改成放弃并提示（智赢也不拦）。
 $("dlgDetail").addEventListener("click", (e) => {
   const closing = e.target === $("dlgDetail") || e.target.closest("[data-close]");
-  if (closing && D.dirty && !confirm("图片修改还没保存，关闭会丢掉这些调整。确定关闭？")) {
-    e.preventDefault();
-    e.stopImmediatePropagation();
+  if (closing && D.dirty) {
+    D.dirty = false;
+    toast("图片调整还没保存，已放弃", "", 4000);
   }
 }, true);
 
@@ -2310,6 +2414,10 @@ function bindEvents() {
   $("azStore").onchange = azSelectStore;
   $("azStoreDel").onclick = azUnbind;
   $("azAuth").onclick = azAuthorize;
+  $("azCopy").onclick = azCopy;
+  $("azFinish").onclick = azFinish;
+  $("azAppSave").onclick = azAppSave;
+  $("azMgmtBtn").onclick = azMgmtToggle;
   $("azStart").onclick = azStart;
 
   $("btnImportToggle").onclick = () => $("importPanel").classList.toggle("hidden");

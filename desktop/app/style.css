@@ -191,6 +191,11 @@ body {
   background: #fff7e6; border: 1px solid #ffd591; border-left: 5px solid #ff9900;
   border-radius: 10px; padding: 12px 14px;
 }
+/* D1.6.0：绑定成功的绿色回执（失败用 .warn 红字/橙底） */
+.modal-body .az-ok {
+  background: #f0faf3; border: 1px solid #b7e4c7; border-left: 5px solid #2e9e5b;
+  border-radius: 10px; padding: 12px 14px; color: #1d7a43;
+}
 .d-head { display: flex; gap: 16px; }
 .d-img {
   width: 210px; min-width: 210px; height: 210px; border-radius: 10px;

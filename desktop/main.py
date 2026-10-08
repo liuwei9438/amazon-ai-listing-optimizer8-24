@@ -19,6 +19,8 @@ import io
 import json
 import os
 import re
+import secrets
+import socket
 import subprocess
 import sys
 import threading
@@ -40,7 +42,7 @@ ROOT = APP_DIR.parent                          # 仓库根
 os.chdir(ROOT)                                 # 引擎的 tasks/ 落在根目录
 sys.path.insert(0, str(ROOT))
 
-VERSION = "D1.5.0"
+VERSION = "D1.6.0"
 APP_DIR_NAME = "app"
 
 DEFAULT_CONFIG = {
@@ -96,6 +98,7 @@ CONFIG.update({k: v for k, v in _over.items() if v not in (None, "")})
 SESSION = _load_json_file(SESSION_PATH, {}) or {}
 
 PROXY_MODE = "direct"   # direct / proxy / unknown
+_STARTED_AT = time.time()   # 双开检测用：刚启动的实例自己会弹窗口
 
 
 # =====================================================
@@ -1228,6 +1231,40 @@ def _amz_store_delete(sid: str) -> dict:
         return {"ok": False, "error": f"连不上服务器：{exc}"[:300]}
 
 
+def _amz_app_info() -> dict:
+    """公共应用凭证状态（服务器上配一次，全公司共用）。"""
+    try:
+        r = _amz_store_api({"action": "app_get"}, timeout=15)
+    except Exception as exc:
+        return {"set": False, "app_id": "", "err": f"连不上服务器：{exc}"[:150]}
+    if not r.get("ok"):
+        return {"set": False, "app_id": "", "err": str(r.get("error") or "")[:150]}
+    app = r.get("app") or {}
+    return {
+        "set": bool(app.get("set")),
+        "app_id": str(app.get("app_id") or ""),
+        "err": "",
+    }
+
+
+def _ean_api(payload: dict, timeout: int = 25) -> dict:
+    return src_api("/ean", _prod_auth() | payload, timeout=timeout,
+                   base=_amz_srv())
+
+
+def _amz_ean_assign(keys: list) -> tuple[dict, str, str]:
+    """给一批 产品#SKU 领 EAN 条码（已领过的原样返回=永久绑定）。
+    返回 (码表, 错误信息, 前缀)。读不到码不挡上传——feed 不带
+    standard_product_id 而已，像侵权词典一样降级。"""
+    try:
+        r = _ean_api({"action": "assign", "keys": keys})
+    except Exception as exc:
+        return {}, f"连不上服务器：{exc}"[:150], ""
+    if not r.get("ok"):
+        return {}, str(r.get("error") or "领取失败")[:150], ""
+    return dict(r.get("eans") or {}), "", str(r.get("prefix") or "")
+
+
 def _amz_active_store(stores: list) -> dict | None:
     sid = str(_amz_cfg().get("active_store") or "")
     for s in stores:
@@ -1366,146 +1403,120 @@ def _amz_api(method: str, path: str, token: str, payload=None):
 
 # ---- 一键授权：本地 9999 端口接亚马逊跳回来的授权码，自动换令牌 ----
 
-def _amz_start_authorize(
-    app_id: str, client_id: str, client_secret: str,
-    bind: dict | None = None,
-) -> str:
+def _amz_begin_authorize(bind: dict) -> str:
+    """智赢式授权第 1 步：生成授权链接（给用户拿去店铺自己的浏览器
+    环境打开，绝不在本机自动弹——IP 不同才是关联风险）。"""
     global _AMZ_AUTHZ
 
-    if _AMZ_AUTHZ.get("state") == "running":
-        return _AMZ_AUTHZ.get("url") or ""
+    app = _amz_app_info()
+    if app.get("err"):
+        raise RuntimeError(f"读应用凭证状态失败：{app['err']}")
+    if not (app.get("set") and app.get("app_id")):
+        raise RuntimeError(
+            "管理员还没配置公共应用凭证——点「🔧 配置应用凭证」粘贴一次即可"
+        )
 
-    redirect = f"http://localhost:{_AUTHZ_PORT}/callback"
+    state = secrets.token_hex(8)
     url = (
         "https://sellercentral.amazon.com/apps/authorize/consent"
-        f"?application_id={app_id}&version=beta"
+        f"?application_id={app['app_id']}&version=beta&state={state}"
     )
     _AMZ_AUTHZ = {
         "state": "running",
-        "message": "等您在浏览器里完成授权（登录亚马逊并点同意）…",
+        "message": (
+            "① 复制授权链接 ② 在这家店自己的浏览器环境（紫鸟/智赢）"
+            "里打开并登录 ③ 点「同意」 ④ 复制跳转后浏览器地址栏的"
+            "完整网址，粘回下面"
+        ),
         "url": url,
+        "oauth_state": state,
+        "bind": bind,
     }
+    return url
 
-    class AuthHandler(BaseHTTPRequestHandler):
-        def log_message(self, fmt, *args):
-            pass
 
-        def _page(self, text: str) -> None:
-            body = (
-                "<meta charset='utf-8'><body style='font-family:sans-serif;"
-                "font-size:20px;text-align:center;padding:70px'>"
-                + text + "</body>"
-            ).encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            try:
-                self.wfile.write(body)
-            except Exception:
-                pass
+def _amz_finish_authorize(pasted: str) -> dict:
+    """智赢式授权第 2 步：用户把跳转后的网址粘回来 → 抽出 code →
+    服务器端换 refresh_token 并存店铺（本机全程摸不到密钥）。"""
+    global _AMZ_AUTHZ
 
-        def do_GET(self) -> None:
-            u = urlparse(self.path)
-            if u.path != "/callback":
-                self._page("不是授权回调地址")
-                return
+    if _AMZ_AUTHZ.get("state") == "done":
+        return {
+            "ok": True, "state": "done",
+            "message": _AMZ_AUTHZ.get("message") or "",
+            "store": _AMZ_AUTHZ.get("store") or {},
+        }
+    if _AMZ_AUTHZ.get("state") != "running":
+        raise RuntimeError("还没开始授权（先点「开始授权」拿链接）")
 
-            q = parse_qs(u.query)
-            code = (q.get("spapi_oauth_code") or q.get("code") or [""])[0]
-            err = (
-                q.get("error_description") or q.get("error") or [""]
-            )[0]
+    raw = str(pasted or "").strip()
+    if not raw:
+        raise RuntimeError("先把浏览器地址栏的完整网址粘进来")
+    if "://" not in raw:
+        raw = "http://" + raw      # urlparse 没有 scheme 解不出 query
 
-            if err:
-                _AMZ_AUTHZ.update(
-                    state="error", message="授权失败：" + str(err)[:300],
-                )
-            elif code:
-                try:
-                    tok = requests.post(
-                        _amz_lwa_host() + "/auth/o2/token",
-                        data={
-                            "grant_type": "authorization_code",
-                            "code": code,
-                            "client_id": client_id,
-                            "client_secret": client_secret,
-                            "redirect_uri": redirect,
-                        },
-                        timeout=20,
-                    ).json()
-                    rt = str(tok.get("refresh_token") or "")
-                    if not rt:
-                        raise RuntimeError(
-                            str(tok.get("error_description") or tok)[:300]
-                        )
-                    # D1.4.1：密钥不落本机，直接存到服务器——这样
-                    # 换电脑、员工机都能用，拿不走密钥本身。
-                    b = bind or {}
-                    saved = _amz_store_save({
-                        "name": str(b.get("name") or "店铺"),
-                        "seller_id": str(b.get("seller_id") or ""),
-                        "marketplace": str(
-                            b.get("marketplace") or "ATVPDKIKX0DER"
-                        ),
-                        "client_id": client_id,
-                        "client_secret": client_secret,
-                        "refresh_token": rt,
-                        "app_id": app_id,
-                    })
-                    if not saved.get("ok"):
-                        raise RuntimeError(
-                            "授权成功了，但保存到服务器失败："
-                            + str(saved.get("error") or "")[:250]
-                        )
-                    _AMZ_TOKENS.clear()
-                    _AMZ_AUTHZ.update(
-                        state="done",
-                        message=(
-                            "✅ 授权成功，店铺已绑定到服务器"
-                            "（换电脑也能直接用）"
-                        ),
-                        store=(saved.get("store") or {}),
-                    )
-                except Exception as exc:
-                    _AMZ_AUTHZ.update(
-                        state="error",
-                        message="换令牌失败：" + str(exc)[:300],
-                    )
-            else:
-                _AMZ_AUTHZ.update(state="error", message="没拿到授权码")
+    q = parse_qs(urlparse(raw).query)
+    code = (q.get("spapi_oauth_code") or q.get("code") or [""])[0]
+    err = (q.get("error_description") or q.get("error") or [""])[0]
 
-            self._page(
-                "✅ 授权成功！可以关掉这个网页，回到「我的产品」窗口。"
-                if _AMZ_AUTHZ["state"] == "done"
-                else "❌ 授权没成功，回到「我的产品」窗口重试。"
-            )
-            threading.Timer(0.6, self.server.shutdown).start()
-
-    try:
-        httpd = ThreadingHTTPServer(("127.0.0.1", _AUTHZ_PORT), AuthHandler)
-    except OSError:
+    if err:
         _AMZ_AUTHZ.update(
             state="error",
-            message=f"本地 {_AUTHZ_PORT} 端口被占，关掉占它的程序再试",
+            message="亚马逊拒绝了授权：" + str(err)[:250],
         )
-        return url
-
-    threading.Thread(target=httpd.serve_forever, daemon=True).start()
-
-    def _expire() -> None:
-        if _AMZ_AUTHZ.get("state") == "running":
+    elif not code:
+        _AMZ_AUTHZ.update(
+            state="error",
+            message=(
+                "这个网址里没有授权码——要粘「点同意之后」跳转到的"
+                "那个网址（地址栏是 localhost 打不开没关系，照样复制）"
+            ),
+        )
+    else:
+        want = str(_AMZ_AUTHZ.get("oauth_state") or "")
+        got = (q.get("state") or [""])[0]
+        if want and got != want:
             _AMZ_AUTHZ.update(
                 state="error",
-                message="15 分钟没完成授权，重新点「🔓 一键授权」",
+                message=(
+                    "回链对不上（可能是上一次的旧网址）——"
+                    "重新点「开始授权」再走一遍"
+                ),
             )
-        try:
-            httpd.shutdown()
-        except Exception:
-            pass
+        else:
+            r = _amz_store_api(
+                {
+                    "action": "exchange",
+                    "code": code,
+                    "store": _AMZ_AUTHZ.get("bind") or {},
+                },
+                timeout=45,
+            )
+            if not r.get("ok"):
+                _AMZ_AUTHZ.update(
+                    state="error",
+                    message="绑定失败：" + str(r.get("error") or "")[:250],
+                )
+            else:
+                _AMZ_TOKENS.clear()
+                _AMZ_AUTHZ.update(
+                    state="done",
+                    message=(
+                        "✅ 授权成功，店铺已绑定并安全保存在服务器"
+                        "（换电脑免重绑）"
+                    ),
+                    store=(r.get("store") or {}),
+                )
 
-    threading.Timer(900, _expire).start()
-    return url
+    ok = _AMZ_AUTHZ.get("state") == "done"
+    msg = _AMZ_AUTHZ.get("message") or ""
+    return {
+        "ok": ok,
+        "state": _AMZ_AUTHZ.get("state") or "error",
+        "message": msg,
+        "error": "" if ok else msg,   # api() 抛错时前端拿得到文案
+        "store": (_AMZ_AUTHZ.get("store") or {}) if ok else {},
+    }
 
 
 # ---- 刊登数据：产品 → JSON_LISTINGS_FEED 的 messages ----
@@ -1548,12 +1559,15 @@ def _apply_words(text: str, pairs: list) -> tuple[str, int]:
 def _amz_build_messages(
     products: list, mid: str, lang: str,
     variant_mode: str, product_type: str, words: list | None = None,
+    eans: dict | None = None,
 ) -> tuple[list, list]:
     """返回 (messages, notes)。内容来源：AI 优化结果优先，没有就
     原始资料。图片只收 https（亚马逊要公网可下载）。变体：>1 行且
     行行有颜色 → 父子变体（颜色主题），否则各行独立单品。
     words=侵权词对照表：上传内容里自动替换（只改这次提交的 feed，
-    不动已存资料——和智赢刊登时替换一个道理）。"""
+    不动已存资料——和智赢刊登时替换一个道理）。
+    eans={产品#SKU: EAN}：子体/独立单品自动带条码（智赢式补码，
+    池子在服务器上，产品↔码永久绑定）。"""
 
     pairs = words or []
     hits = 0
@@ -1672,6 +1686,13 @@ def _amz_build_messages(
                 if desc:
                     attrs["product_description"] = txt(desc, 2000)
                 attrs.update(img_attrs(imgs))
+                ean = str(
+                    (eans or {}).get(f"{p.get('pid')}#{sku}") or ""
+                )
+                if ean:
+                    attrs["standard_product_id"] = [
+                        {"value": ean, "type": "EAN"}
+                    ]
                 messages.append({
                     "messageId": msg(),
                     "sku": sku,
@@ -1697,6 +1718,13 @@ def _amz_build_messages(
                 if desc:
                     attrs["product_description"] = txt(desc, 2000)
                 attrs.update(img_attrs(imgs))
+                ean = str(
+                    (eans or {}).get(f"{p.get('pid')}#{sku}") or ""
+                )
+                if ean:
+                    attrs["standard_product_id"] = [
+                        {"value": ean, "type": "EAN"}
+                    ]
                 messages.append({
                     "messageId": msg(),
                     "sku": sku,
@@ -1869,10 +1897,48 @@ def _amz_start_upload(
             info = _MARKETPLACES.get(mid, ("na", "en_US", ""))
 
             words = _dict_words()   # 侵权词对照（读不到=空，不挡上传）
+
+            # EAN 补码（智赢式：池子在服务器，产品↔码永久绑定）。
+            # 只给「有 https 图、行行有 SKU」的算，免得浪费码池。
+            ekeys: list = []
+            for p in products:
+                has_https = str(p.get("img") or "").startswith("https://")
+                if not has_https:
+                    for r in p.get("raw") or []:
+                        for u in (r.get("image_urls") or []) + (
+                            r.get("detail_image_urls") or []
+                        ):
+                            if str(u or "").strip().startswith("https://"):
+                                has_https = True
+                                break
+                        if has_https:
+                            break
+                if not has_https:
+                    continue
+                pid = str(p.get("pid") or p.get("sku") or "")
+                for r in p.get("raw") or []:
+                    sku = str(
+                        (r.get("raw_data") or {}).get("SKU") or ""
+                    ).strip()
+                    k = f"{pid}#{sku}"
+                    if sku and k not in ekeys:
+                        ekeys.append(k)
+            eans, ean_err, ean_prefix = (
+                _amz_ean_assign(ekeys) if ekeys else ({}, "", "")
+            )
             messages, notes = _amz_build_messages(
                 products, mid, info[1], variant_mode, product_type,
-                words=words,
+                words=words, eans=eans,
             )
+            if ean_err:
+                notes.append(
+                    "⚠️ EAN 补码服务没连上，这次上传不带条码：" + ean_err
+                )
+            elif eans:
+                notes.append(
+                    f"🏷 已自动补 {len(eans)} 个 EAN 条码"
+                    + (f"（前缀 {ean_prefix}…）" if ean_prefix else "")
+                )
             if not messages:
                 raise RuntimeError(
                     "没有可上传的内容：" + "；".join(notes)[:300]
@@ -2024,6 +2090,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({
                     "ok": True, "version": VERSION,
                     "proxy_mode": PROXY_MODE,
+                    "uptime": round(time.time() - _STARTED_AT),
                 })
                 return
 
@@ -2206,6 +2273,11 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 stores, srv_err = _amz_stores()
                 active = _amz_active_store(stores)
+                app = _amz_app_info()
+                try:
+                    ean = _ean_api({"action": "status"}, timeout=15)
+                except Exception:
+                    ean = {}
                 mk = (
                     str(active.get("marketplace") or "")
                     if active else ""
@@ -2226,6 +2298,9 @@ class Handler(BaseHTTPRequestHandler):
                         if active else str(c.get("seller_id") or "")
                     ),
                     "is_admin": is_admin(),
+                    "app_set": bool(app.get("set")),
+                    "app_err": app.get("err") or "",
+                    "ean": ean if ean.get("ok") else None,
                     "markets": [
                         [i, f"{v[2]}（{v[0].upper()}）"]
                         for i, v in _MARKETPLACES.items()
@@ -3107,38 +3182,91 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if url.path == "/api/amazon/authorize/start":
-                c = _amz_cfg()
-                app_id = str(body.get("app_id") or c.get("app_id") or "").strip()
-                client_id = str(
-                    body.get("client_id") or c.get("client_id") or ""
-                ).strip()
-                client_secret = str(
-                    body.get("client_secret") or c.get("client_secret") or ""
-                ).strip()
+                # D1.6.0 智赢式授权第 1 步：只要店铺名/卖家ID/站点
+                # 三栏（应用凭证在服务器上配一次，全店共用）。
                 name = str(body.get("name") or "").strip()[:40]
                 seller_id = str(body.get("seller_id") or "").strip()[:40]
                 marketplace = str(body.get("marketplace") or "").strip()
                 if marketplace not in _MARKETPLACES:
                     marketplace = "ATVPDKIKX0DER"
-                if not (app_id and client_id and client_secret
-                        and seller_id and name):
+                if not (name and seller_id):
                     self._json({
                         "ok": False,
-                        "error": (
-                            "先把 店铺名称 / 卖家ID / App ID / "
-                            "Client ID / Client Secret 都填好，再点授权绑定"
-                        ),
+                        "error": "先把 店铺名称 和 卖家ID 填好，再点开始授权",
                     }, 400)
                     return
-                url_out = _amz_start_authorize(
-                    app_id, client_id, client_secret,
-                    bind={
-                        "name": name,
-                        "seller_id": seller_id,
-                        "marketplace": marketplace,
-                    },
-                )
+                url_out = _amz_begin_authorize({
+                    "name": name,
+                    "seller_id": seller_id,
+                    "marketplace": marketplace,
+                })
                 self._json({"ok": True, "url": url_out})
+                return
+
+            # 智赢式授权第 2 步：粘回跳转网址 → 抽 code → 服务器换令牌
+            if url.path == "/api/amazon/authorize/finish":
+                r = _amz_finish_authorize(str(body.get("url") or ""))
+                self._json(r)      # ok:false 也回 200，前端照渲染红字回执
+                return
+
+            # 一次性配置公共应用凭证（仅管理员；存服务器，不再回显）
+            if url.path == "/api/amazon/app/save":
+                app = {
+                    "app_id": str(
+                        (body.get("app_id") or "").strip()
+                    )[:300],
+                    "client_id": str(
+                        (body.get("client_id") or "").strip()
+                    )[:300],
+                    "client_secret": str(
+                        (body.get("client_secret") or "").strip()
+                    )[:300],
+                }
+                if not all(app.values()):
+                    self._json({
+                        "ok": False,
+                        "error": "App ID / Client ID / Client Secret 都要填",
+                    }, 400)
+                    return
+                try:
+                    r = _amz_store_api({"action": "app_save", "app": app})
+                except Exception as exc:
+                    r = {"ok": False, "error": f"连不上服务器：{exc}"[:200]}
+                self._json(
+                    r if r.get("ok") else
+                    {"ok": False, "error": str(r.get("error") or "")[:300]},
+                    200 if r.get("ok") else 400,
+                )
+                return
+
+            # 店铺管理页的「测连接」：向服务器要一次短令牌
+            if url.path == "/api/amazon/store/test":
+                sid = str(body.get("id") or "").strip()
+                if not sid:
+                    self._json({"ok": False, "error": "缺少店铺 id"}, 400)
+                    return
+                try:
+                    r = _amz_store_api(
+                        {"action": "token", "id": sid}, timeout=30
+                    )
+                except Exception as exc:
+                    r = {"ok": False, "error": f"连不上服务器：{exc}"[:200]}
+                self._json(
+                    {"ok": True, "token_ok": bool(r.get("ok")),
+                     "error": "" if r.get("ok")
+                     else str(r.get("error") or "")[:300]}
+                )
+                return
+
+            if url.path == "/api/ean/status":
+                try:
+                    r = _ean_api({"action": "status"}, timeout=15)
+                except Exception as exc:
+                    r = {"ok": False, "error": f"连不上服务器：{exc}"[:150]}
+                self._json(
+                    r if r.get("ok")
+                    else {"ok": False, "error": str(r.get("error") or "")[:200]}
+                )
                 return
 
             # 选中店铺（本机记住默认用哪家店传）
@@ -3314,17 +3442,39 @@ def main() -> None:
 
     port = int(CONFIG.get("port") or 17891)
 
+    # D1.6.0 修「双窗口/双开」：Windows 上 SO_REUSEADDR 允许第二个
+    # 实例把同一端口再 bind 一次（历史上的 17891 双绑定僵尸就是这么
+    # 来的）。独占端口后，第二个实例才会老实走「已在跑」分支。
+    class Srv(ThreadingHTTPServer):
+        allow_reuse_address = 0
+
+        def server_bind(self):
+            if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+                self.socket.setsockopt(
+                    socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1
+                )
+            super().server_bind()
+
     try:
-        server = ThreadingHTTPServer(
-            ("127.0.0.1", port), Handler
-        )
+        server = Srv(("127.0.0.1", port), Handler)
     except OSError:
-        # 已有实例在跑：只弹窗口
+        # 已有实例在跑。刚启动的实例自己会弹窗口——它启动 3 秒内
+        # 我们再弹就成「双窗口」了，直接静默退出（D1.6.0 修复）。
+        # os._exit：引擎的非 daemon 线程会拖着进程不退（留僵尸）。
+        try:
+            h = requests.get(
+                f"http://127.0.0.1:{port}/api/health", timeout=2,
+                proxies={"http": None, "https": None},
+            ).json()
+            if 0 <= int(h.get("uptime") or 99) < 3:
+                os._exit(0)
+        except Exception:
+            pass
         _open_window(f"http://127.0.0.1:{port}/")
-        return
+        os._exit(0)
 
     url = f"http://127.0.0.1:{port}/"
-    threading.Timer(0.4, lambda: _open_window(url)).start()
+    threading.Timer(0.6, lambda: _open_window(url)).start()
 
     print(f"我的产品桌面版 {VERSION} → {url}（Ctrl+C 退出）")
 

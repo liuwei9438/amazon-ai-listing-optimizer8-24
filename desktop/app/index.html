@@ -338,24 +338,53 @@
       <div class="form-row"><label>上传店铺</label>
         <select id="azStore" class="inp" style="flex:1"></select>
         <button id="azBind" class="btn small" title="绑定一家新店铺（只需做一次）">➕ 绑定新店铺</button>
+        <button id="azMgmtBtn" class="btn small hidden" title="已绑定店铺的清单、令牌状态、解绑">🏪 店铺管理</button>
         <button id="azStoreDel" class="btn small danger hidden" title="解绑选中的店铺">🗑 解绑</button>
+      </div>
+
+      <div id="azMgmt" class="hidden">
+        <div class="d-sub">🏪 店铺管理（已绑定 = 已安全保存在服务器，换电脑免重绑）</div>
+        <table class="recycle-table"><thead><tr>
+          <th>店铺</th><th>站点</th><th>卖家 ID</th><th>授权时间</th><th style="width:110px">令牌状态</th><th style="width:150px">操作</th>
+        </tr></thead><tbody id="azMgmtBody"></tbody></table>
+        <div id="azEanBox" class="d-imghint"></div>
       </div>
 
       <div id="amzCfgBox" class="hidden d-editform">
         <div class="d-imghint">绑定 = 这家店授权给咱们系统一次，之后<b>任何电脑</b>登录都能直接传这家店（密钥存在公司服务器，不落电脑）。</div>
-        <label>店铺名称（自己起个好认的，比如「美国店-1」）</label>
-        <input id="azName" class="inp" placeholder="例如：美国店-1" maxlength="40">
+
+        <div id="azAppBox" class="hidden">
+          <div class="warn">🔧 首次使用：先把<b>公共应用凭证</b>配置一次（全公司只配这一次，存在服务器上；之后每家店绑定都只用填三栏）。在开发者后台「LWA 凭证 → 查看」里复制这三样。</div>
+          <label>App ID</label>
+          <input id="azAppId" class="inp" placeholder="amzn1.sp.solution.…">
+          <label>Client ID</label>
+          <input id="azClientId" class="inp" placeholder="amzn1.application-oa2-client.…">
+          <label>Client Secret（只存服务器，不会再显示）</label>
+          <input id="azClientSecret" class="inp" type="password" placeholder="粘贴密钥">
+          <button id="azAppSave" class="btn small primary wide">🔧 保存应用凭证（一次性）</button>
+        </div>
+
+        <label>店铺名称（自己起个好认的，比如「英国店-xhsm」）</label>
+        <input id="azName" class="inp" placeholder="例如：英国店-xhsm" maxlength="40">
         <label>卖家 ID（Seller Central → 设置 → 账户信息 → 商家令牌，A 开头）</label>
         <input id="azSeller" class="inp" placeholder="例如 A1B2C3D4E5F6G7" maxlength="40">
-        <label>默认上传站点</label>
+        <label>站点</label>
         <select id="azMarket" class="inp"></select>
-        <label>Client ID / Client Secret（这家店卖家后台「应用程序和服务 → 开发应用程序」里的 LWA 凭证）</label>
-        <input id="azClientId" class="inp" placeholder="Client ID（amzn1.application-oa2-client.…）">
-        <input id="azClientSecret" class="inp" type="password" placeholder="Client Secret">
-        <label>App ID（同在「开发应用程序」页）</label>
-        <input id="azAppId" class="inp" placeholder="App ID（amzn1.sp.solution.…）">
-        <button id="azAuth" class="btn small primary wide">🔓 去亚马逊授权并绑定</button>
-        <div class="d-imghint">点按钮会打开亚马逊页面 → 登录这家店 → 点「同意」，成功后自动回来。后台「开发应用程序」里要把跳转地址(redirect URI)填成 <b>http://localhost:9999/callback</b></div>
+        <button id="azAuth" class="btn small primary wide">🔓 开始授权（复制链接，去店铺自己的环境打开）</button>
+
+        <div id="azPasteBox" class="hidden">
+          <div class="d-sub">第 1 步 · 复制这条授权链接</div>
+          <div class="form-row">
+            <input id="azAuthUrl" class="inp" readonly style="flex:1">
+            <button id="azCopy" class="btn small">📋 复制授权链接</button>
+          </div>
+          <div class="d-sub">第 2 步 · 在这家店<b>自己的浏览器环境</b>（紫鸟/智赢）里打开链接 → 登录这家店 → 点「同意」</div>
+          <div class="d-imghint">⚠️ 别在本机直接打开！登录 IP 要和店铺平时一致才安全（和智赢一个逻辑）。</div>
+          <div class="d-sub">第 3 步 · 点完「同意」后跳转的页面可能打不开——没关系，复制浏览器<b>地址栏的完整网址</b>粘到下面</div>
+          <textarea id="azPaste" class="inp" rows="3" placeholder="http://localhost:9999/callback?spapi_oauth_code=…&state=…"></textarea>
+          <button id="azFinish" class="btn primary wide">✅ 完成，绑定这家店</button>
+        </div>
+        <div id="azReceipt"></div>
       </div>
 
       <div class="form-row"><label>变体方式</label>
