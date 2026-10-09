@@ -107,6 +107,7 @@
       <div class="recycle-title" style="margin-top:26px">🗂 分类 → 亚马逊分类节点（放进哪个货架）</div>
       <div class="d-imghint" style="margin-bottom:8px">映射后上传时自动带「亚马逊分类节点」，商品直接放进对应的<b>亚马逊分类</b>（比如 汽车配件/方向盘 → 亚马逊的 Steering Wheels 货架）。<b>没映射的分类默认不让上传</b>——放错分类有封号风险，不让亚马逊自动猜（上传弹窗里可自己放开）。全公司共用一份。</div>
       <div class="words-addrow">
+        <select id="btSite" class="inp" style="max-width:110px"></select>
         <input id="btCat" class="inp" placeholder="产品分类（如 汽车配件/方向盘）" maxlength="120">
         <input id="btNode" class="inp" placeholder="亚马逊节点 ID（纯数字，如 15684181）" maxlength="20">
         <input id="btName" class="inp" placeholder="节点名（备注用，如 Steering Wheels）" maxlength="120">
@@ -115,7 +116,7 @@
       </div>
       <table class="recycle-table">
         <thead><tr>
-          <th style="width:46px">序号</th><th>产品分类</th><th>亚马逊节点 ID</th><th>节点名</th><th>添加时间</th><th style="width:80px">操作</th>
+          <th style="width:46px">序号</th><th style="width:56px">站点</th><th>产品分类</th><th>亚马逊节点 ID</th><th>节点名</th><th>添加时间</th><th style="width:80px">操作</th>
         </tr></thead>
         <tbody id="btBody"></tbody>
       </table>
@@ -472,8 +473,9 @@
   <div class="modal-box wide">
     <div class="modal-head"><b>🔍 帮我找节点</b><button class="btn ghost" data-close>✖</button></div>
     <div class="modal-body">
-      <div class="d-imghint">输入中文分类，自动去亚马逊英国站找对应的分类货架（AI 翻译 + 官网核对，要几十秒）。找到后点「用这个」自动入库。</div>
+      <div class="d-imghint">输入中文分类，选对国家站点，自动去亚马逊官网找对应的分类货架（AI 翻译 + 官网核对，要几十秒）。找到后点「用这个」自动入库。<b>各国亚马逊的节点编号不通用</b>，同一个分类要按国家分别配一次。</div>
       <div class="words-addrow">
+        <select id="bsSite" class="inp" style="max-width:130px"></select>
         <input id="bsCat" class="inp" placeholder="产品分类（如 汽车用品/方向盘套）" maxlength="120">
         <button id="bsRun" class="btn small primary">🔍 开始找</button>
       </div>

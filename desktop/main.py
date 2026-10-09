@@ -42,7 +42,7 @@ ROOT = APP_DIR.parent                          # 仓库根
 os.chdir(ROOT)                                 # 引擎的 tasks/ 落在根目录
 sys.path.insert(0, str(ROOT))
 
-VERSION = "D1.9.0"
+VERSION = "D1.10.0"
 APP_DIR_NAME = "app"
 
 DEFAULT_CONFIG = {
@@ -1175,6 +1175,17 @@ _MARKETPLACES = {           # marketplaceId → (区域, 语言, 名称)
     "A19VAU5U5O7RUS": ("fe", "en_SG", "新加坡 SG"),
 }
 
+# D1.10.0：marketplaceId → 站点代码（分类节点库按站点分，各国
+# 节点编号不通用）。上传时只取本站点配的 btmap 映射。
+_MID_SITE = {
+    "ATVPDKIKX0DER": "US", "A2EUQ1WTGCTBG2": "CA", "A1AM78C64UM0Y8": "MX",
+    "A2Q3Y263D00KWC": "BR", "A1F83G8C2ARO7P": "UK", "A1PA6795UKMFR9": "DE",
+    "A13V1IB3VIYZZH": "FR", "APJ6JRA9NG5V4": "IT", "A1RKKUPIHCS9HS": "ES",
+    "A2NODRKZP88ZB9": "NL", "A1805IZSGTT6HS": "SE", "A1C3SOZRARQ6R3": "PL",
+    "A2VIGQ35RCS4UG": "AE", "A17E79C6D8DWNP": "SA", "A21TJRUUN4KGV": "IN",
+    "A1VC38T7YXB528": "JP", "A39IBJ37TRP1C6": "AU", "A19VAU5U5O7RUS": "SG",
+}
+
 _AMZ_LOCK = threading.Lock()
 _AMZ_TASK = {
     "phase": "idle",   # idle/building/uploading/polling/done/error
@@ -1580,9 +1591,10 @@ def _dict_words() -> list:
 
 
 def _dict_btmap() -> list:
-    """读「分类→亚马逊类目节点」映射 [{cat,node,name}]（worker /dict
-    btmap，全公司共享）。上传时按每个产品自己的分类带上
-    browse_classification，把商品放进亚马逊对应的分类货架。
+    """读「分类→亚马逊类目节点」映射 [{cat,node,name,site}]（worker
+    /dict btmap，全公司共享；D1.10.0 起带站点，各国编号不通用，
+    老数据没有 site 字段的算英国）。上传时按店铺所在国家取对应
+    站点的行，带上 browse_classification 把商品放进对应的分类货架。
     读不到=空，不挡上传。"""
     try:
         r = src_api(
@@ -1593,6 +1605,7 @@ def _dict_btmap() -> list:
             doc = r.get("doc") or {}
             return [
                 {
+                    "site": str(m.get("site") or "UK").strip().upper()[:8],
                     "cat": str(m.get("cat") or ""),
                     "node": str(m.get("node") or ""),
                     "name": str(m.get("name") or ""),
@@ -1876,27 +1889,30 @@ def _autocat_start(pids: list) -> None:
 
 
 def _bt_norm(btmap: list | None) -> list:
-    """btmap 词典 → [(cat, node)] 干净元组表。"""
+    """btmap 词典 → [(cat, node, site)] 干净元组表（缺 site=英国）。"""
     return [
-        (str(m.get("cat") or ""), str(m.get("node") or ""))
+        (str(m.get("cat") or ""), str(m.get("node") or ""),
+         str(m.get("site") or "UK").strip().upper())
         for m in (btmap or []) if m.get("cat") and m.get("node")
     ]
 
 
-def _bt_node_of(cat: str, bt: list) -> str:
-    """产品分类 → 亚马逊类目节点：精确命中优先，其次最长父级
-    前缀（选了「汽车配件」的映射，方向盘套也跟着用）。
-    没命中回 ""（=不上传时带不带节点由调用方决定）。"""
-    if not bt:
+def _bt_node_of(cat: str, bt: list, site: str = "UK") -> str:
+    """产品分类 → 亚马逊类目节点（先按站点过滤——各国编号不通用）：
+    精确命中优先，其次最长父级前缀（选了「汽车配件」的映射，
+    方向盘套也跟着用）。没命中回 ""（=不上传时带不带节点由调用方决定）。"""
+    site = str(site or "UK").strip().upper()
+    rows = [(c, n) for c, n, s in (bt or []) if s == site]
+    if not rows:
         return ""
     cat = str(cat or "").strip()
     if not cat:
         return ""
-    for c, n in bt:
+    for c, n in rows:
         if c == cat:
             return n
     best, bn = 0, ""
-    for c, n in bt:
+    for c, n in rows:
         if cat.startswith(c + "/") and len(c) > best:
             best, bn = len(c), n
     return bn
@@ -2026,7 +2042,7 @@ _BT_UK_SEED_RAW = """266239|Books
 340318031|Mobile Phone Automobile Accessories
 21532898031|Lanyards & Wrist Straps"""
 
-_BT_DEPTS = [
+_BT_UK_DEPTS = [
     ("560798", "Electronics & Photo"),
     ("560820", "Phones & Accessories"),
     ("248877031", "Car & Motorbike"),
@@ -2043,15 +2059,248 @@ _BT_DEPTS = [
     ("300703", "PC & Video Games"),
 ]
 
+_BT_US_SEED_RAW = """172282|Electronics
+541966|Computers
+172541|Headphones
+667846011|Home Audio
+2335752011|Cell Phones
+10048700011|Wearable Tech
+172659|Televisions
+468642|Video Games
+502394|Cameras
+11091801|Musical Instruments
+229534|Software
+213420000011|Car Electronics
+15684181|Automotive Parts & Accessories
+392446011|Deals
+206857996011|New arrivals
+206820331011|OEM parts
+10677469011|Amazon Autos
+15706571|Tires & wheels
+206820333011|Electric vehicle accessories
+15718271|Car care
+15857501|Car accessories
+15706941|Tools & equipment
+2258019011|RV parts & accessories
+404659011|Powersports & motorcycle
+15719731|Auto parts
+162302011|Truck parts & accessories
+15718791|Motor oils & fluids
+1055398|Home
+202194206011|Premium
+202194222011|New arrivals
+120868611011|Sales & deals
+204542739011|Amazon Home Kids
+2972638011|Garden & outdoor
+1063278|Decor
+284507|Kitchen & dining
+228013|Home improvement
+1063306|Furniture
+1057792|Bed & bath
+510106|Floor care
+3610841|Storage & organization
+684541011|Rugs
+3732981|Mattresses
+2619525011|Major appliances
+2617941011|Arts & crafts
+7141123011|Clothing, Shoes & Jewelry
+221271259011|Fall edit
+211953829011|Shoes
+215475993011|Jewelry
+214329668011|Travel Shop
+215441927011|Plush rush & faux fur
+221525270011|Plaids & checks
+221525282011|Chestnut and timber tones
+221525280011|Power dressing
+221525260011|Plum noir
+17020138011|See more
+221271253011|See more
+221271263011|See more
+221269235011|See more
+214018294011|Shoes
+214289137011|Accessories
+207319722011|See more
+215138479011|Shoes
+3375251|Sports & Outdoors
+207316901011|New Arrivals
+212930541011|Fitness
+213022011011|Soccer
+213022010011|Tennis
+220225510011|Lacrosse
+213022786011|Pickleball
+213022354011|Volleyball
+213022230011|Softball
+213022640011|Equestrian & Rodeo
+213021892011|Baseball
+213021866011|Swimming
+213021582011|Cycling
+213021350011|Camping & Hiking
+213022094011|Hunting
+213022484011|Fishing
+212930563011|Winter Sports
+221021485011|Outdoor apparel
+221021525011|Outdoor footwear
+213022412011|Water Sports
+212930479011|Yoga
+214331747011|Recovery & wellness
+165793011|Toys & Games
+2241292011|Deals
+207316906011|New releases
+17728536011|CharacterVerse
+219536026011|Indoor play
+23539911011|Play vehicles
+256994011|Ride on toys
+166164011|Interactive toys
+166359011|Puzzles
+165993011|Playsets
+206534527011|MESH toys
+213837532011|Shop toys
+3760911|Beauty
+2619533011|Pet Supplies
+3760901|Health
+16310101|Grocery
+510080|Industrial
+21403229011|Storage & organization
+128061011|Garden tools
+128066011|Mowers & tractors
+13400641|Outdoor storage
+553782|Patio heaters
+328983011|Grills
+202194212011|Shop all
+552808|Generators
+553632|Bird feeders
+1272941011|Pool & spa supplies
+3480662011|Plants seeds & bulbs
+3043471|Snow removal
+205067900011|Shop Now
+119083793011|Amazon Autos Help
+212438749011|Shop Cars Online
+212438744011|Lease Cars Near Me
+212438743011|Online Car Marketplace
+213485994011|Sell My Car
+212438742011|Trade In Value Car
+212438745011|Buy Car Online
+210708223011|Shop Used Cars
+218823348011|Shop Hyundai Cars
+212438748011|Buy Cars Near Me
+212438746011|Best Hybrid Cars
+212438747011|Used Cars Los Angeles
+346333011|Motorcycle & Powersports
+404660011|Body & Frame Parts
+404697011|Braking
+404709011|Controls
+404772011|Drive Train
+404721011|Electrical & Batteries
+404726011|Engine
+404737011|Exhaust
+404752011|Filters
+404757011|Fuel System
+404766011|Gauges
+404789011|Ignition
+404796011|Lights
+404686011|Suspension
+404805011|Wheels & Tires
+15718801|Additives
+15718901|Antifreezes & Coolants
+15718941|Brake Fluids
+15718971|Cleaners
+15719091|Flushes
+15719191|Greases & Lubricants
+15682255011|Heavy Duty Oils & Fluids
+15719331|Oils
+15719541|Power Steering Fluids
+15719551|Radiator Conditioners & Protectants
+15719561|Refrigerants
+15719641|Transmission Fluids
+15719651|Windshield Washer Fluids
+15719661|Winter Products
+2407755011|Cell Phone Accessories
+2407760011|Cell Phone Cases, Holsters & Clips
+21209106011|Adhesive Card Holders
+2407759011|Automobile Accessories
+21209107011|Cables & Adapters
+21103668011|Camera Privacy Covers
+2407761011|Chargers & Power Adapters
+21209101011|Décor
+21209102011|Gaming Accessories
+21209098011|Grips
+24046923011|Headphones, Earbuds & Accessories
+18022313011|Item Finders
+21209103011|Lanyards & Wrist Straps
+21209105011|Maintenance, Upkeep & Repairs
+3015433011|Micro SD Cards
+23690035011|Mounts
+21209100011|Photo & Video Accessories
+689637011|Portable Speakers & Docks
+21209099011|Screen Expanders & Magnifiers
+2407782011|Signal Boosters
+18021376011|Single Ear Bluetooth Headsets
+7939902011|Smartwatch Accessories
+23690036011|Stands
+11548954011|Stylus Pens
+21268231011|UV Phone Sterilizer Boxes
+14775002011|Virtual Reality (VR) Headsets"""
+
+_BT_US_DEPTS = [
+    ("172282", "Electronics"),
+    ("2335752011", "Cell Phones & Accessories"),
+    ("15684181", "Automotive Parts & Accessories"),
+    ("1055398", "Home & Kitchen"),
+    ("7141123011", "Clothing, Shoes & Jewelry"),
+    ("3375251", "Sports & Outdoors"),
+    ("165793011", "Toys & Games"),
+    ("3760911", "Beauty & Personal Care"),
+    ("2619533011", "Pet Supplies"),
+    ("468642", "Video Games"),
+    ("541966", "Computers"),
+    ("3760901", "Health & Household"),
+    ("16310101", "Grocery & Gourmet Food"),
+    ("510080", "Industrial"),
+    ("2972638011", "Baby"),
+]
+
+# D1.10.0 各国站点：亚马逊各国节点编号不通用（同一个「手机壳」
+# 英/美是两个号），找节点/词典都按站点分开。UK/US 有官网挖好+标题
+# 验证过的分类库；其他站点先立架构，等真开店再攒库（首页全被反爬
+# 挡住，得换通道挖）。
+_BT_SITES = {
+    "UK": {
+        "label": "英国", "base": "https://www.amazon.co.uk",
+        "al": "en-GB,en;q=0.9", "lang": "英文",
+        "seed": _BT_UK_SEED_RAW, "depts": _BT_UK_DEPTS,
+    },
+    "US": {
+        "label": "美国", "base": "https://www.amazon.com",
+        "al": "en-US,en;q=0.9", "lang": "英文",
+        "seed": _BT_US_SEED_RAW, "depts": _BT_US_DEPTS,
+    },
+    "CA": {"label": "加拿大", "base": "https://www.amazon.ca", "al": "en-CA,en;q=0.9"},
+    "MX": {"label": "墨西哥", "base": "https://www.amazon.com.mx", "al": "es-MX,es;q=0.9"},
+    "BR": {"label": "巴西", "base": "https://www.amazon.com.br", "al": "pt-BR,pt;q=0.9"},
+    "DE": {"label": "德国", "base": "https://www.amazon.de", "al": "de-DE,de;q=0.9"},
+    "FR": {"label": "法国", "base": "https://www.amazon.fr", "al": "fr-FR,fr;q=0.9"},
+    "IT": {"label": "意大利", "base": "https://www.amazon.it", "al": "it-IT,it;q=0.9"},
+    "ES": {"label": "西班牙", "base": "https://www.amazon.es", "al": "es-ES,es;q=0.9"},
+    "NL": {"label": "荷兰", "base": "https://www.amazon.nl", "al": "nl-NL,nl;q=0.9"},
+    "SE": {"label": "瑞典", "base": "https://www.amazon.se", "al": "sv-SE,sv;q=0.9"},
+    "PL": {"label": "波兰", "base": "https://www.amazon.pl", "al": "pl-PL,pl;q=0.9"},
+    "AE": {"label": "阿联酋", "base": "https://www.amazon.ae", "al": "en-AE,en;q=0.9"},
+    "SA": {"label": "沙特", "base": "https://www.amazon.sa", "al": "en-SA,en;q=0.9"},
+    "IN": {"label": "印度", "base": "https://www.amazon.in", "al": "en-IN,en;q=0.9"},
+    "JP": {"label": "日本", "base": "https://www.amazon.co.jp", "al": "ja-JP,ja;q=0.9"},
+    "AU": {"label": "澳大利亚", "base": "https://www.amazon.com.au", "al": "en-AU,en;q=0.9"},
+    "SG": {"label": "新加坡", "base": "https://www.amazon.sg", "al": "en-SG,en;q=0.9"},
+}
+
 _BT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
           "AppleWebKit/537.36 (KHTML, like Gecko) "
           "Chrome/126.0.0.0 Safari/537.36")
 
 
-def _bt_seed() -> dict:
-    """英国站同源锚点库 {node: name}（挖矿攒的 10-09 那批）。"""
+def _bt_seed(site: str = "UK") -> dict:
+    """这个站的同源锚点库 {node: name}（挖矿攒的，10-09 那批）。"""
     out: dict = {}
-    for ln in _BT_UK_SEED_RAW.splitlines():
+    for ln in str((_BT_SITES.get(site) or {}).get("seed") or "").splitlines():
         ln = ln.strip()
         if "|" not in ln:
             continue
@@ -2062,17 +2311,22 @@ def _bt_seed() -> dict:
     return out
 
 
-def _bt_site() -> str:
-    """亚马逊英国站基址（测试可用 amazon.site_base 覆盖）。"""
+def _bt_site(site: str = "UK") -> str:
+    """站点基址（测试可用 amazon.site_base 覆盖全部站点）。"""
     amz = CONFIG.get("amazon") or {}
-    return str(amz.get("site_base") or "").strip() or "https://www.amazon.co.uk"
+    over = str(amz.get("site_base") or "").strip()
+    if over:
+        return over.rstrip("/")
+    cfg = _BT_SITES.get(site) or _BT_SITES["UK"]
+    return str(cfg.get("base") or "https://www.amazon.co.uk")
 
 
-def _bt_fetch(path: str, tries: int = 3) -> str:
+def _bt_fetch(path: str, site: str = "UK", tries: int = 3) -> str:
     """拉一个亚马逊节点页。前几遍按环境走（setup_proxy 已设代理就
     走代理），最后一遍显式走 config 代理兜底（直连环境救回来用）。
     空串=没拉到。"""
-    url = _bt_site().rstrip("/") + path
+    cfg = _BT_SITES.get(site) or _BT_SITES["UK"]
+    url = _bt_site(site).rstrip("/") + path
     for attempt in range(tries):
         prox = None
         if attempt == tries - 1:
@@ -2083,7 +2337,7 @@ def _bt_fetch(path: str, tries: int = 3) -> str:
             r = requests.get(
                 url, timeout=12, allow_redirects=True,
                 headers={"User-Agent": _BT_UA,
-                         "Accept-Language": "en-GB,en;q=0.9"},
+                         "Accept-Language": cfg.get("al") or "en-GB,en;q=0.9"},
                 proxies=prox,
             )
             if r.status_code == 200 and len(r.text) > 60000:
@@ -2146,10 +2400,22 @@ def _bt_score(kw: set, name: str) -> int:
     return s
 
 
-def _bt_search(cat: str) -> dict:
-    """中文分类 → 候选节点列表（D1.9.0 🔍 帮我找节点后端）。
-    AI 翻译选部门 → 种子锚点打分 → 不够好拉部门节点页（最多再
-    钻一层）→ 前三名拉页面用标题验证。人点「用这个」才入库。"""
+def _bt_search(cat: str, site: str = "UK") -> dict:
+    """中文分类 → 候选节点列表（🔍 帮我找节点后端；D1.10.0 起按
+    站点，各国节点编号不通用）。AI 翻译选类目页 → 种子锚点打分 →
+    不够好拉类目页钻取（最多再钻一层）→ 前三名拉页面用标题验证。
+    人点「用这个」才入库。"""
+    site = str(site or "UK").strip().upper()[:8]
+    cfg = _BT_SITES.get(site)
+    if not cfg:
+        return {"ok": False, "error": f"不认识的站点代码：{site}"}
+    if not cfg.get("seed"):
+        return {"ok": False, "error": (
+            f"{cfg.get('label') or site}站的分类库还没攒好——各国亚马逊"
+            "的节点编号不通用，等在那个国家开店时告诉我，再照英国/"
+            "美国的方式挖一套。现在先配 英国/美国 的。"
+        )}
+
     leaf = str(cat or "").strip().split("/")[-1].strip()
     if not leaf:
         return {"ok": False, "error": "先填产品分类（如 汽车用品/方向盘套）"}
@@ -2161,19 +2427,21 @@ def _bt_search(cat: str) -> dict:
             "或让管理员在服务器保存全局 Key。"
         )}
 
-    seed = _bt_seed()
+    seed = _bt_seed(site)
     # 给 AI 的清单：node=英文名（btmap 带的中文备注截掉，省 token）
     seed_line = "; ".join(
         f"{n}=" + re.sub(r"[^\x00-\x7F].*$", "", t).strip() or f"{n}=?"
         for n, t in seed.items()
     )
+    label = cfg.get("label") or site
+    lang = cfg.get("lang") or "英文"
     prompt = (
-        "你在帮亚马逊英国站卖家做分类映射。把下面的中文产品分类翻译成"
-        "亚马逊英国站最标准的英文类目名（名词、复数，用来搜索匹配，"
+        f"你在帮亚马逊{label}站卖家做分类映射。把下面的中文产品分类翻译成"
+        f"亚马逊{label}站最标准的{lang}类目名（名词、复数，用来搜索匹配，"
         "如 steering wheel covers），并从类目页列表里挑 1-2 个最可能"
         "包含它的类目页（软件会打开这些页往下找子类目）。\n"
         f"中文分类：{cat}\n类目页列表：{seed_line}\n"
-        '只输出一行 JSON：{"kw":"英文类目名","drill":["类目页node数字"]}'
+        '只输出一行 JSON：{"kw":"类目名","drill":["类目页node数字"]}'
     )
     try:
         raw = _ai_chat_one(prompt, key, provider, model,
@@ -2199,10 +2467,11 @@ def _bt_search(cat: str) -> dict:
 
     # AI 没挑类目页：按词面从部门表兜底挑一个（顶级部门页是门户版
     # 不带子类锚点，但聊胜于无）
+    depts = dict(cfg.get("depts") or {})
     if not drill:
-        drill = [max(dict(_BT_DEPTS),
+        drill = [max(depts,
                      key=lambda n: len(kw & _bt_tokens(
-                         dict(_BT_DEPTS)[n])))]
+                         depts.get(n) or "")))]
 
     pool = dict(seed)
 
@@ -2221,7 +2490,7 @@ def _bt_search(cat: str) -> dict:
     for tgt in drill:
         if cand and cand[0][2] >= 6:
             break
-        page = _bt_fetch(f"/b?node={tgt}")
+        page = _bt_fetch(f"/b?node={tgt}", site)
         fetched.append(tgt)
         if not page:
             continue
@@ -2238,7 +2507,7 @@ def _bt_search(cat: str) -> dict:
                 if s <= 0 or n in fetched:
                     continue
                 fetched.append(n)
-                sub = _bt_fetch(f"/b?node={n}")
+                sub = _bt_fetch(f"/b?node={n}", site)
                 if sub:
                     for n2, t2 in _bt_anchors(sub):
                         pool.setdefault(n2, t2)
@@ -2256,7 +2525,7 @@ def _bt_search(cat: str) -> dict:
     for n, t, _s in cand[:6]:
         title, verified = "", False
         if len(items) < 3:
-            page = _bt_fetch(f"/b?node={n}")
+            page = _bt_fetch(f"/b?node={n}", site)
             if page:
                 title = _bt_title(page)
                 nt = _bt_tokens(t)
@@ -2271,6 +2540,7 @@ def _amz_build_messages(
     products: list, mid: str, lang: str,
     variant_mode: str, product_type: str, words: list | None = None,
     eans: dict | None = None, btmap: list | None = None,
+    site: str = "UK",
 ) -> tuple[list, list, dict]:
     """返回 (messages, notes)。内容来源：AI 优化结果优先，没有就
     原始资料。图片只收 https（亚马逊要公网可下载）。变体：>1 行且
@@ -2279,22 +2549,19 @@ def _amz_build_messages(
     不动已存资料——和智赢刊登时替换一个道理）。
     eans={产品#SKU: EAN}：子体/独立单品自动带条码（智赢式补码，
     池子在服务器上，产品↔码永久绑定）。
-    btmap=分类→亚马逊类目节点：产品分类精确匹配（其次父级前缀）
-    命中时，子体/独立单品带 browse_classification，放进亚马逊
-    对应分类（父体不带）。
+    btmap=分类→亚马逊类目节点：只取 site 站点的行（各国编号不通用），
+    产品分类精确匹配（其次父级前缀）命中时，子体/独立单品带
+    browse_classification，放进亚马逊对应分类（父体不带）。
     返回 (messages, notes, pid_skus)：pid_skus={pid: [进 feed 的 SKU…]}
     ——上传成功后按它记「已上传」（全部 SKU 成功才算传过）。"""
 
     pairs = words or []
     hits = 0
     pid_skus: dict[str, list] = {}
-    bt = [
-        (str(m.get("cat") or ""), str(m.get("node") or ""))
-        for m in (btmap or []) if m.get("cat") and m.get("node")
-    ]
+    bt = _bt_norm(btmap)
 
     def node_of(p) -> str:
-        return _bt_node_of(str(p.get("cat") or ""), bt)
+        return _bt_node_of(str(p.get("cat") or ""), bt, site)
 
     placed_nodes = 0
 
@@ -2650,6 +2917,7 @@ def _amz_start_upload(
                 or str(c.get("marketplace") or "ATVPDKIKX0DER")
             )
             info = _MARKETPLACES.get(mid, ("na", "en_US", ""))
+            site = _MID_SITE.get(mid, "US")   # 上传只取本站点的节点映射
 
             words = _dict_words()   # 侵权词对照（读不到=空，不挡上传）
             btmap = _dict_btmap()   # 分类→亚马逊类目节点（同上不挡）
@@ -2664,7 +2932,7 @@ def _amz_start_upload(
                 for p in products:
                     (
                         keep if _bt_node_of(
-                            str(p.get("cat") or ""), bt
+                            str(p.get("cat") or ""), bt, site
                         ) else dropped
                     ).append(p)
                 if dropped:
@@ -2712,7 +2980,7 @@ def _amz_start_upload(
             )
             messages, notes, pid_skus = _amz_build_messages(
                 products, mid, info[1], variant_mode, product_type,
-                words=words, eans=eans, btmap=btmap,
+                words=words, eans=eans, btmap=btmap, site=site,
             )
             if ean_err:
                 notes.append(
@@ -3274,9 +3542,13 @@ class Handler(BaseHTTPRequestHandler):
 
             if url.path == "/api/dict/btsearch":
                 # D1.9.0 🔍 帮我找节点：中文分类 → 候选节点列表
-                # （AI 翻译 + 亚马逊英国站节点页钻取 + 标题验证），
+                # （AI 翻译 + 亚马逊站点节点页钻取 + 标题验证），
                 # 前端点「用这个」再走 btmap 保存。
-                resp = _bt_search(str(body.get("cat") or ""))
+                # D1.10.0：带 site 按国家站点找（英/美已备种子库）。
+                resp = _bt_search(
+                    str(body.get("cat") or ""),
+                    str(body.get("site") or "UK"),
+                )
                 self._json(resp)
                 return
 

@@ -22,7 +22,7 @@ const S = {
   /* D1.5.0 刊登词典（智赢式） */
   words: [],               // [{bad,fix,at,by}] 侵权词对照表（全局共享）
   ptmap: [],               // [{cat,pt,at,by}] 分类→亚马逊商品类型
-  btmap: [],               // [{cat,node,name,at,by}] 分类→亚马逊分类节点
+  btmap: [],               // [{cat,node,name,site,at,by}] 分类→亚马逊分类节点（按国家站点）
 };
 
 /* D = 当前详情弹窗的图片编辑状态；IE = 图片编辑器状态；AZ = 亚马逊上传 */
@@ -1487,14 +1487,18 @@ function renderWords() {
 
   const bl = [...S.btmap].sort((a, b) => (b.at || 0) - (a.at || 0));
   $("btEmpty").classList.toggle("hidden", bl.length > 0);
-  $("btBody").innerHTML = bl.map((m, i) => `<tr>
+  $("btBody").innerHTML = bl.map((m, i) => {
+    const st = String(m.site || "UK").toUpperCase();
+    return `<tr>
       <td>${i + 1}</td>
+      <td>${esc(btSiteLabel(st))}</td>
       <td>${esc(m.cat)}</td>
       <td><b>${esc(m.node)}</b></td>
       <td>${esc(m.name)}</td>
       <td>${fmtMs(Number(m.at) || 0)}${m.by ? " · " + esc(m.by) : ""}</td>
-      <td>${ro ? "" : `<button class="btn small danger" data-btdel="${esc(m.cat)}">删除</button>`}</td>
-    </tr>`).join("");
+      <td>${ro ? "" : `<button class="btn small danger" data-bsite="${esc(st)}" data-btdel="${esc(m.cat)}">删除</button>`}</td>
+    </tr>`;
+  }).join("");
 }
 
 async function saveDict(kind, doc) {
@@ -1573,24 +1577,27 @@ async function ptDelMap(cat) {
 }
 
 /* D1.7.1 分类→亚马逊分类节点：上传时按产品分类自动带
-   browse_classification（放进亚马逊对应货架） */
+   browse_classification（放进亚马逊对应货架）。
+   D1.10.0：按国家站点分开存（各国节点编号不通用）。 */
 async function btAddMap() {
+  const site = (($("btSite").value || "UK")).toUpperCase();
   const cat = $("btCat").value.trim();
   const node = $("btNode").value.trim();
   const name = $("btName").value.trim();
   if (!cat || !node) { toast("分类和节点 ID 都要填", "err"); return; }
   if (!/^\d+$/.test(node)) { toast("节点 ID 是纯数字（如 15684181）", "err"); return; }
-  const old = S.btmap.find((m) => m.cat === cat);
-  if (old && old.node !== node && !confirm(`「${cat}」已映射到节点 ${old.node}，改成 ${node} 吗？`)) return;
+  const same = (m) => String(m.site || "UK").toUpperCase() === site && m.cat === cat;
+  const old = S.btmap.find(same);
+  if (old && old.node !== node && !confirm(`「${cat}」（${btSiteLabel(site)}站）已映射到节点 ${old.node}，改成 ${node} 吗？`)) return;
   try {
     busy(true, "保存…");
-    const map = S.btmap.filter((m) => m.cat !== cat);
-    map.push({ cat, node, name, at: Date.now(), by: (S.profile || {}).user || "" });
+    const map = S.btmap.filter((m) => !same(m));
+    map.push({ cat, node, name, site, at: Date.now(), by: (S.profile || {}).user || "" });
     await saveDict("btmap", { map });
     $("btCat").value = "";
     $("btNode").value = "";
     $("btName").value = "";
-    toast(old ? "✅ 已更新映射" : "✅ 已添加映射（上传时自动放进这个亚马逊分类）", "ok");
+    toast(old ? "✅ 已更新映射" : `✅ 已添加映射（${btSiteLabel(site)}站上传时自动放进这个亚马逊分类）`, "ok");
   } catch (e) {
     toast(e.message, "err", 7000);
   } finally {
@@ -1598,11 +1605,15 @@ async function btAddMap() {
   }
 }
 
-async function btDelMap(cat) {
-  if (!confirm(`确定删除「${cat}」的亚马逊分类映射？`)) return;
+async function btDelMap(site, cat) {
+  if (!confirm(`确定删除「${cat}」在${btSiteLabel(site)}站的亚马逊分类映射？`)) return;
   try {
     busy(true, "删除…");
-    await saveDict("btmap", { map: S.btmap.filter((m) => m.cat !== cat) });
+    const s0 = String(site || "UK").toUpperCase();
+    await saveDict("btmap", {
+      map: S.btmap.filter((m) =>
+        !(String(m.site || "UK").toUpperCase() === s0 && m.cat === cat)),
+    });
     toast("🗑 已删除", "ok");
   } catch (e) {
     toast(e.message, "err", 7000);
@@ -1611,11 +1622,47 @@ async function btDelMap(cat) {
   }
 }
 
-/* ---------- D1.9.0 🔍 帮我找节点：中文分类 → 后端去亚马逊英国站
+/* ---------- D1.10.0 分类节点按国家站点：各国亚马逊节点编号不通用，
+   同一分类英/美各存一条。BT_SITES=站点清单（前两个已攒好种子库，
+   🔍 找节点能自动找）；MID_SITE=店铺 marketplace → 站点 ---------- */
+const BT_SITES = [
+  ["UK", "英国"], ["US", "美国"], ["CA", "加拿大"], ["MX", "墨西哥"],
+  ["BR", "巴西"], ["DE", "德国"], ["FR", "法国"], ["IT", "意大利"],
+  ["ES", "西班牙"], ["NL", "荷兰"], ["SE", "瑞典"], ["PL", "波兰"],
+  ["AE", "阿联酋"], ["SA", "沙特"], ["IN", "印度"], ["JP", "日本"],
+  ["AU", "澳大利亚"], ["SG", "新加坡"],
+];
+const BT_SEEDED = new Set(["UK", "US"]);
+const MID_SITE = {
+  ATVPDKIKX0DER: "US", A2EUQ1WTGCTBG2: "CA", A1AM78C64UM0Y8: "MX",
+  A2Q3Y263D00KWC: "BR", A1F83G8C2ARO7P: "UK", A1PA6795UKMFR9: "DE",
+  A13V1IB3VIYZZH: "FR", APJ6JRA9NG5V4: "IT", A1RKKUPIHCS9HS: "ES",
+  A2NODRKZP88ZB9: "NL", A1805IZSGTT6HS: "SE", A1C3SOZRARQ6R3: "PL",
+  A2VIGQ35RCS4UG: "AE", A17E79C6D8DWNP: "SA", A21TJRUUN4KGV: "IN",
+  A1VC38T7YXB528: "JP", A39IBJ37TRP1C6: "AU", A19VAU5U5O7RUS: "SG",
+};
+
+function btSiteLabel(code) {
+  const t = BT_SITES.find((x) => x[0] === String(code || "UK").toUpperCase());
+  return t ? t[1] : String(code || "UK").toUpperCase();
+}
+
+/* 上传时看哪家店（或绑定表单选的站点）→ 只用这个国家的节点映射 */
+function azSiteOf() {
+  const st = ((AZ.status && AZ.status.stores) || [])
+    .find((x) => x.id === ((AZ.status && AZ.status.active_store)
+      || ($("azStore") ? $("azStore").value : "")));
+  if (st && MID_SITE[st.marketplace]) return MID_SITE[st.marketplace];
+  const mk = $("azMarket") ? MID_SITE[$("azMarket").value] : "";
+  return mk || "US";
+}
+
+/* ---------- D1.9.0 🔍 帮我找节点：中文分类 → 后端去亚马逊站点
    找候选（AI 翻译 + 节点页钻取 + 标题验证），点「用这个」入库 ---------- */
 
-function btNoNodeCats() {
-  /* 产品里用到、又没节点兜底（精确+父级前缀都没有）的分类路径 */
+function btNoNodeCats(site) {
+  /* 这个国家站点下，产品里用到、又没节点兜底（精确+父级前缀都没有）
+     的分类路径 */
   const out = new Set();
   (S.items || []).forEach((x) => {
     const c = String((x && x.cat) || "").trim();
@@ -1623,7 +1670,7 @@ function btNoNodeCats() {
     let acc = "";
     c.split("/").forEach((seg) => {
       acc = acc ? acc + "/" + seg : seg;
-      if (!btNodeOf(acc)) out.add(acc);
+      if (!btNodeOf(acc, site)) out.add(acc);
     });
   });
   return [...out].sort();
@@ -1633,20 +1680,21 @@ function btSearchOpen() {
   $("bsCat").value = $("btCat").value.trim();
   $("bsBody").innerHTML = "";
   $("bsEmpty").textContent = "";
-  const miss = btNoNodeCats();
+  const miss = btNoNodeCats($("bsSite").value || "UK");
   $("bsNoNode").innerHTML = miss.length
-    ? "还没配节点的分类（点一下填入）：" + miss.slice(0, 12).map((c) =>
+    ? "这个国家还没配节点的分类（点一下填入）：" + miss.slice(0, 12).map((c) =>
         `<button class="btn small" data-bscat="${esc(c)}" title="${esc(c)}">${esc(c.split("/").pop())}</button>`).join(" ")
-    : "你用到的分类都配好节点了 👍（要给别的分类配也可以）";
+    : "你用到的分类在这个站点都配好节点了 👍（要给别的分类配也可以）";
   $("dlgBtSearch").classList.remove("hidden");
 }
 
 async function btSearchRun() {
   const cat = $("bsCat").value.trim();
+  const site = ($("bsSite").value || "UK").toUpperCase();
   if (!cat) { toast("先填产品分类", "err"); return; }
   try {
-    busy(true, "去亚马逊英国站找类目…（AI 翻译 + 官网核对，最多一两分钟）");
-    const r = await api("/api/dict/btsearch", { cat });
+    busy(true, `去亚马逊${btSiteLabel(site)}站找类目…（AI 翻译 + 官网核对，最多一两分钟）`);
+    const r = await api("/api/dict/btsearch", { cat, site });
     const items = r.items || [];
     $("bsBody").innerHTML = items.map((it) => `<tr>
         <td><b>${esc(it.name)}</b>${it.title ? `<div class="d-imghint">${esc(it.title)}</div>` : ""}</td>
@@ -1667,6 +1715,7 @@ async function btSearchRun() {
 async function btSearchUse(node, name) {
   const cat = $("bsCat").value.trim();
   if (!cat) { toast("先填产品分类", "err"); return; }
+  $("btSite").value = ($("bsSite").value || "UK").toUpperCase();
   $("btCat").value = cat;
   $("btNode").value = node;
   $("btName").value = name;
@@ -2405,14 +2454,18 @@ async function azStart() {
 /* D1.7.0 智赢式按分类批量上传：挑「该分类里没传过的」前 N 个一次传，
    传完整批由后端记「已上传」（记在这家店上，换电脑也不重传）。
    D1.7.2：默认再剔掉「分类没配亚马逊节点」的（防放错分类封号）。 */
-function btNodeOf(cat) {
-  /* 和后端 _bt_node_of 同一规则：精确命中优先，其次最长父级前缀 */
+function btNodeOf(cat, site) {
+  /* 和后端 _bt_node_of 同一规则：精确命中优先，其次最长父级前缀。
+     D1.10.0：只看指定国家的行（各国节点编号不通用）；
+     不传 site = 按当前要上传的店铺所在国家。 */
   const c0 = String(cat || "").trim();
   if (!c0 || !(S.btmap || []).length) return "";
-  const ex = S.btmap.find((m) => m.cat === c0);
+  const s0 = String(site || azSiteOf()).toUpperCase();
+  const rows = S.btmap.filter((m) => String(m.site || "UK").toUpperCase() === s0);
+  const ex = rows.find((m) => m.cat === c0);
   if (ex) return ex.node;
   let best = "", bn = "";
-  for (const m of S.btmap) {
+  for (const m of rows) {
     if (c0.startsWith(m.cat + "/") && m.cat.length > best.length) {
       best = m.cat; bn = m.node;
     }
@@ -2466,8 +2519,8 @@ function azByCatInfo() {
   let nodeTag = "";
   if (cat && azStrictOn()) {
     nodeTag = btNodeOf(cat)
-      ? " · 节点✅"
-      : " · ⚠️ 这个分类没配亚马逊节点（先去「🛡 侵权词库」配好才能传）";
+      ? ` · ${btSiteLabel(azSiteOf())}站 节点✅`
+      : ` · ⚠️ 这个分类没配${btSiteLabel(azSiteOf())}站的亚马逊节点（先去「🛡 侵权词库」选对这个国家配好才能传）`;
   }
   $("azCatInfo").textContent =
     `共 ${inCat.length} 个 · 已传 ${done} · 可传 ${eligible.length}${nodeTag}`;
@@ -2670,6 +2723,11 @@ function bindEvents() {
   $("wzAdd").onclick = wzAddWord;
   $("ptAdd").onclick = ptAddMap;
   $("btAdd").onclick = btAddMap;
+  // D1.10.0 站点下拉：分类节点按国家分开（英/美已攒好种子库）
+  $("btSite").innerHTML = BT_SITES.map(([c, l]) =>
+    `<option value="${c}">${l}</option>`).join("");
+  $("bsSite").innerHTML = BT_SITES.map(([c, l]) =>
+    `<option value="${c}">${l}${BT_SEEDED.has(c) ? "" : "（还没攒分类库）"}</option>`).join("");
   $("btFind").onclick = btSearchOpen;              // D1.9.0 🔍 帮我找节点
   $("bsRun").onclick = btSearchRun;
   $("bsCat").addEventListener("keydown", (e) => { if (e.key === "Enter") btSearchRun(); });
@@ -2687,7 +2745,7 @@ function bindEvents() {
     const p = e.target.closest("[data-pdel]");
     if (p) { ptDelMap(p.dataset.pdel); return; }
     const bt = e.target.closest("[data-btdel]");
-    if (bt) btDelMap(bt.dataset.btdel);
+    if (bt) btDelMap(bt.dataset.bsite || "UK", bt.dataset.btdel);
   });
   $("scanOk").onclick = scanReplace;
 
@@ -2751,6 +2809,7 @@ function bindEvents() {
   // D1.7.0 按分类批量上传 + D1.7.2 防错分类开关联动计数
   $("azByCat").onclick = azByCatStart;
   $("azStrict").onchange = azByCatInfo;
+  $("azMarket").onchange = azByCatInfo;   // D1.10.0 换站点=换一套节点映射
   $("azCat").onchange = () => {
     const cat = $("azCat").value;
     if (cat && !$("azType").value) {
