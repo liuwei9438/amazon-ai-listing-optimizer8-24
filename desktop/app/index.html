@@ -105,7 +105,7 @@
       <div id="ptEmpty" class="empty hidden" style="padding:40px 0">还没有映射。上传时报「商品类型」错误的话，把后台模板里的类型名填到这里。</div>
 
       <div class="recycle-title" style="margin-top:26px">🗂 分类 → 亚马逊分类节点（放进哪个货架）</div>
-      <div class="d-imghint" style="margin-bottom:8px">映射后上传时自动带「亚马逊分类节点」，商品直接放进对应的<b>亚马逊分类</b>（比如 汽车配件/方向盘 → 亚马逊的 Steering Wheels 货架）。没映射的让亚马逊按标题自动归类。全公司共用一份。</div>
+      <div class="d-imghint" style="margin-bottom:8px">映射后上传时自动带「亚马逊分类节点」，商品直接放进对应的<b>亚马逊分类</b>（比如 汽车配件/方向盘 → 亚马逊的 Steering Wheels 货架）。<b>没映射的分类默认不让上传</b>——放错分类有封号风险，不让亚马逊自动猜（上传弹窗里可自己放开）。全公司共用一份。</div>
       <div class="words-addrow">
         <input id="btCat" class="inp" placeholder="产品分类（如 汽车配件/方向盘）" maxlength="120">
         <input id="btNode" class="inp" placeholder="亚马逊节点 ID（纯数字，如 15684181）" maxlength="20">
@@ -427,6 +427,11 @@
       </div>
       <div class="form-row"><label>商品类型</label>
         <input id="azType" class="inp" placeholder="PRODUCT（通用；报错时改成后台模板里的类型名）">
+      </div>
+      <div class="form-row"><label>防错分类</label>
+        <span class="d-imghint" style="flex:1">
+          <input type="checkbox" id="azStrict" checked> 分类没配「亚马逊分类节点」的产品<b>不上传</b>——不让亚马逊自动猜分类（放错分类有封号风险）。配好节点（侵权词库页第三张表）再传。
+        </span>
       </div>
       <div class="d-imghint">内容自动取「AI 优化结果」，没优化过的用原始资料；图片只收 https 公网图。价格和库存要在上传后到亚马逊后台（或智赢）设置。</div>
 

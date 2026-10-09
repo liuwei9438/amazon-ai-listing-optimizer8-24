@@ -2261,13 +2261,36 @@ async function azStart() {
 }
 
 /* D1.7.0 智赢式按分类批量上传：挑「该分类里没传过的」前 N 个一次传，
-   传完整批由后端记「已上传」（记在这家店上，换电脑也不重传）。 */
+   传完整批由后端记「已上传」（记在这家店上，换电脑也不重传）。
+   D1.7.2：默认再剔掉「分类没配亚马逊节点」的（防放错分类封号）。 */
+function btNodeOf(cat) {
+  /* 和后端 _bt_node_of 同一规则：精确命中优先，其次最长父级前缀 */
+  const c0 = String(cat || "").trim();
+  if (!c0 || !(S.btmap || []).length) return "";
+  const ex = S.btmap.find((m) => m.cat === c0);
+  if (ex) return ex.node;
+  let best = "", bn = "";
+  for (const m of S.btmap) {
+    if (c0.startsWith(m.cat + "/") && m.cat.length > best.length) {
+      best = m.cat; bn = m.node;
+    }
+  }
+  return bn;
+}
+
+function azStrictOn() {
+  const el = $("azStrict");
+  return !!(el && el.checked);
+}
+
 function azCatItems(cat) {
+  const strict = azStrictOn();
   const inCat = (S.items || []).filter((x) => x && x.pid
     && (!cat || (x.cat || "") === cat || (x.cat || "").startsWith(cat + "/")));
   const up = AZ.up || {};
   const eligible = inCat
-    .filter((x) => !up[x.pid] && (Number(x.n_rows) || 0) > 0)
+    .filter((x) => !up[x.pid] && (Number(x.n_rows) || 0) > 0
+      && (!strict || !!btNodeOf(x.cat)))
     .sort((a, b) => (a.created || 0) - (b.created || 0));
   return { inCat, eligible };
 }
@@ -2294,10 +2317,18 @@ function azByCatRender() {
 }
 
 function azByCatInfo() {
-  const { inCat, eligible } = azCatItems($("azCat").value);
+  const cat = $("azCat").value;
+  const { inCat, eligible } = azCatItems(cat);
   const up = AZ.up || {};
   const done = inCat.filter((x) => up[x.pid]).length;
-  $("azCatInfo").textContent = `共 ${inCat.length} 个 · 已传 ${done} · 可传 ${eligible.length}`;
+  let nodeTag = "";
+  if (cat && azStrictOn()) {
+    nodeTag = btNodeOf(cat)
+      ? " · 节点✅"
+      : " · ⚠️ 这个分类没配亚马逊节点（先去「🛡 侵权词库」配好才能传）";
+  }
+  $("azCatInfo").textContent =
+    `共 ${inCat.length} 个 · 已传 ${done} · 可传 ${eligible.length}${nodeTag}`;
   let n = parseInt($("azBatchN").value, 10) || 50;
   n = Math.max(1, Math.min(200, n));
   $("azByCat").textContent = eligible.length
@@ -2318,6 +2349,24 @@ async function azByCatStart() {
 }
 
 async function azUploadPids(pids) {
+  // D1.7.2 防错分类封号：默认拦下「分类没配亚马逊节点」的产品，
+  // 让亚马逊自动猜分类有放错被封号的风险。勾去掉=自己担责放开。
+  if (azStrictOn()) {
+    const catOf = (pid) =>
+      String(((S.items || []).find((x) => x.pid === pid) || {}).cat || "").trim();
+    const okPids = pids.filter((p) => !!btNodeOf(catOf(p)));
+    const skipped = pids.length - okPids.length;
+    if (skipped) {
+      const cats = [...new Set(pids.filter((p) => !btNodeOf(catOf(p)))
+        .map(catOf).map((c) => c || "（未分类）"))];
+      if (!okPids.length) {
+        toast(`⛔ 这 ${skipped} 个产品的分类都没配「亚马逊分类节点」，不让亚马逊瞎猜分类（防封号）。去「🛡 侵权词库」第三张表配好：${cats.slice(0, 4).join("、")}`, "err", 9000);
+        return;
+      }
+      toast(`⛔ 已拦下 ${skipped} 个产品没传（分类没配亚马逊节点，防放错分类封号）：${cats.slice(0, 4).join("、")}`, "", 8000);
+      pids = okPids;
+    }
+  }
   try {
     busy(true, "提交上传…");
     await api("/api/amazon/upload", {
@@ -2325,6 +2374,7 @@ async function azUploadPids(pids) {
       store: $("azStore").value,
       variant_mode: $("azVariant").value,
       product_type: $("azType").value.trim() || "PRODUCT",
+      allow_unmapped: !azStrictOn(),
     });
     $("amzProg").classList.remove("hidden");
     $("amzResult").innerHTML = "";
@@ -2544,8 +2594,9 @@ function bindEvents() {
   $("azBind").onclick = () => $("amzCfgBox").classList.toggle("hidden");
   $("azStore").onchange = azSelectStore;
   $("azStoreDel").onclick = azUnbind;
-  // D1.7.0 按分类批量上传
+  // D1.7.0 按分类批量上传 + D1.7.2 防错分类开关联动计数
   $("azByCat").onclick = azByCatStart;
+  $("azStrict").onchange = azByCatInfo;
   $("azCat").onchange = () => {
     const cat = $("azCat").value;
     if (cat && !$("azType").value) {

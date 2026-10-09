@@ -42,7 +42,7 @@ ROOT = APP_DIR.parent                          # 仓库根
 os.chdir(ROOT)                                 # 引擎的 tasks/ 落在根目录
 sys.path.insert(0, str(ROOT))
 
-VERSION = "D1.7.1"
+VERSION = "D1.7.2"
 APP_DIR_NAME = "app"
 
 DEFAULT_CONFIG = {
@@ -1608,6 +1608,33 @@ def _apply_words(text: str, pairs: list) -> tuple[str, int]:
     return text, n
 
 
+def _bt_norm(btmap: list | None) -> list:
+    """btmap 词典 → [(cat, node)] 干净元组表。"""
+    return [
+        (str(m.get("cat") or ""), str(m.get("node") or ""))
+        for m in (btmap or []) if m.get("cat") and m.get("node")
+    ]
+
+
+def _bt_node_of(cat: str, bt: list) -> str:
+    """产品分类 → 亚马逊类目节点：精确命中优先，其次最长父级
+    前缀（选了「汽车配件」的映射，方向盘套也跟着用）。
+    没命中回 ""（=不上传时带不带节点由调用方决定）。"""
+    if not bt:
+        return ""
+    cat = str(cat or "").strip()
+    if not cat:
+        return ""
+    for c, n in bt:
+        if c == cat:
+            return n
+    best, bn = 0, ""
+    for c, n in bt:
+        if cat.startswith(c + "/") and len(c) > best:
+            best, bn = len(c), n
+    return bn
+
+
 def _amz_build_messages(
     products: list, mid: str, lang: str,
     variant_mode: str, product_type: str, words: list | None = None,
@@ -1635,21 +1662,7 @@ def _amz_build_messages(
     ]
 
     def node_of(p) -> str:
-        """产品分类 → 亚马逊类目节点：精确命中优先，其次最长父级
-        前缀（选了「汽车配件」的映射，方向盘套也跟着用）。"""
-        if not bt:
-            return ""
-        cat = str(p.get("cat") or "").strip()
-        if not cat:
-            return ""
-        for c, n in bt:
-            if c == cat:
-                return n
-        best, bn = 0, ""
-        for c, n in bt:
-            if cat.startswith(c + "/") and len(c) > best:
-                best, bn = len(c), n
-        return bn
+        return _bt_node_of(str(p.get("cat") or ""), bt)
 
     placed_nodes = 0
 
@@ -1966,6 +1979,7 @@ def _amz_log_add(entry: dict) -> None:
 
 def _amz_start_upload(
     pids: list, variant_mode: str, product_type: str,
+    allow_unmapped: bool = True,
 ) -> None:
     def work():
         try:
@@ -2008,6 +2022,34 @@ def _amz_start_upload(
             words = _dict_words()   # 侵权词对照（读不到=空，不挡上传）
             btmap = _dict_btmap()   # 分类→亚马逊类目节点（同上不挡）
 
+            # D1.7.2 防错分类封号：分类没配亚马逊节点的产品默认
+            # 拦下不传（不让亚马逊瞎猜分类）。上传弹窗可显式放开。
+            blocked_note = ""
+            if not allow_unmapped:
+                bt = _bt_norm(btmap)
+                keep: list = []
+                dropped: list = []
+                for p in products:
+                    (
+                        keep if _bt_node_of(
+                            str(p.get("cat") or ""), bt
+                        ) else dropped
+                    ).append(p)
+                if dropped:
+                    cats = sorted({
+                        str(p.get("cat") or "").strip() or "（未分类）"
+                        for p in dropped
+                    })
+                    blocked_note = (
+                        f"⛔ 已拦下 {len(dropped)} 个产品没传：它们的分类"
+                        "没配「亚马逊分类节点」，不让亚马逊自动猜分类"
+                        "（防放错分类封号）。去「🛡 侵权词库」页第三张表"
+                        f"配好再传：{'、'.join(cats[:8])}"
+                    )
+                    products = keep
+                    if not products:
+                        raise RuntimeError(blocked_note)
+
             # EAN 补码（智赢式：池子在服务器，产品↔码永久绑定）。
             # 只给「有 https 图、行行有 SKU」的算，免得浪费码池。
             ekeys: list = []
@@ -2049,6 +2091,8 @@ def _amz_start_upload(
                     f"🏷 已自动补 {len(eans)} 个 EAN 条码"
                     + (f"（前缀 {ean_prefix}…）" if ean_prefix else "")
                 )
+            if blocked_note:
+                notes.append(blocked_note)
             if not messages:
                 raise RuntimeError(
                     "没有可上传的内容：" + "；".join(notes)[:300]
@@ -3552,7 +3596,10 @@ class Handler(BaseHTTPRequestHandler):
                         started_at=int(time.time()),
                     )
 
-                _amz_start_upload(pids, variant_mode, product_type)
+                _amz_start_upload(
+                    pids, variant_mode, product_type,
+                    allow_unmapped=bool(body.get("allow_unmapped", True)),
+                )
                 self._json({"ok": True, "count": len(pids)})
                 return
 
