@@ -350,6 +350,21 @@
         <div id="azEanBox" class="d-imghint"></div>
       </div>
 
+      <!-- D1.7.0 按分类批量上传（智赢式：传过的自动跳过） -->
+      <div id="azByCatBox" class="d-editform">
+        <div class="d-sub">🏷 按分类批量上传（这家店传过的自动跳过）</div>
+        <div class="form-row"><label>产品分类</label>
+          <select id="azCat" class="inp" style="flex:1"></select>
+        </div>
+        <div class="form-row"><label>单次上传</label>
+          <input id="azBatchN" class="inp" type="number" min="1" max="200" value="50" style="width:90px">
+          <span class="d-imghint">个以内</span>
+          <span id="azCatInfo" class="d-imghint" style="flex:1"></span>
+        </div>
+        <button id="azByCat" class="btn wide">📤 按分类上传（自动挑没传过的）</button>
+        <div class="d-imghint">按「先导入先传」挑产品，传完整批自动记为已上传；勾选后点下面「开始上传」的老方式也照旧可用。</div>
+      </div>
+
       <div id="amzCfgBox" class="hidden d-editform">
         <div class="d-imghint">绑定 = 这家店授权给咱们系统一次，之后<b>任何电脑</b>登录都能直接传这家店（密钥存在公司服务器，不落电脑）。</div>
 

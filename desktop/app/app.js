@@ -27,7 +27,7 @@ const S = {
 /* D = 当前详情弹窗的图片编辑状态；IE = 图片编辑器状态；AZ = 亚马逊上传 */
 const D = { pid: "", imgs: [], dirty: false, thin: false };
 const IE = { work: null, init: null, idx: -1, isNew: false, zoom: 1, mode: "view" };
-const AZ = { poll: null, authPoll: null, status: null };
+const AZ = { poll: null, authPoll: null, status: null, up: {} };
 const SCAN = { hits: null };   // D1.5.0 侵权扫描结果
 
 const $ = (id) => document.getElementById(id);
@@ -1998,6 +1998,10 @@ async function refreshAmz() {
       ? `🏷 EAN 条码池 · 前缀(厂商编号) <b>${esc(s.ean.prefix || "未初始化")}</b> 已锁定 · 已用 ${s.ean.used} · 剩余 ${s.ean.remaining} · 上传时自动补码，产品↔码永久绑定（重传不换码）`
       : "";
 
+    // D1.7.0 按分类批量上传：已传清单（按店铺记在服务器上）
+    AZ.up = s.uploaded || {};
+    azByCatRender();
+
     $("azMarket").innerHTML = (s.markets || []).map(([id, label]) =>
       `<option value="${esc(id)}" ${id === s.marketplace ? "selected" : ""}>${esc(label)}</option>`).join("");
     $("azType").value = s.product_type === "PRODUCT" ? "" : s.product_type;
@@ -2199,10 +2203,71 @@ async function azUnbindId(id, name) {
 }
 
 async function azStart() {
+  await azUploadPids([...S.sel]);
+}
+
+/* D1.7.0 智赢式按分类批量上传：挑「该分类里没传过的」前 N 个一次传，
+   传完整批由后端记「已上传」（记在这家店上，换电脑也不重传）。 */
+function azCatItems(cat) {
+  const inCat = (S.items || []).filter((x) => x && x.pid
+    && (!cat || (x.cat || "") === cat || (x.cat || "").startsWith(cat + "/")));
+  const up = AZ.up || {};
+  const eligible = inCat
+    .filter((x) => !up[x.pid] && (Number(x.n_rows) || 0) > 0)
+    .sort((a, b) => (a.created || 0) - (b.created || 0));
+  return { inCat, eligible };
+}
+
+function azByCatRender() {
+  const el = $("azCat");
+  if (!el) return;
+  const cur = el.value;
+  // 分类选项 = 产品里实际用到的路径（含各级父分类）
+  const cats = new Set();
+  for (const x of (S.items || [])) {
+    let acc = "";
+    for (const seg of String((x && x.cat) || "").split("/")) {
+      if (!seg) continue;
+      acc = acc ? acc + "/" + seg : seg;
+      cats.add(acc);
+    }
+  }
+  const list = [...cats].sort();
+  el.innerHTML = `<option value="">全部产品（含未分类）</option>`
+    + list.map((c) => `<option value="${esc(c)}">${esc(c)}</option>`).join("");
+  if (cur && list.includes(cur)) el.value = cur;
+  azByCatInfo();
+}
+
+function azByCatInfo() {
+  const { inCat, eligible } = azCatItems($("azCat").value);
+  const up = AZ.up || {};
+  const done = inCat.filter((x) => up[x.pid]).length;
+  $("azCatInfo").textContent = `共 ${inCat.length} 个 · 已传 ${done} · 可传 ${eligible.length}`;
+  let n = parseInt($("azBatchN").value, 10) || 50;
+  n = Math.max(1, Math.min(200, n));
+  $("azByCat").textContent = eligible.length
+    ? `📤 按分类上传（传前 ${Math.min(n, eligible.length)} 个没传过的）`
+    : "📤 这个分类没有可传的新产品了";
+  $("azByCat").disabled = !(((AZ.status && AZ.status.stores) || []).length)
+    || !eligible.length;
+}
+
+async function azByCatStart() {
+  const cat = $("azCat").value;
+  let n = parseInt($("azBatchN").value, 10) || 50;
+  n = Math.max(1, Math.min(200, n));
+  const pids = azCatItems(cat).eligible.slice(0, n).map((x) => x.pid);
+  if (!pids.length) { toast("这个分类没有可传的新产品了", ""); return; }
+  toast(`挑了 ${pids.length} 个没传过的产品，开始上传…`, "", 4000);
+  await azUploadPids(pids);
+}
+
+async function azUploadPids(pids) {
   try {
     busy(true, "提交上传…");
     await api("/api/amazon/upload", {
-      pids: [...S.sel],
+      pids,
       store: $("azStore").value,
       variant_mode: $("azVariant").value,
       product_type: $("azType").value.trim() || "PRODUCT",
@@ -2226,6 +2291,7 @@ function azPollStart() {
       if (!["building", "uploading", "polling"].includes(r.task.phase)) {
         clearInterval(AZ.poll);
         loadProductsTwice();
+        refreshAmz();   // D1.7.0：刷新已传清单，按分类的计数跟着更新
       }
     } catch (e) { /* 下轮再看 */ }
   }, 3000);
@@ -2421,6 +2487,18 @@ function bindEvents() {
   $("azBind").onclick = () => $("amzCfgBox").classList.toggle("hidden");
   $("azStore").onchange = azSelectStore;
   $("azStoreDel").onclick = azUnbind;
+  // D1.7.0 按分类批量上传
+  $("azByCat").onclick = azByCatStart;
+  $("azCat").onchange = () => {
+    const cat = $("azCat").value;
+    if (cat && !$("azType").value) {
+      const m = (S.ptmap || []).find((x) => x.cat === cat)
+        || (S.ptmap || []).find((x) => cat.startsWith(x.cat + "/"));
+      if (m) $("azType").value = m.pt;
+    }
+    azByCatInfo();
+  };
+  $("azBatchN").oninput = azByCatInfo;
   $("azAuth").onclick = azAuthorize;
   $("azCopy").onclick = azCopy;
   $("azFinish").onclick = azFinish;

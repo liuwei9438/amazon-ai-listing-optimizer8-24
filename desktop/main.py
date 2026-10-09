@@ -42,7 +42,7 @@ ROOT = APP_DIR.parent                          # 仓库根
 os.chdir(ROOT)                                 # 引擎的 tasks/ 落在根目录
 sys.path.insert(0, str(ROOT))
 
-VERSION = "D1.6.0"
+VERSION = "D1.7.0"
 APP_DIR_NAME = "app"
 
 DEFAULT_CONFIG = {
@@ -1265,6 +1265,33 @@ def _amz_ean_assign(keys: list) -> tuple[dict, str, str]:
     return dict(r.get("eans") or {}), "", str(r.get("prefix") or "")
 
 
+_AMZ_UP = {"sid": "", "map": {}, "at": 0.0}   # 已上传清单缓存（按店铺）
+
+
+def _amz_uploaded_map(sid: str, force: bool = False) -> dict:
+    """这家店已上传的产品清单 {pid: 时间}（智赢式：传过的下次跳过）。
+    读不到当空表——去重只是锦上添花，不该挡上传。"""
+    if not sid:
+        return {}
+    now = time.time()
+    if (
+        not force
+        and _AMZ_UP["sid"] == sid
+        and now - float(_AMZ_UP.get("at") or 0) < 30
+    ):
+        return _AMZ_UP["map"]
+    try:
+        r = _amz_store_api({"action": "up_get", "id": sid}, timeout=15)
+    except Exception:
+        # 读失败退回旧缓存（同店），没有就当空表
+        return dict(_AMZ_UP["map"]) if _AMZ_UP["sid"] == sid else {}
+    if not r.get("ok"):
+        return dict(_AMZ_UP["map"]) if _AMZ_UP["sid"] == sid else {}
+    m = dict(r.get("uploaded") or {})
+    _AMZ_UP.update(sid=sid, map=m, at=now)
+    return m
+
+
 def _amz_active_store(stores: list) -> dict | None:
     sid = str(_amz_cfg().get("active_store") or "")
     for s in stores:
@@ -1560,17 +1587,20 @@ def _amz_build_messages(
     products: list, mid: str, lang: str,
     variant_mode: str, product_type: str, words: list | None = None,
     eans: dict | None = None,
-) -> tuple[list, list]:
+) -> tuple[list, list, dict]:
     """返回 (messages, notes)。内容来源：AI 优化结果优先，没有就
     原始资料。图片只收 https（亚马逊要公网可下载）。变体：>1 行且
     行行有颜色 → 父子变体（颜色主题），否则各行独立单品。
     words=侵权词对照表：上传内容里自动替换（只改这次提交的 feed，
     不动已存资料——和智赢刊登时替换一个道理）。
     eans={产品#SKU: EAN}：子体/独立单品自动带条码（智赢式补码，
-    池子在服务器上，产品↔码永久绑定）。"""
+    池子在服务器上，产品↔码永久绑定）。
+    返回 (messages, notes, pid_skus)：pid_skus={pid: [进 feed 的 SKU…]}
+    ——上传成功后按它记「已上传」（全部 SKU 成功才算传过）。"""
 
     pairs = words or []
     hits = 0
+    pid_skus: dict[str, list] = {}
 
     def txt(v, cap):
         return [{
@@ -1655,6 +1685,7 @@ def _amz_build_messages(
                 or (rows[0].get("raw_data") or {}).get("父SKU(必填)")
                 or "",
             ).strip()
+            key_pid = str(p.get("pid") or p.get("sku") or "")
             parent_title, _, _ = content_of(p, rows[0])
             messages.append({
                 "messageId": msg(),
@@ -1667,6 +1698,8 @@ def _amz_build_messages(
                     "item_name": txt(parent_title or parent_sku, 200),
                 },
             })
+            if key_pid and parent_sku:
+                pid_skus.setdefault(key_pid, []).append(parent_sku)
             for i, (r, color) in enumerate(zip(rows, colors)):
                 sku = str((r.get("raw_data") or {}).get("SKU") or "").strip()
                 if not sku:
@@ -1701,6 +1734,8 @@ def _amz_build_messages(
                     "requirements": "LISTING",
                     "attributes": attrs,
                 })
+                if key_pid and sku:
+                    pid_skus.setdefault(key_pid, []).append(sku)
         else:
             for i, r in enumerate(rows):
                 rd = r.get("raw_data") or {}
@@ -1733,8 +1768,11 @@ def _amz_build_messages(
                     "requirements": "LISTING",
                     "attributes": attrs,
                 })
+                kpid = str(p.get("pid") or p.get("sku") or "")
+                if kpid and sku:
+                    pid_skus.setdefault(kpid, []).append(sku)
 
-    return messages, notes
+    return messages, notes, pid_skus
 
 
 # ---- 上传管道：文档 → feed → 轮询 → 结果 ----
@@ -1926,7 +1964,7 @@ def _amz_start_upload(
             eans, ean_err, ean_prefix = (
                 _amz_ean_assign(ekeys) if ekeys else ({}, "", "")
             )
-            messages, notes = _amz_build_messages(
+            messages, notes, pid_skus = _amz_build_messages(
                 products, mid, info[1], variant_mode, product_type,
                 words=words, eans=eans,
             )
@@ -1974,6 +2012,49 @@ def _amz_start_upload(
             summary = _amz_parse_result(result)
             summary["notes"] = notes
             summary["feed_id"] = feed_id
+
+            # D1.7.0 智赢式记账：产品进 feed 的 SKU 全部成功 → 给
+            # 这家店记一笔「已上传」（下次按分类上传自动跳过）。
+            store_rec = _AMZ_RUN.get("store") or {}
+            if store_rec.get("id") and pid_skus:
+                ok_skus = {
+                    s["sku"] for s in summary.get("skus") or []
+                    if str(s.get("status") or "").lower() == "success"
+                }
+                bad_skus = {
+                    s["sku"] for s in summary.get("skus") or []
+                    if str(s.get("status") or "").lower() != "success"
+                }
+                done_pids = [
+                    pid for pid, skus in pid_skus.items()
+                    if skus
+                    and not (set(skus) & bad_skus)
+                    and set(skus) <= ok_skus
+                ]
+                if done_pids:
+                    try:
+                        r = _amz_store_api(
+                            {
+                                "action": "up_add",
+                                "id": str(store_rec["id"]),
+                                "pids": done_pids,
+                            },
+                            timeout=30,
+                        )
+                        if r.get("ok"):
+                            summary["notes"].append(
+                                f"🔖 {len(done_pids)} 个产品已记为已上传"
+                                "（下次按分类上传自动跳过）"
+                            )
+                            # 已传清单立刻刷新（不等 30 秒缓存）
+                            _amz_uploaded_map(str(store_rec["id"]), force=True)
+                        else:
+                            summary["notes"].append(
+                                "⚠️ 记「已上传」失败（不影响本次结果）："
+                                + str(r.get("error") or "")[:120]
+                            )
+                    except Exception:
+                        pass   # 记账失败不影响上传结果
 
             msg = (
                 f"上传完成：成功 {summary['success']} / "
@@ -2273,6 +2354,10 @@ class Handler(BaseHTTPRequestHandler):
                 )
                 stores, srv_err = _amz_stores()
                 active = _amz_active_store(stores)
+                uploaded = (
+                    _amz_uploaded_map(str(active.get("id") or ""))
+                    if active else {}
+                )
                 app = _amz_app_info()
                 try:
                     ean = _ean_api({"action": "status"}, timeout=15)
@@ -2300,6 +2385,7 @@ class Handler(BaseHTTPRequestHandler):
                     "is_admin": is_admin(),
                     "app_set": bool(app.get("set")),
                     "app_err": app.get("err") or "",
+                    "uploaded": uploaded,
                     "ean": ean if ean.get("ok") else None,
                     "markets": [
                         [i, f"{v[2]}（{v[0].upper()}）"]
