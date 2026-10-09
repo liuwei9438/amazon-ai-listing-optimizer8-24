@@ -42,7 +42,7 @@ ROOT = APP_DIR.parent                          # 仓库根
 os.chdir(ROOT)                                 # 引擎的 tasks/ 落在根目录
 sys.path.insert(0, str(ROOT))
 
-VERSION = "D1.11.0"
+VERSION = "D1.11.1"
 APP_DIR_NAME = "app"
 
 DEFAULT_CONFIG = {
@@ -2045,7 +2045,15 @@ _BT_UK_SEED_RAW = """266239|Books
 340327031|Mobile Phone Chargers
 27295731031|Mobile Phone Mounts
 340318031|Mobile Phone Automobile Accessories
-21532898031|Lanyards & Wrist Straps"""
+21532898031|Lanyards & Wrist Straps
+3538316031|Small Appliance Parts & Accessories
+3538288031|Blenders, Mixers & Food Processors
+3147441|Small Kitchen Appliances
+79903031|DIY & Tools
+1939465031|Pipes, Pipe Fittings & Accessories
+12464475031|Pipe Fittings
+6543814031|Hydraulics, Pneumatics & Plumbing
+216955866031|Brakes & Pads"""
 
 _BT_UK_DEPTS = [
     ("560798", "Electronics & Photo"),
@@ -2244,7 +2252,11 @@ _BT_US_SEED_RAW = """172282|Electronics
 23690036011|Stands
 11548954011|Stylus Pens
 21268231011|UV Phone Sterilizer Boxes
-14775002011|Virtual Reality (VR) Headsets"""
+14775002011|Virtual Reality (VR) Headsets
+289913|Small Appliances
+13749581|Plumbing
+680333011|Pipes, Pipe Fittings & Accessories
+383612011|Pipe Fittings"""
 
 _BT_US_DEPTS = [
     ("172282", "Electronics"),
