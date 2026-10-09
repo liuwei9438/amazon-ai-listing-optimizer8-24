@@ -144,6 +144,7 @@ function enterApp() {
     });
   setTimeout(() => loadProducts(true), 1200);  // 随后拉最新
   pollTask();  // 万一上次任务还在跑
+  pollAutoCat();  // AI 归类同理（在跑就接上进度，空闲首轮即停）
 }
 
 async function doLogout() {
@@ -351,7 +352,7 @@ function renderPager() {
 
 function renderSelBar() {
   const ro = readOnly();
-  ["btnSelAll", "btnSelNone", "btnOpt", "btnCat", "btnDel",
+  ["btnSelAll", "btnSelNone", "btnOpt", "btnCat", "btnAutoCat", "btnDel",
    "btnExport", "btnAmz", "btnImportToggle"].forEach((id) =>
     $(id).classList.toggle("hidden", ro));
 
@@ -362,6 +363,7 @@ function renderSelBar() {
   $("selCount").textContent = `已选 ${S.sel.size} 个（跨页保留）`;
   $("btnOpt").disabled = S.sel.size === 0;
   $("btnCat").disabled = S.sel.size === 0;
+  if (!acTimer) $("btnAutoCat").disabled = S.sel.size === 0;
   $("btnDel").disabled = S.sel.size === 0;
   $("btnExport").disabled = S.sel.size === 0;
   $("btnAmz").disabled = S.sel.size === 0;
@@ -1983,6 +1985,57 @@ async function retryWriteback() {
   }
 }
 
+/* ---------- D1.8.0 AI 归类：像 AI 优化一样一键跑，AI 只从
+   自己的分类树里挑分类（不新建、挑不中不动） ---------- */
+
+let acTimer = null;
+
+async function startAutoCat() {
+  if (!S.sel.size) { toast("请先勾选产品", "err"); return; }
+  if (!window.confirm(
+    `让 AI 给 ${S.sel.size} 个产品自动挑分类？\n`
+    + `只从你已有的分类里挑（不会新建分类），挑不中的保持不变。`
+  )) return;
+
+  try {
+    await api("/api/products/autocat", { pids: [...S.sel] });
+    toast("🏷 AI 归类已开始（后台跑，可以继续操作）", "ok");
+    pollAutoCat();
+  } catch (e) {
+    toast(e.message, "err");
+  }
+}
+
+function pollAutoCat() {
+  if (acTimer) { clearInterval(acTimer); acTimer = null; }
+  const btn = $("btnAutoCat");
+
+  acTimer = setInterval(async () => {
+    let t;
+    try {
+      const r = await api("/api/products/autocat/status");
+      t = r.task || {};
+    } catch (e) { return; /* 断网：下轮再试 */ }
+
+    if (t.phase === "running") {
+      btn.disabled = true;
+      btn.textContent =
+        `🤖 AI 归类中 ${Number(t.done) || 0}/${Number(t.total) || 0}`;
+      return;
+    }
+    clearInterval(acTimer); acTimer = null;
+    btn.textContent = "🏷 AI 归类";
+    renderSelBar();
+    if (t.phase === "done") {
+      toast("✅ " + (t.message || "AI 归类完成"), "ok", 8000);
+      loadProductsTwice();
+      renderTree();
+    } else if (t.phase === "error") {
+      toast(t.message || "AI 归类失败", "err", 8000);
+    }
+  }, 1800);
+}
+
 /* ---------- AI 设置 ---------- */
 
 async function openAi() {
@@ -2512,6 +2565,7 @@ function bindEvents() {
   $("btnSelNone").onclick = () => { S.sel.clear(); saveSel(); renderGrid(); renderSelBar(); };
 
   $("btnOpt").onclick = startOptimize;
+  $("btnAutoCat").onclick = startAutoCat;           // 🏷 AI 归类（D1.8.0）
   $("btnCat").onclick = () => openMove();           // 🏷 移动分类（树选择）
   $("moveOk").onclick = moveOk;
   $("ceOk").onclick = catEditOk;

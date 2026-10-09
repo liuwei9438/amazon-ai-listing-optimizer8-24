@@ -42,7 +42,7 @@ ROOT = APP_DIR.parent                          # 仓库根
 os.chdir(ROOT)                                 # 引擎的 tasks/ 落在根目录
 sys.path.insert(0, str(ROOT))
 
-VERSION = "D1.7.2"
+VERSION = "D1.8.0"
 APP_DIR_NAME = "app"
 
 DEFAULT_CONFIG = {
@@ -1608,6 +1608,208 @@ def _apply_words(text: str, pairs: list) -> tuple[str, int]:
     return text, n
 
 
+# =====================================================
+# D1.8.0 AI 自动归类（像 AI 优化一样点一下跑后台：
+# AI 从自己的分类树里挑最合适的分类，绝不发明新类；
+# 没挑中=保持不变并计数，不会乱改）
+# =====================================================
+
+_AUTOCAT = {
+    "phase": "idle", "message": "", "total": 0, "done": 0,
+    "ok": 0, "miss": 0, "err": 0,
+}
+_AUTOCAT_LOCK = threading.Lock()
+
+
+def _ai_chat_one(prompt: str, key: str, provider: str, model: str,
+                 timeout: int = 45) -> str:
+    """一次普通对话补全（归类用，温度 0 求稳）。base 可被
+    CONFIG["ai"]["base"] 覆盖（本地 mock 测试用）。"""
+    base = str((CONFIG.get("ai") or {}).get("base") or "").strip() or (
+        "https://api.deepseek.com"
+        if provider == "deepseek" else "https://api.openai.com/v1"
+    )
+    r = requests.post(
+        base.rstrip("/") + "/chat/completions",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + key,
+        },
+        json={
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0,
+            "max_tokens": 300,
+        },
+        timeout=timeout,
+    )
+    r.raise_for_status()
+    data = r.json()
+    return str(
+        (((data.get("choices") or [{}])[0].get("message") or {})
+         .get("content")) or ""
+    )
+
+
+def _cat_tree_paths() -> list:
+    """当前账号分类树的全部完整路径（/cat_lib 文档节点）。"""
+    paths: list = []
+    try:
+        data = src_api(
+            "/cat_lib", _prod_auth() | {"action": "get"}, timeout=15,
+        )
+        if data.get("ok"):
+            for n in (data.get("doc") or {}).get("nodes") or []:
+                name = str((n or {}).get("name") or "").strip()
+                parent = str((n or {}).get("parent") or "").strip()
+                if name and "/" not in name:
+                    paths.append(
+                        (parent + "/" + name) if parent else name
+                    )
+    except Exception:
+        pass
+    return paths
+
+
+def _autocat_start(pids: list) -> None:
+    """后台线程：逐个产品让 AI 从分类树里挑分类，批量写回。"""
+
+    def work():
+        ok = miss = err = 0
+        try:
+            key, provider, model = resolve_ai()
+            if not key:
+                with _AUTOCAT_LOCK:
+                    _AUTOCAT.update(
+                        phase="error",
+                        message=(
+                            "还没配置 AI：点右上角 ⚙️ 填 Key 并保存，"
+                            "或让管理员在服务器保存全局 Key。"
+                        ),
+                    )
+                return
+
+            tree = _cat_tree_paths()
+            if not tree:
+                with _AUTOCAT_LOCK:
+                    _AUTOCAT.update(
+                        phase="error",
+                        message="分类树读取失败，稍后再试一次。",
+                    )
+                return
+
+            updates: list = []
+
+            for i, pid in enumerate(pids):
+                with _AUTOCAT_LOCK:
+                    _AUTOCAT["done"] = i
+                    _AUTOCAT["message"] = (
+                        f"AI 归类中… {i} / {len(pids)}"
+                    )
+                try:
+                    data = src_api(
+                        "/prod_list", _prod_auth() | {"pid": pid},
+                        timeout=30,
+                    )
+                    product = (
+                        (data.get("product") or {})
+                        if data.get("ok") else {}
+                    )
+                    if not product:
+                        err += 1
+                        continue
+
+                    cur = str(product.get("cat") or "").strip()
+                    opt = product.get("opt") or {}
+                    r0 = (product.get("raw") or [{}])[0] or {}
+                    rd = r0.get("raw_data") or {}
+                    title = str(
+                        opt.get("title") or rd.get("标题(必填)")
+                        or product.get("title") or ""
+                    )[:200]
+                    bullets = "；".join(
+                        str(b) for b in (opt.get("bullets") or [])[:3]
+                    )[:200] or "；".join(
+                        str(rd.get(f"要点{k}") or "")
+                        for k in (1, 2, 3)
+                    )[:200]
+                    desc = str(
+                        opt.get("description") or rd.get("简介") or ""
+                    )[:160]
+
+                    if not title:
+                        miss += 1
+                        continue
+
+                    cand = list(
+                        dict.fromkeys(tree + ([cur] if cur else []))
+                    )
+                    prompt = (
+                        "你是亚马逊运营助理，负责给产品挑分类。\n"
+                        "下面是我们产品库的分类树，每行一个完整路径：\n"
+                        + "\n".join(cand[:300]) + "\n\n"
+                        "从这个列表里给产品选最合适的一个分类。"
+                        "只能选列表里已有的（原样返回，不要改字、"
+                        "不要造新的、不要输出列表外的内容），"
+                        "实在没有合适的选「其他」。\n"
+                        '只输出 JSON：{"cat":"路径"}\n\n'
+                        f"产品标题：{title}\n卖点：{bullets}\n"
+                        f"简介：{desc}"
+                    )
+                    out = _ai_chat_one(prompt, key, provider, model)
+                    m = re.search(r"\{[^{}]*\}", out, re.S)
+                    cat = ""
+                    if m:
+                        try:
+                            cat = str(
+                                (json.loads(m.group(0)) or {})
+                                .get("cat") or ""
+                            ).strip()
+                        except Exception:
+                            cat = ""
+                    if cat not in cand:
+                        miss += 1
+                        continue
+
+                    if cat != cur:
+                        updates.append({"pid": pid, "cat": cat})
+                    ok += 1
+                except Exception:
+                    err += 1
+
+            # 批量写回（和「🏷 移动分类」同一条通道）
+            for start in range(0, len(updates), 20):
+                src_api(
+                    "/prod_update",
+                    _prod_auth()
+                    | {"updates": updates[start:start + 20]},
+                    timeout=40,
+                )
+            if updates:
+                _index_apply_updates(updates)
+                _index_heal()
+
+            with _AUTOCAT_LOCK:
+                _AUTOCAT["done"] = len(pids)
+                _AUTOCAT.update(
+                    phase="done", ok=ok, miss=miss, err=err,
+                    message=(
+                        f"AI 归类完成：分好 {ok}"
+                        + (f" · 没找到合适分类 {miss}" if miss else "")
+                        + (f" · 失败 {err}" if err else "")
+                        + f"；改了 {len(updates)} 个产品的分类"
+                    ),
+                )
+
+        except Exception as exc:
+            with _AUTOCAT_LOCK:
+                _AUTOCAT.update(
+                    phase="error", message=f"AI 归类出错：{exc}",
+                )
+
+    threading.Thread(target=work, daemon=True).start()
+
+
 def _bt_norm(btmap: list | None) -> list:
     """btmap 词典 → [(cat, node)] 干净元组表。"""
     return [
@@ -2366,6 +2568,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": True, "task": _poll_task()})
                 return
 
+            # D1.8.0 AI 自动归类进度（前端 1.8s 轮询）
+            if url.path == "/api/products/autocat/status":
+                with _AUTOCAT_LOCK:
+                    task = dict(_AUTOCAT)
+                self._json({"ok": True, "task": task})
+                return
+
             if url.path == "/api/ai":
                 key, provider, model = resolve_ai()
                 self._json({
@@ -2680,6 +2889,36 @@ class Handler(BaseHTTPRequestHandler):
                 _index_apply_updates(updates)
                 _index_heal()
                 self._json({"ok": True})
+                return
+
+            # D1.8.0 AI 自动归类：AI 从自己的分类树里挑分类（像 AI
+            # 优化一样一键跑后台）。只挑已有的，挑不中=不动。
+            if url.path == "/api/products/autocat":
+                pids = [
+                    str(p) for p in body.get("pids") or [] if str(p).strip()
+                ]
+
+                if not pids:
+                    self._json(
+                        {"ok": False, "error": "请先勾选产品"}, 400
+                    )
+                    return
+
+                with _AUTOCAT_LOCK:
+                    if _AUTOCAT.get("phase") == "running":
+                        self._json({
+                            "ok": False,
+                            "error": "AI 归类正在跑，等它结束",
+                        }, 409)
+                        return
+
+                    _AUTOCAT.update(
+                        phase="running", message="准备中…",
+                        total=len(pids), done=0, ok=0, miss=0, err=0,
+                    )
+
+                _autocat_start(pids)
+                self._json({"ok": True, "count": len(pids)})
                 return
 
             if url.path == "/api/products/delete":
