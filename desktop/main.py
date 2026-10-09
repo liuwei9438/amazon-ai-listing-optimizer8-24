@@ -42,7 +42,7 @@ ROOT = APP_DIR.parent                          # 仓库根
 os.chdir(ROOT)                                 # 引擎的 tasks/ 落在根目录
 sys.path.insert(0, str(ROOT))
 
-VERSION = "D1.8.2"
+VERSION = "D1.9.0"
 APP_DIR_NAME = "app"
 
 DEFAULT_CONFIG = {
@@ -64,7 +64,7 @@ DEFAULT_CONFIG = {
         "client_id": "", "client_secret": "", "refresh_token": "",
         "app_id": "", "seller_id": "",
         "marketplace": "ATVPDKIKX0DER", "product_type": "PRODUCT",
-        "lwa_base": "", "spapi_base": "",
+        "lwa_base": "", "spapi_base": "", "site_base": "",
     },
 }
 
@@ -1902,6 +1902,371 @@ def _bt_node_of(cat: str, bt: list) -> str:
     return bn
 
 
+# =====================================================
+# D1.9.0 🔍 帮我找节点（btmap 半自动配节点）：中文分类 →
+# AI 翻英文类目名+选部门 → 本地锚点库 / 部门节点页钻取 →
+# 标题验证 → 候选列表给前端点「用这个」入库。
+# 亚马逊搜索页 /s?k= 有机器人墙（连 curl 都 202），但
+# /b?node= 节点页稳定 200——全部走节点页，不碰搜索页。
+# =====================================================
+
+_BT_UK_SEED_RAW = """266239|Books
+341689031|Kindle Books
+300703|PC & Video Games
+248877031|Car & Motorbike
+11052591|Home & Garden
+15418328031|Shopper Toolkit
+14578036031|Custom Products
+560798|Electronics
+340831031|PC
+65801031|Health & Personal Care
+1571304031|Gift Cards & Top Up
+468292|Toys & Games
+340840031|Pet Supplies
+59624031|Baby
+117332031|Beauty
+590987031|Deals
+560820|Phones & Accessories
+560858|TVs & Home Cinema
+560834|Camera & Photo
+4085731|Headphones & Earphones
+2589474031|Audio & HiFi
+4085831|Speakers
+4916328031|Wearable Technology
+1345741031|Accessories
+3030781|Car Electronics
+431404031|Batteries & Chargers
+1104388|Tripods & Monopods
+1083920|Binoculars, Telescopes & Optics
+3077037031|Action Cameras
+1591689031|Cases
+1591690031|Earpads
+3457450031|Smartwatches
+4294916031|Activity Trackers
+22472729031|Virtual Reality
+3030871|Accessories
+1342661031|Car Electronics
+1591378031|GPS Devices
+389516011|Accessories
+16063353031|Item Finders
+461187031|Sport GPS Units
+407733031|Power Cables
+1338188031|Extension Cords
+1345745031|International Power Adapters
+431410031|Disposable Batteries
+4913451031|Battery Holders
+431411031|Rechargeable Batteries
+10395601|Two-Way Radios
+4854322031|E-Cigarettes & Accessories
+429892031|Tablets
+1345763031|Warranties
+16721554031|Host an Amazon Hub
+2374298031|Sell on Amazon
+340834031|Grocery
+17941707031|Audible
+560826|Accessories
+10394961|Pay As You Go Phones
+356496011|SIM-Free Phones
+430574031|Mobile Broadband
+4845975031|Wearable Technology
+1340513031|Telephones & VOIP
+1661657031|Amazon App Store
+5362060031|Phones
+301311031|Motorbike
+509908031|Car Electronics
+301312031|Tools & Equipment
+307675031|Tyres & Wheels
+2493626031|Travel & Caravanning
+5816538031|Tuning
+303891031|Car Care
+652723031|Special Offers
+301308031|Car Accessories
+301309031|Car Parts
+301315031|Oils &amp; Fluids
+2486235031|Tools &amp; Equipments
+60036031|Baby Car Seats
+301310031|Gifts &amp; Merchandise
+3013843031|Vehicle Electronics
+301314031|Motorhome
+301313031|Transporting &amp; Storage
+205728364031|NEW ARRIVALS
+12422025031|WOMEN
+12422026031|MEN
+9337138031|KIDS & BABY
+2454166031|LUGGAGE
+206536626031|BRANDS
+686204031|DEALS
+391784011|Appliances
+392546011|Cooking & Dining
+213077031|Lighting
+3313444031|Laundry & Storage
+11052671|Garden & Outdoors
+10745681|Furniture
+376320011|Home Accessories
+11716391|Bedding & Linens
+84908660031|Sports & Outdoors
+85881349031|Clothing
+2467807031|Shoes
+84908665031|Fitness
+87270285031|Camping & Hiking
+85494247031|Cycling
+85895819031|Sports Tech
+85895847031|Winter Sports
+85895799031|Golf
+85118077031|Running
+17495199031|Football Club
+350630011|Deals
+11961407031|Fashion 服饰（英国站）
+303762031|Car Steering Wheel Covers
+340321031|Mobile Phone Cases & Covers
+329083031|Mobile Phone Screen Protectors
+21532901031|Mobile Phone Cables & Adapters
+340327031|Mobile Phone Chargers
+27295731031|Mobile Phone Mounts
+340318031|Mobile Phone Automobile Accessories
+21532898031|Lanyards & Wrist Straps"""
+
+_BT_DEPTS = [
+    ("560798", "Electronics & Photo"),
+    ("560820", "Phones & Accessories"),
+    ("248877031", "Car & Motorbike"),
+    ("11961407031", "Fashion"),
+    ("11052591", "Home & Garden"),
+    ("84908660031", "Sports & Outdoors"),
+    ("468292", "Toys & Games"),
+    ("340831031", "PC"),
+    ("59624031", "Baby"),
+    ("117332031", "Beauty"),
+    ("340840031", "Pet Supplies"),
+    ("65801031", "Health & Personal Care"),
+    ("340834031", "Grocery"),
+    ("300703", "PC & Video Games"),
+]
+
+_BT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+          "AppleWebKit/537.36 (KHTML, like Gecko) "
+          "Chrome/126.0.0.0 Safari/537.36")
+
+
+def _bt_seed() -> dict:
+    """英国站同源锚点库 {node: name}（挖矿攒的 10-09 那批）。"""
+    out: dict = {}
+    for ln in _BT_UK_SEED_RAW.splitlines():
+        ln = ln.strip()
+        if "|" not in ln:
+            continue
+        n, _, t = ln.partition("|")
+        n, t = n.strip(), t.strip().replace("&amp;", "&")
+        if n.isdigit() and t:
+            out.setdefault(n, t)
+    return out
+
+
+def _bt_site() -> str:
+    """亚马逊英国站基址（测试可用 amazon.site_base 覆盖）。"""
+    amz = CONFIG.get("amazon") or {}
+    return str(amz.get("site_base") or "").strip() or "https://www.amazon.co.uk"
+
+
+def _bt_fetch(path: str, tries: int = 3) -> str:
+    """拉一个亚马逊节点页。前几遍按环境走（setup_proxy 已设代理就
+    走代理），最后一遍显式走 config 代理兜底（直连环境救回来用）。
+    空串=没拉到。"""
+    url = _bt_site().rstrip("/") + path
+    for attempt in range(tries):
+        prox = None
+        if attempt == tries - 1:
+            p = str(CONFIG.get("proxy") or "").strip()
+            if p:
+                prox = {"http": p, "https": p}
+        try:
+            r = requests.get(
+                url, timeout=12, allow_redirects=True,
+                headers={"User-Agent": _BT_UA,
+                         "Accept-Language": "en-GB,en;q=0.9"},
+                proxies=prox,
+            )
+            if r.status_code == 200 and len(r.text) > 60000:
+                return r.text
+        except Exception:
+            pass
+        time.sleep(3)
+    return ""
+
+
+_BT_ANCHOR_RE = re.compile(
+    r'<a[^>]+href="(?:https?://[^"]*?)?/b\?node=(\d+)[^"]*"[^>]*>(.*?)</a>',
+    re.S,
+)
+
+
+def _bt_anchors(html_text: str) -> list:
+    """节点页里的 /b?node= 锚点 → [(node, name)]（去重、去杂物）。"""
+    out, seen = [], set()
+    for node, inner in _BT_ANCHOR_RE.findall(html_text or ""):
+        txt = re.sub(r"<[^>]+>", " ", inner)
+        txt = re.sub(r"\s+", " ", txt).strip().replace("&amp;", "&")
+        if not txt or len(txt) > 80 or node in seen:
+            continue
+        seen.add(node)
+        out.append((node, txt))
+    return out
+
+
+def _bt_title(html_text: str) -> str:
+    m = re.search(r"<title>(.*?)</title>", html_text or "", re.S | re.I)
+    return re.sub(r"\s+", " ", m.group(1)) if m else ""
+
+
+_BT_STOP = {"the", "a", "an", "of", "and", "for", "in", "on",
+            "with", "&", "to", "by"}
+
+
+def _bt_tokens(s: str) -> set:
+    """小写词元 + 朴素去复数（cover/covers、freshener/fresheners
+    才能对上；两边同规则，不会误伤）。"""
+    out = set()
+    for t in re.split(r"[^a-z0-9]+", str(s or "").lower()):
+        if not t or t in _BT_STOP:
+            continue
+        if len(t) > 3 and t.endswith("s"):
+            t = t[:-1]
+        out.add(t)
+    return out
+
+
+def _bt_score(kw: set, name: str) -> int:
+    nt = _bt_tokens(name)
+    if not kw or not nt:
+        return 0
+    hit = kw & nt
+    s = len(hit) * 3
+    if len(hit) == len(nt) and len(nt) >= 2:
+        s += 4   # 名字整个被关键词盖住 = 更像叶子类目
+    return s
+
+
+def _bt_search(cat: str) -> dict:
+    """中文分类 → 候选节点列表（D1.9.0 🔍 帮我找节点后端）。
+    AI 翻译选部门 → 种子锚点打分 → 不够好拉部门节点页（最多再
+    钻一层）→ 前三名拉页面用标题验证。人点「用这个」才入库。"""
+    leaf = str(cat or "").strip().split("/")[-1].strip()
+    if not leaf:
+        return {"ok": False, "error": "先填产品分类（如 汽车用品/方向盘套）"}
+
+    key, provider, model = resolve_ai()
+    if not key:
+        return {"ok": False, "error": (
+            "还没配置 AI：点右上角 ⚙️ 填 Key 并保存，"
+            "或让管理员在服务器保存全局 Key。"
+        )}
+
+    seed = _bt_seed()
+    # 给 AI 的清单：node=英文名（btmap 带的中文备注截掉，省 token）
+    seed_line = "; ".join(
+        f"{n}=" + re.sub(r"[^\x00-\x7F].*$", "", t).strip() or f"{n}=?"
+        for n, t in seed.items()
+    )
+    prompt = (
+        "你在帮亚马逊英国站卖家做分类映射。把下面的中文产品分类翻译成"
+        "亚马逊英国站最标准的英文类目名（名词、复数，用来搜索匹配，"
+        "如 steering wheel covers），并从类目页列表里挑 1-2 个最可能"
+        "包含它的类目页（软件会打开这些页往下找子类目）。\n"
+        f"中文分类：{cat}\n类目页列表：{seed_line}\n"
+        '只输出一行 JSON：{"kw":"英文类目名","drill":["类目页node数字"]}'
+    )
+    try:
+        raw = _ai_chat_one(prompt, key, provider, model,
+                           timeout=40, max_tokens=200)
+    except Exception as exc:
+        return {"ok": False, "error": "AI 调用失败（查网络/代理）：" + str(exc)[:120]}
+
+    kw_s, drill = "", []
+    m = re.search(r"\{[^{}]*\}", raw or "")
+    if m:
+        try:
+            j = json.loads(m.group(0))
+            kw_s = str(j.get("kw") or "").strip()
+            drill = [
+                str(x).strip() for x in (j.get("drill") or [])
+                if str(x).strip().isdigit()
+            ][:2]
+        except Exception:
+            pass
+    if not kw_s:
+        kw_s = leaf          # AI 没按格式答：退化用原中文名（基本没戏但不炸）
+    kw = _bt_tokens(kw_s)
+
+    # AI 没挑类目页：按词面从部门表兜底挑一个（顶级部门页是门户版
+    # 不带子类锚点，但聊胜于无）
+    if not drill:
+        drill = [max(dict(_BT_DEPTS),
+                     key=lambda n: len(kw & _bt_tokens(
+                         dict(_BT_DEPTS)[n])))]
+
+    pool = dict(seed)
+
+    def best() -> list:
+        scored = sorted(
+            ((n, t, _bt_score(kw, t)) for n, t in pool.items()),
+            key=lambda x: -x[2],
+        )
+        return [x for x in scored if x[2] >= 3][:8]
+
+    cand = best()
+    fetched: list = []
+
+    # 种子没打中 / 只捞到单词弱命中（如 kw 只对上 Tyres & Wheels
+    # 的 wheel）：打开 AI 挑的类目页抽锚点；再不行拿半分最优钻一层
+    for tgt in drill:
+        if cand and cand[0][2] >= 6:
+            break
+        page = _bt_fetch(f"/b?node={tgt}")
+        fetched.append(tgt)
+        if not page:
+            continue
+        anchors = _bt_anchors(page)
+        for n, t in anchors:
+            pool.setdefault(n, t)
+        cand = best()
+        if not cand:
+            weak = sorted(
+                ((n, t, _bt_score(kw, t)) for n, t in anchors),
+                key=lambda x: -x[2],
+            )[:2]
+            for n, _t, s in weak:
+                if s <= 0 or n in fetched:
+                    continue
+                fetched.append(n)
+                sub = _bt_fetch(f"/b?node={n}")
+                if sub:
+                    for n2, t2 in _bt_anchors(sub):
+                        pool.setdefault(n2, t2)
+            cand = best()
+
+    if not cand:
+        return {"ok": True, "kw": kw_s, "items": [],
+                "message": (
+                    f"没找到像「{kw_s}」的类目。亚马逊偶尔会藏起子类目"
+                    "列表（反爬限制），过阵子再试一次，或换个更通用的说法。"
+                )}
+
+    # 前三名拉页面：标题里出现类目名 = 验证通过（其余标 …）
+    items = []
+    for n, t, _s in cand[:6]:
+        title, verified = "", False
+        if len(items) < 3:
+            page = _bt_fetch(f"/b?node={n}")
+            if page:
+                title = _bt_title(page)
+                nt = _bt_tokens(t)
+                hit = len(nt & _bt_tokens(title))
+                verified = hit >= max(1, (len(nt) + 1) // 2)
+        items.append({"node": n, "name": t, "title": title[:90],
+                      "verified": verified})
+    return {"ok": True, "kw": kw_s, "items": items}
+
+
 def _amz_build_messages(
     products: list, mid: str, lang: str,
     variant_mode: str, product_type: str, words: list | None = None,
@@ -2904,6 +3269,14 @@ class Handler(BaseHTTPRequestHandler):
                     payload["doc"] = doc_in
 
                 resp = src_api("/dict", payload, timeout=30)
+                self._json(resp)
+                return
+
+            if url.path == "/api/dict/btsearch":
+                # D1.9.0 🔍 帮我找节点：中文分类 → 候选节点列表
+                # （AI 翻译 + 亚马逊英国站节点页钻取 + 标题验证），
+                # 前端点「用这个」再走 btmap 保存。
+                resp = _bt_search(str(body.get("cat") or ""))
                 self._json(resp)
                 return
 

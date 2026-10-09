@@ -111,6 +111,7 @@
         <input id="btNode" class="inp" placeholder="亚马逊节点 ID（纯数字，如 15684181）" maxlength="20">
         <input id="btName" class="inp" placeholder="节点名（备注用，如 Steering Wheels）" maxlength="120">
         <button id="btAdd" class="btn small primary">➕ 添加</button>
+        <button id="btFind" class="btn small">🔍 帮我找节点</button>
       </div>
       <table class="recycle-table">
         <thead><tr>
@@ -462,6 +463,28 @@
         <button class="btn" data-close>取消</button>
         <button id="scanOk" class="btn primary">🛡 一键替换全部</button>
       </div>
+    </div>
+  </div>
+</div>
+
+<!-- ============ D1.9.0 帮我找节点 ============ -->
+<div id="dlgBtSearch" class="modal hidden">
+  <div class="modal-box wide">
+    <div class="modal-head"><b>🔍 帮我找节点</b><button class="btn ghost" data-close>✖</button></div>
+    <div class="modal-body">
+      <div class="d-imghint">输入中文分类，自动去亚马逊英国站找对应的分类货架（AI 翻译 + 官网核对，要几十秒）。找到后点「用这个」自动入库。</div>
+      <div class="words-addrow">
+        <input id="bsCat" class="inp" placeholder="产品分类（如 汽车用品/方向盘套）" maxlength="120">
+        <button id="bsRun" class="btn small primary">🔍 开始找</button>
+      </div>
+      <div id="bsNoNode" class="d-imghint" style="margin:6px 0"></div>
+      <table class="recycle-table">
+        <thead><tr>
+          <th>亚马逊分类</th><th>节点 ID</th><th style="width:64px">验证</th><th style="width:84px">操作</th>
+        </tr></thead>
+        <tbody id="bsBody"></tbody>
+      </table>
+      <div id="bsEmpty" class="d-imghint" style="margin-top:8px"></div>
     </div>
   </div>
 </div>

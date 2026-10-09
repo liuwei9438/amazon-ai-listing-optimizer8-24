@@ -1611,6 +1611,69 @@ async function btDelMap(cat) {
   }
 }
 
+/* ---------- D1.9.0 🔍 帮我找节点：中文分类 → 后端去亚马逊英国站
+   找候选（AI 翻译 + 节点页钻取 + 标题验证），点「用这个」入库 ---------- */
+
+function btNoNodeCats() {
+  /* 产品里用到、又没节点兜底（精确+父级前缀都没有）的分类路径 */
+  const out = new Set();
+  (S.items || []).forEach((x) => {
+    const c = String((x && x.cat) || "").trim();
+    if (!c) return;
+    let acc = "";
+    c.split("/").forEach((seg) => {
+      acc = acc ? acc + "/" + seg : seg;
+      if (!btNodeOf(acc)) out.add(acc);
+    });
+  });
+  return [...out].sort();
+}
+
+function btSearchOpen() {
+  $("bsCat").value = $("btCat").value.trim();
+  $("bsBody").innerHTML = "";
+  $("bsEmpty").textContent = "";
+  const miss = btNoNodeCats();
+  $("bsNoNode").innerHTML = miss.length
+    ? "还没配节点的分类（点一下填入）：" + miss.slice(0, 12).map((c) =>
+        `<button class="btn small" data-bscat="${esc(c)}" title="${esc(c)}">${esc(c.split("/").pop())}</button>`).join(" ")
+    : "你用到的分类都配好节点了 👍（要给别的分类配也可以）";
+  $("dlgBtSearch").classList.remove("hidden");
+}
+
+async function btSearchRun() {
+  const cat = $("bsCat").value.trim();
+  if (!cat) { toast("先填产品分类", "err"); return; }
+  try {
+    busy(true, "去亚马逊英国站找类目…（AI 翻译 + 官网核对，最多一两分钟）");
+    const r = await api("/api/dict/btsearch", { cat });
+    const items = r.items || [];
+    $("bsBody").innerHTML = items.map((it) => `<tr>
+        <td><b>${esc(it.name)}</b>${it.title ? `<div class="d-imghint">${esc(it.title)}</div>` : ""}</td>
+        <td>${esc(it.node)}</td>
+        <td>${it.verified ? "✅" : "…"}</td>
+        <td><button class="btn small primary" data-bsuse="${esc(it.node)}" data-bsname="${esc(it.name)}">用这个</button></td>
+      </tr>`).join("");
+    $("bsEmpty").textContent = items.length
+      ? ""
+      : (r.message || `没找到像「${r.kw || ""}」的类目，换个说法再试`);
+  } catch (e) {
+    toast(e.message, "err", 8000);
+  } finally {
+    busy(false);
+  }
+}
+
+async function btSearchUse(node, name) {
+  const cat = $("bsCat").value.trim();
+  if (!cat) { toast("先填产品分类", "err"); return; }
+  $("btCat").value = cat;
+  $("btNode").value = node;
+  $("btName").value = name;
+  closeModal("dlgBtSearch");
+  await btAddMap();   // 复用添加（校验纯数字 + 覆盖确认 + 保存 + 刷表）
+}
+
 /* ---------- 侵权扫描（D1.5.0 智赢式：详情里查一遍 → 一键替换） ---------- */
 
 function wordHits(text) {
@@ -2607,6 +2670,17 @@ function bindEvents() {
   $("wzAdd").onclick = wzAddWord;
   $("ptAdd").onclick = ptAddMap;
   $("btAdd").onclick = btAddMap;
+  $("btFind").onclick = btSearchOpen;              // D1.9.0 🔍 帮我找节点
+  $("bsRun").onclick = btSearchRun;
+  $("bsCat").addEventListener("keydown", (e) => { if (e.key === "Enter") btSearchRun(); });
+  $("bsBody").addEventListener("click", (e) => {
+    const b = e.target.closest("[data-bsuse]");
+    if (b) { btSearchUse(b.dataset.bsuse, b.dataset.bsname); return; }
+  });
+  $("bsNoNode").addEventListener("click", (e) => {
+    const c = e.target.closest("[data-bscat]");
+    if (c) { $("bsCat").value = c.dataset.bscat; $("bsBody").innerHTML = ""; $("bsEmpty").textContent = ""; }
+  });
   $("wordsBox").addEventListener("click", (e) => {
     const d = e.target.closest("[data-wdel]");
     if (d) { wzDelWord(d.dataset.wdel); return; }
