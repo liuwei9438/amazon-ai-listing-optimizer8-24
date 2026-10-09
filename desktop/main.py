@@ -42,7 +42,7 @@ ROOT = APP_DIR.parent                          # 仓库根
 os.chdir(ROOT)                                 # 引擎的 tasks/ 落在根目录
 sys.path.insert(0, str(ROOT))
 
-VERSION = "D1.10.0"
+VERSION = "D1.10.1"
 APP_DIR_NAME = "app"
 
 DEFAULT_CONFIG = {
@@ -1676,14 +1676,19 @@ def _ai_chat_one(prompt: str, key: str, provider: str, model: str,
 
 
 def _cat_tree_paths() -> list:
-    """当前账号分类树的全部完整路径（/cat_lib 文档节点）。"""
+    """当前账号分类树的全部完整路径（/cat_lib 文档节点）。
+
+    D1.10.1 修：worker /cat_lib 返回的字段是 lib（不是 doc）——
+    D1.8.0 起读错字段，线上 AI 归类恒报「分类树读取失败」（mock
+    当时跟着写成 doc，测试全绿但形状和真 worker 不一致）。"""
     paths: list = []
     try:
         data = src_api(
             "/cat_lib", _prod_auth() | {"action": "get"}, timeout=15,
         )
         if data.get("ok"):
-            for n in (data.get("doc") or {}).get("nodes") or []:
+            for n in ((data.get("lib") or data.get("doc") or {})
+                      .get("nodes")) or []:
                 name = str((n or {}).get("name") or "").strip()
                 parent = str((n or {}).get("parent") or "").strip()
                 if name and "/" not in name:
