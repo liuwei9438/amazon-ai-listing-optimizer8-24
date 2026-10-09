@@ -1919,6 +1919,7 @@ async function pollTask() {
 
       if (["reading", "running", "writing"].includes(t.phase)) {
         S.taskOpen = true;
+        S.sawOptRun = true;   // D1.8.1 本页亲眼见过在跑 → 完成时自动接 AI 归类
       }
       if (S.taskOpen) renderTask(t);
 
@@ -1928,6 +1929,10 @@ async function pollTask() {
         t._done_toasted = true;
         toast(t.message || "任务完成", "ok", 6000);
         loadProductsTwice();
+        // D1.8.1 优化完自动接 AI 归类（只在本次页面看着它跑完时触发，
+        // 重启页面看到的旧 done 任务不会重复跑）
+        if (S.sawOptRun && (t.pids || []).length) autoCatAfterOpt(t.pids);
+        S.sawOptRun = false;
       }
     } catch (e) { /* 断网等情况：下轮再试 */ S.pollTimer = setTimeout(tick, 5000); }
   };
@@ -2004,6 +2009,16 @@ async function startAutoCat() {
   } catch (e) {
     toast(e.message, "err");
   }
+}
+
+async function autoCatAfterOpt(pids) {
+  /* D1.8.1 优化完成后自动接 AI 归类（同一批产品，不用手动点）。
+     已有归类在跑（409）等情况就静默让位——手点 🏷 随时可以补。 */
+  try {
+    await api("/api/products/autocat", { pids });
+    toast("🏷 优化完成，AI 归类自动接着跑", "ok");
+    pollAutoCat();
+  } catch (e) { /* 让位：不打扰 */ }
 }
 
 function pollAutoCat() {

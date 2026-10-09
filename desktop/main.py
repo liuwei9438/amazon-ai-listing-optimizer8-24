@@ -42,7 +42,7 @@ ROOT = APP_DIR.parent                          # 仓库根
 os.chdir(ROOT)                                 # 引擎的 tasks/ 落在根目录
 sys.path.insert(0, str(ROOT))
 
-VERSION = "D1.8.0"
+VERSION = "D1.8.1"
 APP_DIR_NAME = "app"
 
 DEFAULT_CONFIG = {
@@ -1622,7 +1622,7 @@ _AUTOCAT_LOCK = threading.Lock()
 
 
 def _ai_chat_one(prompt: str, key: str, provider: str, model: str,
-                 timeout: int = 45) -> str:
+                 timeout: int = 45, max_tokens: int = 300) -> str:
     """一次普通对话补全（归类用，温度 0 求稳）。base 可被
     CONFIG["ai"]["base"] 覆盖（本地 mock 测试用）。"""
     base = str((CONFIG.get("ai") or {}).get("base") or "").strip() or (
@@ -1639,7 +1639,7 @@ def _ai_chat_one(prompt: str, key: str, provider: str, model: str,
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0,
-            "max_tokens": 300,
+            "max_tokens": max_tokens,
         },
         timeout=timeout,
     )
@@ -1671,11 +1671,27 @@ def _cat_tree_paths() -> list:
     return paths
 
 
+def _autocat_launch(pids: list) -> None:
+    """置运行态 + 起线程（POST 端点 / 优化完成自动链 共用）。"""
+    with _AUTOCAT_LOCK:
+        _AUTOCAT.update(
+            phase="running", message="准备中…",
+            total=len(pids), done=0, ok=0, miss=0, err=0,
+        )
+    _autocat_start(pids)
+
+
 def _autocat_start(pids: list) -> None:
-    """后台线程：逐个产品让 AI 从分类树里挑分类，批量写回。"""
+    """后台线程：让 AI 从分类树里挑分类，批量写回。
+    D1.8.1 起 10 个产品合一次问（分类树只带一遍=省 token），
+    AI 答案不在树里=丢弃不动（防乱编）。"""
+
+    BATCH = 10   # 一次问几个产品（树只带一遍，10 个一问最省）
 
     def work():
         ok = miss = err = 0
+        updates: list = []
+        n = len(pids)
         try:
             key, provider, model = resolve_ai()
             if not key:
@@ -1698,84 +1714,122 @@ def _autocat_start(pids: list) -> None:
                     )
                 return
 
-            updates: list = []
+            for bstart in range(0, n, BATCH):
+                batch = [str(p) for p in pids[bstart:bstart + BATCH]]
 
-            for i, pid in enumerate(pids):
-                with _AUTOCAT_LOCK:
-                    _AUTOCAT["done"] = i
-                    _AUTOCAT["message"] = (
-                        f"AI 归类中… {i} / {len(pids)}"
-                    )
-                try:
-                    data = src_api(
-                        "/prod_list", _prod_auth() | {"pid": pid},
-                        timeout=30,
-                    )
-                    product = (
-                        (data.get("product") or {})
-                        if data.get("ok") else {}
-                    )
-                    if not product:
+                # 1) 取料（标题/卖点/简介，AI 优化结果优先）
+                items: list = []
+                for pid in batch:
+                    try:
+                        data = src_api(
+                            "/prod_list", _prod_auth() | {"pid": pid},
+                            timeout=30,
+                        )
+                        product = (
+                            (data.get("product") or {})
+                            if data.get("ok") else {}
+                        )
+                        if not product:
+                            err += 1
+                            continue
+                        cur = str(product.get("cat") or "").strip()
+                        opt = product.get("opt") or {}
+                        r0 = (product.get("raw") or [{}])[0] or {}
+                        rd = r0.get("raw_data") or {}
+                        title = str(
+                            opt.get("title") or rd.get("标题(必填)")
+                            or product.get("title") or ""
+                        )[:200]
+                        bullets = "；".join(
+                            str(b) for b in (opt.get("bullets") or [])[:3]
+                        )[:200] or "；".join(
+                            str(rd.get(f"要点{k}") or "")
+                            for k in (1, 2, 3)
+                        )[:200]
+                        desc = str(
+                            opt.get("description") or rd.get("简介") or ""
+                        )[:160]
+                        if not title:
+                            miss += 1
+                            continue
+                        items.append({
+                            "pid": pid, "cur": cur, "title": title,
+                            "bullets": bullets, "desc": desc,
+                        })
+                    except Exception:
                         err += 1
-                        continue
 
-                    cur = str(product.get("cat") or "").strip()
-                    opt = product.get("opt") or {}
-                    r0 = (product.get("raw") or [{}])[0] or {}
-                    rd = r0.get("raw_data") or {}
-                    title = str(
-                        opt.get("title") or rd.get("标题(必填)")
-                        or product.get("title") or ""
-                    )[:200]
-                    bullets = "；".join(
-                        str(b) for b in (opt.get("bullets") or [])[:3]
-                    )[:200] or "；".join(
-                        str(rd.get(f"要点{k}") or "")
-                        for k in (1, 2, 3)
-                    )[:200]
-                    desc = str(
-                        opt.get("description") or rd.get("简介") or ""
-                    )[:160]
-
-                    if not title:
-                        miss += 1
-                        continue
-
-                    cand = list(
-                        dict.fromkeys(tree + ([cur] if cur else []))
+                if items:
+                    # 2) 这一批合一次问（分类树带一遍）
+                    cand = list(dict.fromkeys(
+                        tree + [it["cur"] for it in items if it["cur"]]
+                    ))
+                    lines = "\n".join(
+                        f"{k}. 标题：{it['title']}"
+                        f"｜卖点：{it['bullets']}｜简介：{it['desc']}"
+                        for k, it in enumerate(items, 1)
                     )
                     prompt = (
                         "你是亚马逊运营助理，负责给产品挑分类。\n"
-                        "下面是我们产品库的分类树，每行一个完整路径：\n"
-                        + "\n".join(cand[:300]) + "\n\n"
-                        "从这个列表里给产品选最合适的一个分类。"
-                        "只能选列表里已有的（原样返回，不要改字、"
-                        "不要造新的、不要输出列表外的内容），"
+                        "我们的分类树，每行一个完整路径（只能从中选）：\n"
+                        + "\n".join("- " + c for c in cand[:300]) + "\n\n"
+                        "产品列表：\n" + lines + "\n\n"
+                        "给每个产品从树里选最合适的一个分类。"
+                        "只能选树里已有的（原样返回，不要改字、"
+                        "不要造新分类、不要输出列表外的内容），"
                         "实在没有合适的选「其他」。\n"
-                        '只输出 JSON：{"cat":"路径"}\n\n'
-                        f"产品标题：{title}\n卖点：{bullets}\n"
-                        f"简介：{desc}"
+                        '只输出 JSON：{"items":[{"i":编号,'
+                        '"cat":"路径"},…]}，每个产品一条，'
+                        "i=产品编号。\n"
                     )
-                    out = _ai_chat_one(prompt, key, provider, model)
-                    m = re.search(r"\{[^{}]*\}", out, re.S)
-                    cat = ""
-                    if m:
+                    pick: dict[int, str] = {}
+                    try:
+                        out = _ai_chat_one(
+                            prompt, key, provider, model,
+                            timeout=60, max_tokens=800,
+                        )
                         try:
-                            cat = str(
-                                (json.loads(m.group(0)) or {})
-                                .get("cat") or ""
-                            ).strip()
+                            doc = json.loads(out)
                         except Exception:
-                            cat = ""
-                    if cat not in cand:
-                        miss += 1
-                        continue
+                            s = out.find("{")
+                            e = out.rfind("}")
+                            doc = (
+                                json.loads(out[s:e + 1])
+                                if 0 <= s < e else {}
+                            )
+                        if isinstance(doc, list):
+                            doc = {"items": doc}
+                        for d in (doc.get("items") or []):
+                            if not isinstance(d, dict):
+                                continue
+                            try:
+                                i = int(d.get("i") or 0)
+                            except (TypeError, ValueError):
+                                continue
+                            if 1 <= i <= len(items):
+                                pick[i - 1] = str(
+                                    d.get("cat") or ""
+                                ).strip()
+                    except Exception:
+                        err += len(items)
 
-                    if cat != cur:
-                        updates.append({"pid": pid, "cat": cat})
-                    ok += 1
-                except Exception:
-                    err += 1
+                    # 3) 逐个校验：答案必须在树里，否则丢弃不动
+                    for k, it in enumerate(items):
+                        cat = pick.get(k, "")
+                        if cat not in cand:
+                            miss += 1
+                            continue
+                        if cat != it["cur"]:
+                            updates.append(
+                                {"pid": it["pid"], "cat": cat}
+                            )
+                        ok += 1
+
+                with _AUTOCAT_LOCK:
+                    _AUTOCAT["done"] = min(bstart + BATCH, n)
+                    _AUTOCAT["message"] = (
+                        f"AI 归类中… {_AUTOCAT['done']} / {n}"
+                    )
 
             # 批量写回（和「🏷 移动分类」同一条通道）
             for start in range(0, len(updates), 20):
@@ -1790,7 +1844,7 @@ def _autocat_start(pids: list) -> None:
                 _index_heal()
 
             with _AUTOCAT_LOCK:
-                _AUTOCAT["done"] = len(pids)
+                _AUTOCAT["done"] = n
                 _AUTOCAT.update(
                     phase="done", ok=ok, miss=miss, err=err,
                     message=(
@@ -2912,12 +2966,7 @@ class Handler(BaseHTTPRequestHandler):
                         }, 409)
                         return
 
-                    _AUTOCAT.update(
-                        phase="running", message="准备中…",
-                        total=len(pids), done=0, ok=0, miss=0, err=0,
-                    )
-
-                _autocat_start(pids)
+                _autocat_launch(pids)
                 self._json({"ok": True, "count": len(pids)})
                 return
 
