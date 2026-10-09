@@ -2271,10 +2271,18 @@ $("dlgDetail").addEventListener("click", (e) => {
   }
 }, true);
 
-document.querySelectorAll(".modal").forEach((m) => {
+// D1.6.1 修复「照片点开关不掉」：大图预览的类名是 .lightbox 不是
+// .modal，之前根本没挂上关闭逻辑（✖ 和点空白都无效）。一起挂上，
+// 另加 Esc 关闭。
+document.querySelectorAll(".modal, .lightbox").forEach((m) => {
   m.addEventListener("click", (e) => {
     if (e.target === m || e.target.closest("[data-close]")) m.classList.add("hidden");
   });
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key !== "Escape") return;
+  const lb = $("dlgLightbox");
+  if (lb && !lb.classList.contains("hidden")) lb.classList.add("hidden");
 });
 
 /* ---------- 事件绑定 ---------- */
