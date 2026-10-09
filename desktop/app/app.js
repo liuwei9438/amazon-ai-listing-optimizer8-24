@@ -1897,6 +1897,17 @@ async function runImport(payload) {
 async function startOptimize() {
   if (!S.sel.size) { toast("请先勾选产品", "err"); return; }
 
+  /* D1.8.2 防重复优化：勾选里含已优化过的产品时先确认——重跑会把
+     上次结果整个覆盖（包括手动改过的标题/五点/简介） */
+  const doneN = [...S.sel].filter((pid) =>
+    (S.items.find((x) => String(x.pid) === String(pid)) || {}).has_opt).length;
+  if (doneN && !window.confirm(
+    `勾选的 ${S.sel.size} 个产品里，有 ${doneN} 个已经优化过了。\n`
+    + `重新优化会把上次的结果整个覆盖掉（包括手动改过的标题、五点、简介）。\n\n`
+    + `确定 = 照样全部重新优化\n`
+    + `取消 = 先不跑（只想优化没优化过的：点上面的「⏳ 待优化」筛选再全选）`
+  )) return;
+
   try {
     await api("/api/optimize", { pids: [...S.sel] });
     S.taskOpen = true;

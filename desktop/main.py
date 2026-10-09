@@ -42,7 +42,7 @@ ROOT = APP_DIR.parent                          # 仓库根
 os.chdir(ROOT)                                 # 引擎的 tasks/ 落在根目录
 sys.path.insert(0, str(ROOT))
 
-VERSION = "D1.8.1"
+VERSION = "D1.8.2"
 APP_DIR_NAME = "app"
 
 DEFAULT_CONFIG = {
@@ -141,6 +141,11 @@ def setup_proxy() -> None:
     os.environ["HTTPS_PROXY"] = proxy
     os.environ["http_proxy"] = proxy
     os.environ["https_proxy"] = proxy
+    # NO_PROXY 只豁免本机。启动环境若带着 NO_PROXY=*（restart_boss 等
+    # 启动器会塞），代理会被整个废掉：外网请求全走已断的直连，症状=
+    # 优化报「产品都没有完整资料」（2026-10-09 的线上事故）。
+    os.environ["NO_PROXY"] = "127.0.0.1,localhost"
+    os.environ["no_proxy"] = "127.0.0.1,localhost"
     PROXY_MODE = "proxy"
 
 
@@ -843,6 +848,7 @@ def _start_optimize_async(pids: list) -> None:
             records: list[ProductRecord] = []
             rec_pids: list[str] = []
             skipped: list[str] = []
+            net_fail: list[str] = []   # 服务器连不上的（≠资料为空）
 
             for i, pid in enumerate(pids):
                 try:
@@ -852,6 +858,7 @@ def _start_optimize_async(pids: list) -> None:
                     )
                 except Exception:
                     skipped.append(pid)
+                    net_fail.append(pid)
                     continue
 
                 product = (
@@ -878,6 +885,10 @@ def _start_optimize_async(pids: list) -> None:
                 with TASK_LOCK:
                     TASK["phase"] = "error"
                     TASK["message"] = (
+                        "连不上服务器，一个产品的资料都没读到"
+                        "——检查网络/代理（加速器）是否开启，"
+                        "稍后再试一次。"
+                        if net_fail else
                         "选中的产品都没有完整资料"
                         "（旧库数据），重新导入同一份 Excel 补全。"
                     )
