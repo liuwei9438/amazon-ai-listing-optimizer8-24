@@ -42,7 +42,7 @@ ROOT = APP_DIR.parent                          # 仓库根
 os.chdir(ROOT)                                 # 引擎的 tasks/ 落在根目录
 sys.path.insert(0, str(ROOT))
 
-VERSION = "D1.10.1"
+VERSION = "D1.11.0"
 APP_DIR_NAME = "app"
 
 DEFAULT_CONFIG = {

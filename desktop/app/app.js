@@ -1919,13 +1919,53 @@ function setView(v) {
   renderAll();
 }
 
+function catEligible() {
+  /* 当前树选中的分类（含子孙）里，资料全且还没优化过的产品。
+     D1.11.0 按分类批量优化：只挑没优化过的，已优化过的不动
+     （防止把手动改过的 AI 结果覆盖掉）。 */
+  const cat = S.viewCat;
+  const inCat = (S.items || []).filter((x) => {
+    const c = String((x && x.cat) || "").trim();
+    if (cat === "__none__") return !c;
+    if (!cat) return true;
+    return c === cat || c.startsWith(cat + "/");
+  });
+  return {
+    inCat,
+    eligible: inCat.filter((x) =>
+      (Number(x.n_rows) || 0) > 0 && !x.has_opt),
+  };
+}
+
+async function catOptStart() {
+  const cat = S.viewCat;
+  const { eligible } = catEligible();
+  if (!eligible.length) {
+    toast("这个分类里没有「待优化」的产品（资料齐全又还没优化过的）", "", 5000);
+    return;
+  }
+  if (!window.confirm(
+    `优化「${catLabel(cat)}」分类下的 ${eligible.length} 个产品？\n`
+    + `只优化还没优化过的（已优化过的不动，防覆盖手改内容）。\n`
+    + `跑完会自动接着做 AI 归类。`
+  )) return;
+
+  S.sel = new Set(eligible.map((x) => String(x.pid)));
+  saveSel();
+  renderGrid();
+  renderSelBar();
+  await startOptimize();   // 勾选里没有已优化过的 → 不会再弹覆盖确认
+}
+
 function renderCatHead() {
   if (S.view !== "cat") return;
   const list = S.filtered || [];
+  const n = readOnly() ? 0 : catEligible().eligible.length;
   $("catHead").innerHTML =
     `<b>🗂 分类产品：${esc(catLabel(S.viewCat))}</b>` +
     `<span class="cat-head-n">${list.length} 个产品</span>` +
-    (readOnly() ? "" : `　<span class="hint">勾选产品后点「🏷 移动分类」把它们分到这里</span>`);
+    (readOnly() ? "" : `　<span class="hint">勾选产品后点「🏷 移动分类」把它们分到这里</span>`
+      + `　<button class="btn small primary" onclick="catOptStart()">🚀 优化这个分类${n ? `（${n} 个待优化）` : ""}</button>`);
 }
 
 async function applyDelete() {
