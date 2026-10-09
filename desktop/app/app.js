@@ -22,6 +22,7 @@ const S = {
   /* D1.5.0 刊登词典（智赢式） */
   words: [],               // [{bad,fix,at,by}] 侵权词对照表（全局共享）
   ptmap: [],               // [{cat,pt,at,by}] 分类→亚马逊商品类型
+  btmap: [],               // [{cat,node,name,at,by}] 分类→亚马逊分类节点
 };
 
 /* D = 当前详情弹窗的图片编辑状态；IE = 图片编辑器状态；AZ = 亚马逊上传 */
@@ -1439,16 +1440,19 @@ function renderRecycle() {
 
 async function loadDict() {
   try {
-    const [w, p] = await Promise.all([
+    const [w, p, b] = await Promise.all([
       api("/api/dict", { kind: "words" }),
       api("/api/dict", { kind: "ptmap" }),
+      api("/api/dict", { kind: "btmap" }),
     ]);
     S.words = (w.doc && w.doc.pairs) || [];
     S.ptmap = (p.doc && p.doc.map) || [];
+    S.btmap = (b.doc && b.doc.map) || [];
   } catch (e) {
     /* 词典读不到不挡别的功能 */
     S.words = [];
     S.ptmap = [];
+    S.btmap = [];
   }
   renderWords();
 }
@@ -1477,6 +1481,17 @@ function renderWords() {
       <td><b>${esc(m.pt)}</b></td>
       <td>${fmtMs(Number(m.at) || 0)}${m.by ? " · " + esc(m.by) : ""}</td>
       <td>${ro ? "" : `<button class="btn small danger" data-pdel="${esc(m.cat)}">删除</button>`}</td>
+    </tr>`).join("");
+
+  const bl = [...S.btmap].sort((a, b) => (b.at || 0) - (a.at || 0));
+  $("btEmpty").classList.toggle("hidden", bl.length > 0);
+  $("btBody").innerHTML = bl.map((m, i) => `<tr>
+      <td>${i + 1}</td>
+      <td>${esc(m.cat)}</td>
+      <td><b>${esc(m.node)}</b></td>
+      <td>${esc(m.name)}</td>
+      <td>${fmtMs(Number(m.at) || 0)}${m.by ? " · " + esc(m.by) : ""}</td>
+      <td>${ro ? "" : `<button class="btn small danger" data-btdel="${esc(m.cat)}">删除</button>`}</td>
     </tr>`).join("");
 }
 
@@ -1547,6 +1562,45 @@ async function ptDelMap(cat) {
   try {
     busy(true, "删除…");
     await saveDict("ptmap", { map: S.ptmap.filter((m) => m.cat !== cat) });
+    toast("🗑 已删除", "ok");
+  } catch (e) {
+    toast(e.message, "err", 7000);
+  } finally {
+    busy(false);
+  }
+}
+
+/* D1.7.1 分类→亚马逊分类节点：上传时按产品分类自动带
+   browse_classification（放进亚马逊对应货架） */
+async function btAddMap() {
+  const cat = $("btCat").value.trim();
+  const node = $("btNode").value.trim();
+  const name = $("btName").value.trim();
+  if (!cat || !node) { toast("分类和节点 ID 都要填", "err"); return; }
+  if (!/^\d+$/.test(node)) { toast("节点 ID 是纯数字（如 15684181）", "err"); return; }
+  const old = S.btmap.find((m) => m.cat === cat);
+  if (old && old.node !== node && !confirm(`「${cat}」已映射到节点 ${old.node}，改成 ${node} 吗？`)) return;
+  try {
+    busy(true, "保存…");
+    const map = S.btmap.filter((m) => m.cat !== cat);
+    map.push({ cat, node, name, at: Date.now(), by: (S.profile || {}).user || "" });
+    await saveDict("btmap", { map });
+    $("btCat").value = "";
+    $("btNode").value = "";
+    $("btName").value = "";
+    toast(old ? "✅ 已更新映射" : "✅ 已添加映射（上传时自动放进这个亚马逊分类）", "ok");
+  } catch (e) {
+    toast(e.message, "err", 7000);
+  } finally {
+    busy(false);
+  }
+}
+
+async function btDelMap(cat) {
+  if (!confirm(`确定删除「${cat}」的亚马逊分类映射？`)) return;
+  try {
+    busy(true, "删除…");
+    await saveDict("btmap", { map: S.btmap.filter((m) => m.cat !== cat) });
     toast("🗑 已删除", "ok");
   } catch (e) {
     toast(e.message, "err", 7000);
@@ -2422,11 +2476,14 @@ function bindEvents() {
   /* 刊登词典（D1.5.0）：添加/删除 + 侵权扫描确认 */
   $("wzAdd").onclick = wzAddWord;
   $("ptAdd").onclick = ptAddMap;
+  $("btAdd").onclick = btAddMap;
   $("wordsBox").addEventListener("click", (e) => {
     const d = e.target.closest("[data-wdel]");
     if (d) { wzDelWord(d.dataset.wdel); return; }
     const p = e.target.closest("[data-pdel]");
-    if (p) ptDelMap(p.dataset.pdel);
+    if (p) { ptDelMap(p.dataset.pdel); return; }
+    const bt = e.target.closest("[data-btdel]");
+    if (bt) btDelMap(bt.dataset.btdel);
   });
   $("scanOk").onclick = scanReplace;
 

@@ -103,6 +103,22 @@
         <tbody id="ptBody"></tbody>
       </table>
       <div id="ptEmpty" class="empty hidden" style="padding:40px 0">还没有映射。上传时报「商品类型」错误的话，把后台模板里的类型名填到这里。</div>
+
+      <div class="recycle-title" style="margin-top:26px">🗂 分类 → 亚马逊分类节点（放进哪个货架）</div>
+      <div class="d-imghint" style="margin-bottom:8px">映射后上传时自动带「亚马逊分类节点」，商品直接放进对应的<b>亚马逊分类</b>（比如 汽车配件/方向盘 → 亚马逊的 Steering Wheels 货架）。没映射的让亚马逊按标题自动归类。全公司共用一份。</div>
+      <div class="words-addrow">
+        <input id="btCat" class="inp" placeholder="产品分类（如 汽车配件/方向盘）" maxlength="120">
+        <input id="btNode" class="inp" placeholder="亚马逊节点 ID（纯数字，如 15684181）" maxlength="20">
+        <input id="btName" class="inp" placeholder="节点名（备注用，如 Steering Wheels）" maxlength="120">
+        <button id="btAdd" class="btn small primary">➕ 添加</button>
+      </div>
+      <table class="recycle-table">
+        <thead><tr>
+          <th style="width:46px">序号</th><th>产品分类</th><th>亚马逊节点 ID</th><th>节点名</th><th>添加时间</th><th style="width:80px">操作</th>
+        </tr></thead>
+        <tbody id="btBody"></tbody>
+      </table>
+      <div id="btEmpty" class="empty hidden" style="padding:40px 0">还没有映射。节点 ID 从亚马逊后台（添加商品时的分类选择页）或已刊登商品的分类里能查到。</div>
     </div>
 
     <!-- 优化任务卡 -->

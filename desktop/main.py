@@ -42,7 +42,7 @@ ROOT = APP_DIR.parent                          # 仓库根
 os.chdir(ROOT)                                 # 引擎的 tasks/ 落在根目录
 sys.path.insert(0, str(ROOT))
 
-VERSION = "D1.7.0"
+VERSION = "D1.7.1"
 APP_DIR_NAME = "app"
 
 DEFAULT_CONFIG = {
@@ -1568,6 +1568,31 @@ def _dict_words() -> list:
     return []
 
 
+def _dict_btmap() -> list:
+    """读「分类→亚马逊类目节点」映射 [{cat,node,name}]（worker /dict
+    btmap，全公司共享）。上传时按每个产品自己的分类带上
+    browse_classification，把商品放进亚马逊对应的分类货架。
+    读不到=空，不挡上传。"""
+    try:
+        r = src_api(
+            "/dict", _prod_auth() | {"kind": "btmap", "action": "get"},
+            timeout=20,
+        )
+        if r.get("ok"):
+            doc = r.get("doc") or {}
+            return [
+                {
+                    "cat": str(m.get("cat") or ""),
+                    "node": str(m.get("node") or ""),
+                    "name": str(m.get("name") or ""),
+                }
+                for m in (doc.get("map") or [])
+            ]
+    except Exception:
+        pass
+    return []
+
+
 def _apply_words(text: str, pairs: list) -> tuple[str, int]:
     """按对照表替换（大小写不敏感）。返回 (新文本, 替换次数)。"""
     n = 0
@@ -1586,7 +1611,7 @@ def _apply_words(text: str, pairs: list) -> tuple[str, int]:
 def _amz_build_messages(
     products: list, mid: str, lang: str,
     variant_mode: str, product_type: str, words: list | None = None,
-    eans: dict | None = None,
+    eans: dict | None = None, btmap: list | None = None,
 ) -> tuple[list, list, dict]:
     """返回 (messages, notes)。内容来源：AI 优化结果优先，没有就
     原始资料。图片只收 https（亚马逊要公网可下载）。变体：>1 行且
@@ -1595,12 +1620,38 @@ def _amz_build_messages(
     不动已存资料——和智赢刊登时替换一个道理）。
     eans={产品#SKU: EAN}：子体/独立单品自动带条码（智赢式补码，
     池子在服务器上，产品↔码永久绑定）。
+    btmap=分类→亚马逊类目节点：产品分类精确匹配（其次父级前缀）
+    命中时，子体/独立单品带 browse_classification，放进亚马逊
+    对应分类（父体不带）。
     返回 (messages, notes, pid_skus)：pid_skus={pid: [进 feed 的 SKU…]}
     ——上传成功后按它记「已上传」（全部 SKU 成功才算传过）。"""
 
     pairs = words or []
     hits = 0
     pid_skus: dict[str, list] = {}
+    bt = [
+        (str(m.get("cat") or ""), str(m.get("node") or ""))
+        for m in (btmap or []) if m.get("cat") and m.get("node")
+    ]
+
+    def node_of(p) -> str:
+        """产品分类 → 亚马逊类目节点：精确命中优先，其次最长父级
+        前缀（选了「汽车配件」的映射，方向盘套也跟着用）。"""
+        if not bt:
+            return ""
+        cat = str(p.get("cat") or "").strip()
+        if not cat:
+            return ""
+        for c, n in bt:
+            if c == cat:
+                return n
+        best, bn = 0, ""
+        for c, n in bt:
+            if cat.startswith(c + "/") and len(c) > best:
+                best, bn = len(c), n
+        return bn
+
+    placed_nodes = 0
 
     def txt(v, cap):
         return [{
@@ -1726,6 +1777,13 @@ def _amz_build_messages(
                     attrs["standard_product_id"] = [
                         {"value": ean, "type": "EAN"}
                     ]
+                node = node_of(p)
+                if node:
+                    attrs["browse_classification"] = [{
+                        "node_id": int(node) if node.isdigit() else node,
+                        "marketplace_id": mid,
+                    }]
+                    placed_nodes += 1
                 messages.append({
                     "messageId": msg(),
                     "sku": sku,
@@ -1760,6 +1818,13 @@ def _amz_build_messages(
                     attrs["standard_product_id"] = [
                         {"value": ean, "type": "EAN"}
                     ]
+                node = node_of(p)
+                if node:
+                    attrs["browse_classification"] = [{
+                        "node_id": int(node) if node.isdigit() else node,
+                        "marketplace_id": mid,
+                    }]
+                    placed_nodes += 1
                 messages.append({
                     "messageId": msg(),
                     "sku": sku,
@@ -1771,6 +1836,12 @@ def _amz_build_messages(
                 kpid = str(p.get("pid") or p.get("sku") or "")
                 if kpid and sku:
                     pid_skus.setdefault(kpid, []).append(sku)
+
+    if placed_nodes:
+        notes.append(
+            f"🗂 已按分类给 {placed_nodes} 条带亚马逊类目节点"
+            "（放进对应分类货架）"
+        )
 
     return messages, notes, pid_skus
 
@@ -1935,6 +2006,7 @@ def _amz_start_upload(
             info = _MARKETPLACES.get(mid, ("na", "en_US", ""))
 
             words = _dict_words()   # 侵权词对照（读不到=空，不挡上传）
+            btmap = _dict_btmap()   # 分类→亚马逊类目节点（同上不挡）
 
             # EAN 补码（智赢式：池子在服务器，产品↔码永久绑定）。
             # 只给「有 https 图、行行有 SKU」的算，免得浪费码池。
@@ -1966,7 +2038,7 @@ def _amz_start_upload(
             )
             messages, notes, pid_skus = _amz_build_messages(
                 products, mid, info[1], variant_mode, product_type,
-                words=words, eans=eans,
+                words=words, eans=eans, btmap=btmap,
             )
             if ean_err:
                 notes.append(
@@ -2500,7 +2572,7 @@ class Handler(BaseHTTPRequestHandler):
                 kind = str(body.get("kind") or "")
                 doc_in = body.get("doc")
 
-                if kind not in ("words", "ptmap") or (
+                if kind not in ("words", "ptmap", "btmap") or (
                     doc_in is not None and not isinstance(doc_in, dict)
                 ):
                     self._json({"ok": False, "error": "参数不对"}, 400)
