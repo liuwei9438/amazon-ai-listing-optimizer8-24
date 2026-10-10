@@ -28,6 +28,7 @@ robocopy 部署不会覆盖），环境变量 WZD_PT_DATA 可改根目录；测�
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import threading
@@ -35,6 +36,8 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable
+
+_LOG = logging.getLogger("pt.store")   # 模块 2 要求 11：异常必须可诊断
 
 SCHEMA_VERSION = 1
 
@@ -240,8 +243,13 @@ class PtStore:
         with self._lock:
             try:
                 self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            except sqlite3.Error:
-                pass
+            except sqlite3.Error as e:
+                # 模块 2 要求 11：checkpoint 失败必须留下可诊断日志（数据
+                # 仍在 WAL，重开库会自动恢复，所以只告警不阻断关闭）。
+                _LOG.warning(
+                    "pt.store close: wal_checkpoint 失败 db=%s err=%r（数据"
+                    "保留在 WAL，下次打开自动恢复）", self.path, e,
+                    exc_info=True)
             self._db.close()
 
     def __enter__(self) -> "PtStore":
