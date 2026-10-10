@@ -11,12 +11,17 @@ developer-docs.amazon 抓取核对，规范镜像存 spec_ptd_*.json/spec_cat_*.
   getCatalogItem                GET   /catalog/2022-04-01/items/{asin}          2 rps / burst 2
 
 工程约束（模块 2 批复 12 条）在代码中的落点：
-  3  不 import main：transport / token_provider / endpoint_for 全部构造注入，
-     main 在装配期把自己的 SP-API 请求能力（代理、令牌、区域表）注入进来。
+  3  不 import main：运行环境（build_environment 三模式 direct/proxy/mock）、
+     取令牌回调全部构造注入，main 在装配期把自己的 SP-API 请求能力
+     （代理配置、令牌、区域表）注入进来。direct=显式直连官方端点；
+     proxy=经指定代理（认证只进 opener，repr/日志零秘密，代理失败只报
+     网络错误、绝不擅自改道直连）；mock=只访问 mock_url，物理上发不出
+     真实请求。
   4  错误分类：SpApiAuthError(401) / SpApiForbiddenError(403) /
      SpApiBadRequestError(400 及 413/415 等其他 4xx) / SpApiNotFoundError(404) /
      SpApiRateLimitError(429) / SpApiServerError(5xx) / SpApiNetworkError(网络
-     超时/连接失败) / SpApiParseError(响应不是合法官方形状)。
+     超时/连接失败) / SpApiParseError(响应不是合法官方形状) /
+     SpApiEnvironmentError(环境隔离违反)。
   5  有界重试：仅 429 / 5xx / 网络错误重试（本客户端四个操作全是 GET，天然
      幂等；重试引擎按 method==GET 守卫，非幂等操作永不自动重试）。指数退避
      base=0.5s 翻倍，上限 max_delay；429 优先遵守 Retry-After（秒），超过
@@ -25,22 +30,26 @@ developer-docs.amazon 抓取核对，规范镜像存 spec_ptd_*.json/spec_cat_*.
      响应读 x-amzn-RateLimit-Limit 实时修正速率。
   7  区域正确：marketplace_id → 区域端点（18 站点表与 main._MARKETPLACES
      逐条一致），未知站点直接 ValueError，绝不猜区域。
-  9  Mock 结果显式标记：响应头 X-WZ-Mock: 1 → SpApiResult.mock=True。
-     官方真响应没有这个头 → mock=False。上层据此决定 verified_against。
-  10 认证秘密绝不入日志/异常文本：令牌只在发请求瞬间进 header；异常只带
-     状态码、官方 ErrorList、request id。
+  9  Mock/Live 严格隔离（模块 2 修正 2）：可信判定=客户端环境配置——
+     mock 环境的结果一律 SpApiResult.mock=True；live 环境结果只能来自
+     官方端点白名单（正则校验），且一旦出现 X-WZ-Mock 头立即抛
+     SpApiEnvironmentError 作废。响应头只是交叉校验，不是判定依据。
+  10 认证秘密绝不入日志/异常文本：令牌只在发请求瞬间进 header；代理
+     密码只进 urllib opener（ProxyConfig repr 已抹除）；异常只带状态码、
+     官方 ErrorList、request id。
 """
 
 from __future__ import annotations
 
 import json
+import re
 import socket
 import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable
 
 # ---------------------------------------------------------------------------
@@ -200,7 +209,7 @@ class SpApiResult:
     marketplace_id: str
     status: int
     data: Any                    # 官方响应原样（dict）
-    mock: bool = False           # 响应头 X-WZ-Mock: 1 → True（Mock 铁律）
+    mock: bool = False           # 可信环境判定：mock 环境恒 True（铁律）
     request_id: str | None = None
     rate_limit: float | None = None   # 本次响应 x-amzn-RateLimit-Limit
     attempts: int = 1            # 含重试的总尝试次数
@@ -256,20 +265,66 @@ class RateLimiter:
 
 
 # ---------------------------------------------------------------------------
-# 传输层（要求 3：注入）
+# 传输层与环境隔离（模块 2 修正：显式 Direct/Proxy/Mock 三模式）
 # ---------------------------------------------------------------------------
 
 Transport = Callable[[str, str, dict, float], tuple[int, dict, bytes]]
 # transport(method, url, headers, timeout) -> (status, headers小写dict, body字节)
 
+TRANSPORT_MODES = ("direct", "proxy", "mock")
 
-def stdlib_transport(method: str, url: str, headers: dict,
-                     timeout: float) -> tuple[int, dict, bytes]:
-    """缺省传输：urllib，显式禁用环境代理（本模块只对接本地 Mock 与注入
-    的定制传输；真实出网代理由 main 注入的 transport 负责——防 NO_PROXY
-    继承事故重演）。HTTPError 统一拆成三元组返回，不在这里抛。"""
+# 官方 SP-API 端点唯一合法形态（live 环境的目标白名单）
+OFFICIAL_HOST_RE = re.compile(r"^sellingpartnerapi-(na|eu|fe)\.amazon\.com$")
+
+
+class SpApiEnvironmentError(SpApiError):
+    """环境隔离被违反：live 环境碰了非官方端点 / mock 环境要出网 /
+    live 环境收到 X-WZ-Mock 响应头。结果一律作废，绝不降级放行。"""
+
+
+@dataclass
+class ProxyConfig:
+    """代理配置由 main 的配置体系注入本模块（代理地址、认证）。
+    密码只进 urllib opener，repr/日志永不携带（repr=False）。"""
+    url: str                        # 如 http://127.0.0.1:1080（可含认证）
+    user: str = field(default="", repr=False)
+    password: str = field(default="", repr=False)
+
+
+@dataclass
+class Environment:
+    """可信运行环境（模块 2 修正 2：Mock/Live 由客户端配置确定，不靠响应头）。
+
+    mode="mock"：transport 只允许访问 mock_url 的主机，endpoint_for 恒回
+    mock_url——物理上发不出真实请求，结果一律 mock=True。
+    mode="live"：transport 只允许官方 SP-API 端点（正则白名单），endpoint_for
+    =官方区域表；若响应带 X-WZ-Mock 头（说明被指到模拟服务）立即抛
+    SpApiEnvironmentError，结果作废。
+    """
+    mode: str                       # "mock" | "live"
+    transport: Transport
+    endpoint_for: Callable[[str], str]
+
+
+def _proxy_url_with_auth(proxy: ProxyConfig) -> str:
+    """把 user/password 并进代理 URL（认证信息只在这里出现，绝不进日志）。"""
+    url = proxy.url.strip()
+    if not url:
+        raise ValueError("ProxyConfig.url 不能为空")
+    if proxy.user or proxy.password:
+        if "@" in url.split("://", 1)[-1]:
+            return url                       # URL 自带认证，原样用
+        scheme, _, rest = url.partition("://")
+        cred = urllib.parse.quote(proxy.user or "") + ":" + \
+            urllib.parse.quote(proxy.password or "")
+        return f"{scheme}://{cred}@{rest}"
+    return url
+
+
+def _urllib_call(opener, method: str, url: str, headers: dict,
+                 timeout: float) -> tuple[int, dict, bytes]:
+    """统一 urllib 调用：HTTPError 拆成三元组返回（状态分类在客户端做）。"""
     req = urllib.request.Request(url, method=method, headers=headers)
-    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
         with opener.open(req, timeout=timeout) as resp:
             return int(resp.status), _lc(resp.headers), resp.read()
@@ -280,6 +335,82 @@ def stdlib_transport(method: str, url: str, headers: dict,
         except Exception:  # noqa: BLE001
             pass
         return int(e.code), _lc(e.headers), body
+
+
+def _host_of(url: str) -> str:
+    return (urllib.parse.urlparse(url).hostname or "").lower()
+
+
+def _assert_official(url: str) -> None:
+    host = _host_of(url)
+    if not OFFICIAL_HOST_RE.match(host):
+        raise SpApiEnvironmentError(
+            f"live 环境只允许官方 SP-API 端点"
+            f"（sellingpartnerapi-na|eu|fe.amazon.com），拒绝目标：{host}")
+
+
+def _assert_host(url: str, allowed_host: str) -> None:
+    host = _host_of(url)
+    if host != allowed_host.lower():
+        raise SpApiEnvironmentError(
+            f"mock 环境只允许访问 {allowed_host}，拒绝目标：{host}")
+
+
+def _no_proxy_opener():
+    """direct / mock 都显式不走环境代理（这是明确的选择，不是缺省凑合：
+    代理模式必须显式传 ProxyConfig）。单一定径，无回退路径。"""
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def raw_transport(method: str, url: str, headers: dict,
+                  timeout: float) -> tuple[int, dict, bytes]:
+    """无守卫裸传输：仅供测试构造「环境配置被绕过」的故障注入场景，
+    业务代码禁止使用。"""
+    return _urllib_call(_no_proxy_opener(), method, url, headers, timeout)
+
+
+def build_environment(mode: str, *, proxy: ProxyConfig | None = None,
+                      mock_url: str | None = None) -> Environment:
+    """三模式环境工厂：
+      direct：显式直连官方端点（不接受 proxy 参数）
+      proxy： 经指定代理连官方端点（必须给 proxy；代理失败只报网络错误，
+              绝不擅自改走直连）
+      mock：  只访问 mock_url 的本地模拟服务（必须给 mock_url）
+    """
+    if mode == "mock":
+        if not mock_url:
+            raise ValueError("mock 模式必须给 mock_url")
+        host = _host_of(mock_url)
+        opener_holder = _no_proxy_opener()
+
+        def mock_transport(method, url, headers, timeout):
+            _assert_host(url, host)
+            return _urllib_call(opener_holder, method, url, headers, timeout)
+
+        base = mock_url.rstrip("/")
+        return Environment("mock", mock_transport, lambda mid: base)
+
+    if mode in ("direct", "proxy"):
+        if mode == "direct" and proxy is not None:
+            raise ValueError("direct 模式不接受 proxy 参数（要用代理请选 "
+                             "proxy 模式）")
+        if mode == "proxy" and proxy is None:
+            raise ValueError("proxy 模式必须给 ProxyConfig")
+        if mode == "proxy":
+            proxy_url = _proxy_url_with_auth(proxy)   # 认证只进 opener
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler(
+                    {"http": proxy_url, "https": proxy_url}))
+        else:
+            opener = _no_proxy_opener()
+
+        def live_transport(method, url, headers, timeout):
+            _assert_official(url)          # live 只发官方端点
+            return _urllib_call(opener, method, url, headers, timeout)
+
+        return Environment("live", live_transport, official_endpoint)
+
+    raise ValueError(f"未知传输模式：{mode!r}（可选 {TRANSPORT_MODES}）")
 
 
 def _lc(h) -> dict:
@@ -334,19 +465,20 @@ def _csv(values: Iterable) -> str:
 
 
 class SpApiClient:
-    """四个官方操作的客户端。一切外部能力（发请求、取令牌、选端点）全部
-    注入；默认传输 urllib 直连不走环境代理，默认取令牌=报错提醒注入。"""
+    """四个官方操作的客户端。运行环境（direct/proxy/mock）由
+    build_environment 构造后注入——Mock/Live 的判定以这份可信配置为准，
+    响应头 X-WZ-Mock 只用作 live 环境的交叉校验（出现即作废）。
+    取令牌回调注入；令牌只在发请求瞬间进 header。"""
 
-    def __init__(self, *, transport: Transport | None = None,
+    def __init__(self, environment: Environment, *,
                  token_provider: Callable[[], str] | None = None,
-                 endpoint_for: Callable[[str], str] | None = None,
                  rate_overrides: dict[str, tuple[float, float]] | None = None,
                  retry: RetryConfig | None = None,
                  timeout: float = 20.0,
                  user_agent: str = "wz-desktop-pt/1.0"):
-        self._transport = transport or stdlib_transport
+        self._env = environment
+        self._transport = environment.transport
         self._token_provider = token_provider
-        self._endpoint_for = endpoint_for or official_endpoint
         self._retry = retry or RetryConfig()
         self._timeout = float(timeout)
         self._user_agent = user_agent
@@ -355,6 +487,11 @@ class SpApiClient:
             if rate_overrides and op in rate_overrides:
                 r, b = rate_overrides[op]
             self._limiters[op] = RateLimiter(r, b)
+
+    @property
+    def env_mode(self) -> str:
+        """当前可信环境（mock|live）——上层据此决定 verified_against。"""
+        return self._env.mode
 
     # ---- 对外诊断 ----
 
@@ -560,7 +697,7 @@ class SpApiClient:
 
     def _call(self, op: str, spec: _OpSpec, marketplace_id: str,
               path: str, params: dict) -> SpApiResult:
-        base = self._endpoint_for(marketplace_id).rstrip("/")
+        base = self._env.endpoint_for(marketplace_id).rstrip("/")
         url = base + path + "?" + urllib.parse.urlencode(params)
         # 区域/站点正确性（要求 7）：默认 resolver 已拒未知站点；注入的
         # resolver 也兜底再验一次 marketplace 合法性。
@@ -618,12 +755,21 @@ class SpApiClient:
             else:
                 self._absorb_rate_header(op, resp_headers)
                 if 200 <= status < 300:
+                    # 环境信任（修正 2）：mock 与否由客户端配置决定；
+                    # live 环境见到 X-WZ-Mock 头=目标可疑，结果作废。
+                    mock_by_cfg = self._env.mode == "mock"
+                    if not mock_by_cfg and _is_mock(resp_headers):
+                        raise SpApiEnvironmentError(
+                            f"{spec.official} 在 live 环境收到 X-WZ-Mock "
+                            f"响应头——请求目标疑似模拟服务，结果作废",
+                            op=op, marketplace_id=marketplace_id,
+                            status=status,
+                            request_id=resp_headers.get("x-amzn-requestid"))
                     data, parsed_errs = _parse_json(body)
                     if parsed_errs is None:
                         return SpApiResult(
                             op=op, marketplace_id=marketplace_id,
-                            status=status, data=data, mock=_is_mock(
-                                resp_headers),
+                            status=status, data=data, mock=mock_by_cfg,
                             request_id=resp_headers.get("x-amzn-requestid"),
                             rate_limit=_rate_of(resp_headers),
                             attempts=attempts,
