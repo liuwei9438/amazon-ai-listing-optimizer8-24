@@ -16,6 +16,7 @@ const S = {
   viewCat: "",             // 分类视图当前选中（""=全部，"__none__"=未分类）
   expanded: null,          // Set 展开路径（localStorage 记忆）
   treeQ: "",               // 分类搜索
+  moveQ: "",               // 移动分类弹窗里的分类搜索（D1.12.0 大树用）
   moveCtx: null,           // 移动分类弹窗上下文
   catEditCtx: null,        // 新增/修改分类上下文
   catDelCtx: null,         // 删除/彻底删除上下文
@@ -1193,7 +1194,7 @@ function renderTree(target = "#catTree") {
   if (!box) return;
   const picker = target === "#moveTree";
   const { rows, exact, none } = treeRows();
-  const q = S.treeQ.trim().toLowerCase();
+  const q = (picker ? S.moveQ : S.treeQ).trim().toLowerCase();
 
   const matchSet = new Set();        // 搜索命中 + 祖先链
   if (q) {
@@ -1251,8 +1252,8 @@ function renderTree(target = "#catTree") {
       .forEach(emit);
   } else {
     rows.forEach((r) => {
-      /* 弹窗树：默认全展开（智赢弹窗就是全展开可滚） */
-      const hasKids = r.children.size > 0;
+      /* 弹窗树：默认全展开（智赢弹窗就是全展开可滚），搜索时照滤 */
+      if (!visible(r)) return;
       out.push(nodeHtml(r));
     });
   }
@@ -1858,6 +1859,8 @@ function openMove(ctx = {}) {   // {} = 批量（S.sel）；{single:true, fill:"
     : `请为选中的 ${S.sel.size} 个产品选择分类`;
   S.treeQ = "";
   $("treeQ") && ($("treeQ").value = "");
+  S.moveQ = "";
+  $("moveQ") && ($("moveQ").value = "");
   renderTree("#moveTree");
   $("dlgMove").classList.remove("hidden");
 }
@@ -2793,6 +2796,10 @@ function bindEvents() {
   $("treeQ").oninput = (e) => {
     S.treeQ = e.target.value;
     renderTree();
+  };
+  $("moveQ").oninput = (e) => {
+    S.moveQ = e.target.value;
+    renderTree("#moveTree");
   };
   $("catTree").addEventListener("click", (e) => {
     const tib = e.target.closest("[data-tact]");

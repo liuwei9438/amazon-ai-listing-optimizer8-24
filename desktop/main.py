@@ -42,7 +42,7 @@ ROOT = APP_DIR.parent                          # 仓库根
 os.chdir(ROOT)                                 # 引擎的 tasks/ 落在根目录
 sys.path.insert(0, str(ROOT))
 
-VERSION = "D1.11.1"
+VERSION = "D1.12.0"
 APP_DIR_NAME = "app"
 
 DEFAULT_CONFIG = {
@@ -1789,7 +1789,9 @@ def _autocat_start(pids: list) -> None:
                         err += 1
 
                 if items:
-                    # 2) 这一批合一次问（分类树带一遍）
+                    # 2) 这一批合一次问（分类树带一遍）。树大（亚马逊
+                    # 细分分类库，几百上千条）时两段问：先挑部门、
+                    # 再在部门里挑细分——省 token 又准（D1.12.0）。
                     cand = list(dict.fromkeys(
                         tree + [it["cur"] for it in items if it["cur"]]
                     ))
@@ -1798,24 +1800,12 @@ def _autocat_start(pids: list) -> None:
                         f"｜卖点：{it['bullets']}｜简介：{it['desc']}"
                         for k, it in enumerate(items, 1)
                     )
-                    prompt = (
-                        "你是亚马逊运营助理，负责给产品挑分类。\n"
-                        "我们的分类树，每行一个完整路径（只能从中选）：\n"
-                        + "\n".join("- " + c for c in cand[:300]) + "\n\n"
-                        "产品列表：\n" + lines + "\n\n"
-                        "给每个产品从树里选最合适的一个分类。"
-                        "只能选树里已有的（原样返回，不要改字、"
-                        "不要造新分类、不要输出列表外的内容），"
-                        "实在没有合适的选「其他」。\n"
-                        '只输出 JSON：{"items":[{"i":编号,'
-                        '"cat":"路径"},…]}，每个产品一条，'
-                        "i=产品编号。\n"
-                    )
-                    pick: dict[int, str] = {}
-                    try:
+
+                    def ask(prompt, max_tokens=800):
+                        """问一次，回 {序号-1: 答案}（cat 或 dept）。"""
                         out = _ai_chat_one(
                             prompt, key, provider, model,
-                            timeout=60, max_tokens=800,
+                            timeout=90, max_tokens=max_tokens,
                         )
                         try:
                             doc = json.loads(out)
@@ -1828,6 +1818,7 @@ def _autocat_start(pids: list) -> None:
                             )
                         if isinstance(doc, list):
                             doc = {"items": doc}
+                        got: dict[int, str] = {}
                         for d in (doc.get("items") or []):
                             if not isinstance(d, dict):
                                 continue
@@ -1836,9 +1827,87 @@ def _autocat_start(pids: list) -> None:
                             except (TypeError, ValueError):
                                 continue
                             if 1 <= i <= len(items):
-                                pick[i - 1] = str(
-                                    d.get("cat") or ""
+                                got[i - 1] = str(
+                                    d.get("cat") or d.get("dept") or ""
                                 ).strip()
+                        return got
+
+                    pick: dict[int, str] = {}
+                    try:
+                        dept_paths: dict[str, list] = {}
+                        for p in tree:
+                            top = p.split("/", 1)[0]
+                            dept_paths.setdefault(top, []).append(p)
+                        for it in items:
+                            if it["cur"] and it["cur"] not in tree:
+                                top = it["cur"].split("/", 1)[0]
+                                if top in dept_paths:
+                                    dept_paths[top].append(it["cur"])
+
+                        if len(cand) <= 260:
+                            prompt = (
+                                "你是亚马逊运营助理，负责给产品挑分类。\n"
+                                "我们的分类树，每行一个完整路径（只能从中选）：\n"
+                                + "\n".join("- " + c for c in cand[:300]) + "\n\n"
+                                "产品列表：\n" + lines + "\n\n"
+                                "给每个产品从树里选最合适的一个分类。"
+                                "只能选树里已有的（原样返回，不要改字、"
+                                "不要造新分类、不要输出列表外的内容），"
+                                "实在没有合适的选「其他」。\n"
+                                '只输出 JSON：{"items":[{"i":编号,'
+                                '"cat":"路径"},…]}，每个产品一条，'
+                                "i=产品编号。\n"
+                            )
+                            pick = ask(prompt)
+                        else:
+                            # 第一段：挑部门（顶级分类）
+                            prompt_a = (
+                                "你是亚马逊运营助理，负责给产品挑分类。\n"
+                                "部门列表（只能从中选一个）：\n"
+                                + "\n".join(
+                                    "- " + d for d in list(dept_paths)[:80]
+                                ) + "\n\n"
+                                "产品列表：\n" + lines + "\n\n"
+                                "给每个产品从部门列表里选最合适的一个部门"
+                                "（原样返回，不要改字、不要造新部门）。\n"
+                                '只输出 JSON：{"items":[{"i":编号,'
+                                '"dept":"部门"},…]}，每个产品一条，'
+                                "i=产品编号。\n"
+                            )
+                            dep = ask(prompt_a, max_tokens=400)
+                            # 第二段：部门内挑细分（一个部门合一次问）
+                            groups: dict[str, list] = {}
+                            for k, _it in enumerate(items):
+                                d = dep.get(k, "")
+                                if d in dept_paths:
+                                    groups.setdefault(d, []).append(k)
+                            for d, ks in groups.items():
+                                paths = dept_paths[d][:900]
+                                sub = "\n".join(
+                                    f"{k + 1}. 标题：{items[k]['title']}"
+                                    f"｜卖点：{items[k]['bullets']}"
+                                    f"｜简介：{items[k]['desc']}"
+                                    for k in ks
+                                )
+                                prompt_b = (
+                                    "你是亚马逊运营助理，负责给产品挑"
+                                    "亚马逊上传分类。\n"
+                                    f"「{d}」部门下的分类，每行一个完整路径"
+                                    "（只能从中选）：\n"
+                                    + "\n".join("- " + p for p in paths) + "\n\n"
+                                    "产品列表：\n" + sub + "\n\n"
+                                    "给每个产品选最合适的一个分类。"
+                                    "只能选列表里已有的（原样返回，"
+                                    "不要改字、不要造新分类），"
+                                    "实在没有合适的选「其他」。\n"
+                                    '只输出 JSON：{"items":[{"i":编号,'
+                                    '"cat":"路径"},…]}，每个产品一条，'
+                                    "i=产品编号。\n"
+                                )
+                                pick_b = ask(prompt_b)
+                                for k in ks:
+                                    if pick_b.get(k):
+                                        pick[k] = pick_b[k]
                     except Exception:
                         err += len(items)
 
