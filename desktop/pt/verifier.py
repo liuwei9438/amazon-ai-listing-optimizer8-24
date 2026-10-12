@@ -6,11 +6,18 @@
 只做验证与证据，不做选择（选择属模块 4）、不碰 Schema（属模块 6）。
 铁律（模块 5 批复 10 条）：
 1. 独立验证：PT 官方存在性（getDefinitionsProductType）与商品语义
-   适配性（官方 displayName × 本体语义词）分开出结论，互不代劳——
-   存在性过了语义照样可能不合格，反之亦然。
-2. Browse Node 三分离：存在性（evidence_status）、目录证据（哪些 ASIN
-   的官方 classifications 链引用了该节点）、当前商品适配性（fit_status）
-   分别记录（落 pt_browse_node 三列各记各的）——节点存在≠商品适配。
+   适配性分开出结论，互不代劳——存在性过了语义照样可能不合格，反之
+   亦然。语义适配不只看 displayName 词汇重叠（2026-10-12 补强 1）：
+   四路可解释证据=商品理解词 ×（官方 displayName/PT 名 + 官方类型
+   定义属性名）+ 目录同类商品佐证（同类有多少官方标注该 PT）+ 候选
+   来源追溯；跨语言 displayName 零重叠时目录强佐证可支撑 passed，
+   双向否定才 failed，佐证拿不到只降说明为 unavailable 绝不伪装否定。
+2. Browse Node 证据四级分记（2026-10-12 补强 2）：官方目录观察
+   （evidence_status，哪些 ASIN 链引用）、同类商品佐证（similar_seen/
+   referencing/占比）、当前商品适配（fit_status）、实际刊登可用性
+   （usability=not_assessable——Catalog 节点被引用≠该商品可在此节点
+   刊登，刊登可用性须待属性检查（模块 6）与真实上传验证，本模块
+   绝不自动放行）分别记录（落 pt_browse_node 列+evidence_json 四键）。
 3. Catalog 检索为空 = 证据不足（insufficient，kind=empty_search），
    **绝不判「节点不存在」**——官方目录覆盖率有限，absence of evidence
    不是 evidence of absence。本模块四个操作下「节点不存在」本来就
@@ -62,6 +69,9 @@ SEMANTIC_FIT_MIN = ABS_MIN_SEMANTIC   # 语义适配下限（单源：matcher �
 BN_KEYWORDS_MAX = 8                   # 目录检索词上限（官方上限 20，留余量）
 BN_PAGE_SIZE = 20                     # 单页证据够用；翻页聚合属模块 7
 OFFICIAL_BN_SOURCE = "spapi_catalog"  # 官方目录证据来源名（落 store.source）
+# 补强 1：目录同类佐证门槛（同类商品官方标注该 PT 的占比/数量）
+CATALOG_CORROB_SHARE = 0.5            # 占比下限（≥ 一半同类在用才算佐证）
+CATALOG_CORROB_MIN_ITEMS = 2          # 可比同类数量下限（1 件说明不了问题）
 
 # 状态常量（落库对齐 store.VALID_VSTATUS，模块 5 起后两值可写）
 S_PASSED = "passed"
@@ -102,14 +112,15 @@ class PtVerification:
 
 @dataclass
 class BrowseNodeVerification:
-    """一次 Browse Node 验证：存在性/目录证据/商品适配三分离（铁律 2）。"""
+    """一次 Browse Node 验证：证据四级分记（补强 2）。"""
     node_id: str
     marketplace_id: str
     env: str
     checked_at: int
-    existence: CheckResult           # passed=confirmed / insufficient（不 missing）
-    catalog: CheckResult             # 目录证据本身（检索成败+引用清单）
-    fit: CheckResult                # passed=fit / failed=mismatch / insufficient=unknown
+    existence: CheckResult           # ①官方目录观察：confirmed/insufficient
+    catalog: CheckResult             # 目录证据本身（检索成败+引用清单+佐证占比）
+    fit: CheckResult                # ③当前商品适配：fit/mismatch/unknown
+    usability: CheckResult           # ④实际刊登可用性：恒 not_assessable
 
 
 def _tokens(text: str) -> set[str]:
@@ -223,6 +234,79 @@ def _bn_keywords(material: ProductMaterial) -> list[str]:
     return seen
 
 
+def _property_names(ptd_data: dict) -> list[str]:
+    """官方类型定义证据（补强 1）：propertyGroups 里的属性名——官方响应
+    可选块，有多少记多少，不猜。"""
+    out: list[str] = []
+    for grp in (ptd_data.get("propertyGroups") or []):
+        if not isinstance(grp, dict):
+            continue
+        pg = grp.get("propertyGroup")
+        if isinstance(pg, dict) and isinstance(pg.get("title"), dict):
+            out.extend(str(v) for v in pg["title"].get("propertyNames")
+                       or [] if v)
+        for rq in grp.get("requirements") or []:
+            if isinstance(rq, dict) and rq.get("name"):
+                out.append(str(rq["name"]))
+    seen, dedup = set(), []
+    for n in out:
+        if n and n not in seen:
+            seen.add(n)
+            dedup.append(n)
+    return dedup
+
+
+def _catalog_segment(client: SpApiClient, material: ProductMaterial,
+                     pt: str, marketplace_id: str) -> dict:
+    """目录同类商品佐证（补强 1）：检索同类，数多少可比商品的官方
+    productTypes 标注了该 PT（只数本站点）。佐证拿不到=segment
+    unavailable——只降说明、不降结论，绝不伪装成官方否定。"""
+    kws = _bn_keywords(material)
+    if not kws:
+        return {"status": "skipped", "reason": "无本体检索词"}
+    kw: dict[str, Any] = {"keywords": kws, "included_data": [
+        "classifications", "summaries", "productTypes"],
+        "page_size": BN_PAGE_SIZE}
+    if material.language_guess == "zh":
+        kw["keywords_locale"] = "zh_CN"
+    try:
+        r = client.search_catalog_items(marketplace_id, **kw)
+    except (ValueError, SpApiError) as e:
+        return {"status": "unavailable", "error": _err_detail(e)}
+    items = [i for i in (r.data.get("items") or []) if isinstance(i, dict)]
+    comparable = using = 0
+    texts: list[str] = []
+    for it in items:
+        pts = [str(p.get("productType") or "")
+               for p in (it.get("productTypes") or [])
+               if isinstance(p, dict)
+               and p.get("marketplaceId") == marketplace_id]
+        if pts:
+            comparable += 1
+        if pt in pts:
+            using += 1
+            texts.append(_item_text(it))
+    terms = semantic_terms(material)
+    return {
+        "status": "ok", "items_seen": len(items), "comparable": comparable,
+        "using_pt": using,
+        "share": round(using / comparable, 4) if comparable else None,
+        "text_score": _overlap_score(terms, " ".join(texts))
+        if texts else 0.0}
+
+
+def _usability_not_assessable() -> CheckResult:
+    """补强 2 第 4 级：实际刊登可用性。目录观察只证明节点被同类引用，
+    绝不等于该商品能在此节点刊登——属性适配检查属模块 6、真实刊登
+    验证属第二阶段，本模块一律 not_assessable，绝不自动放行。"""
+    return CheckResult(
+        "browse_node", S_INSUFFICIENT, "internal", False,
+        {"kind": "not_assessable",
+         "detail": "Catalog 节点被同类商品引用 ≠ 该商品可在此节点刊登；"
+                   "刊登可用性须待属性缺口检查（模块 6）与真实上传验证"
+                   "（第二阶段），本阶段一律记 not_assessable"})
+
+
 # ---------------------------------------------------------------------------
 # 验证（纯查询：不落库、不改传入对象；同输入+同目录数据=同输出）
 # ---------------------------------------------------------------------------
@@ -230,9 +314,13 @@ def _bn_keywords(material: ProductMaterial) -> list[str]:
 
 def verify_product_type(client: SpApiClient, material: ProductMaterial,
                         pt_name: str, *, marketplace_id: str,
-                        now_fn: Callable[[], float] = time.time
+                        now_fn: Callable[[], float] = time.time,
+                        candidate_sources: dict[str, list[str]] | None = None,
                         ) -> PtVerification:
-    """PT 官方存在性 + 商品语义适配性（两条独立结论，铁律 1）。"""
+    """PT 官方存在性 + 商品语义适配性（两条独立结论，铁律 1）。
+
+    candidate_sources（可选，补强 1）：{pt_name: [候选策略名]}——模块 4
+    检索的来龙去脉，只入证供人工复核追溯，不参与打分。"""
     pt = (pt_name or "").strip()
     t = int(now_fn())
 
@@ -269,22 +357,63 @@ def verify_product_type(client: SpApiClient, material: ProductMaterial,
          "locale": r.data.get("locale"),
          "request_id": r.request_id, "attempts": r.attempts})
 
+    # ---- 语义适配（补强 1：四路可解释证据，不只 displayName 词重叠）----
+    # 主证据=官方 displayName×本体理解词；辅证据=官方类型定义属性名、
+    # 目录同类商品佐证（同类有无官方标注该 PT）、候选来源追溯。
     terms = semantic_terms(material)
-    score = _overlap_score(terms, display + " " + pt.replace("_", " "))
-    if score <= 0.0:
-        status = S_FAILED          # 与本体零语义关联：错误分类
-        note = "官方 PT 名与本体语义词零重叠（错误分类）"
-    elif score < SEMANTIC_FIT_MIN:
-        status = S_INSUFFICIENT    # 弱关联：证据不足，交人工
-        note = "语义关联低于阈值（弱证据）"
-    else:
+    seg_display = {"basis": "官方 displayName×本体理解词",
+                   "score": _overlap_score(
+                       terms, display + " " + pt.replace("_", " "))}
+    prop_names = _property_names(r.data)
+    seg_def = {"basis": "官方类型定义（propertyGroups 属性名）",
+               "property_names": prop_names[:20],
+               "score": _overlap_score(terms, " ".join(prop_names))}
+    seg_cat = _catalog_segment(client, material, pt, marketplace_id)
+    primary = seg_display["score"]
+    reasons: list[str] = []
+    if primary >= SEMANTIC_FIT_MIN:
         status = S_PASSED
         note = "官方 PT 名与本体语义一致"
-    semantic = CheckResult(
-        "semantic", status, _SRC_PTD_GET, True,
-        {"score": score, "threshold": SEMANTIC_FIT_MIN, "note": note,
-         "displayName": display,
-         "identity_source": material.identity_source})
+        reasons.append(f"主证据通过：displayName 语义重叠 {primary}"
+                       f"≥{SEMANTIC_FIT_MIN}")
+    elif (seg_cat.get("status") == "ok"
+          and (seg_cat.get("share") or 0) >= CATALOG_CORROB_SHARE
+          and (seg_cat.get("comparable") or 0) >= CATALOG_CORROB_MIN_ITEMS):
+        # 跨语言 displayName 零重叠但目录同类强佐证——不靠词重叠定生死
+        status = S_PASSED
+        note = "主证据不足，目录同类商品佐证充分"
+        reasons.append(
+            f"主证据重叠 {primary}；目录同类 {seg_cat['using_pt']}/"
+            f"{seg_cat['comparable']} 官方标注该 PT"
+            f"（占比≥{CATALOG_CORROB_SHARE}）")
+    elif (primary <= 0 and seg_cat.get("status") == "ok"
+          and (seg_cat.get("comparable") or 0) >= 1
+          and (seg_cat.get("using_pt") or 0) == 0):
+        status = S_FAILED          # 官方名与目录同类双向否定：错误分类
+        note = "官方 PT 名与本体零重叠且目录同类无一使用（错误分类）"
+        reasons.append("displayName 零重叠；目录同类商品无一使用该 PT")
+    elif primary <= 0 and seg_cat.get("status") != "ok":
+        status = S_INSUFFICIENT    # 零重叠但佐证不可用/为空：证据不足
+        note = "官方 PT 名与本体零重叠，目录佐证不可用或为空（证据不足）"
+        reasons.append("displayName 零重叠；目录佐证缺失，不下定论")
+    elif primary <= 0:
+        status = S_INSUFFICIENT    # 零重叠+佐证两极分化之外：不下定论
+        note = "官方 PT 名与本体零重叠，目录佐证不足以下定论"
+        reasons.append("displayName 零重叠；目录同类佐证占比未达门槛")
+    else:
+        status = S_INSUFFICIENT    # 弱关联且佐证不足：交人工
+        note = "语义关联低于阈值（弱证据）且目录佐证不足"
+        reasons.append(f"主证据 {primary}<{SEMANTIC_FIT_MIN}；目录佐证"
+                       "未达门槛")
+    detail: dict[str, Any] = {
+        "score": primary, "threshold": SEMANTIC_FIT_MIN, "note": note,
+        "displayName": display, "identity_source": material.identity_source,
+        "reasons": reasons,
+        "segments": {"display": seg_display, "definition": seg_def,
+                     "catalog": seg_cat}}
+    if candidate_sources:
+        detail["candidate_sources"] = list(candidate_sources.get(pt) or [])
+    semantic = CheckResult("semantic", status, _SRC_PTD_GET, True, detail)
     return PtVerification(pt, marketplace_id, client.env_mode, t,
                           exists, semantic)
 
@@ -311,7 +440,7 @@ def verify_browse_node(client: SpApiClient, material: ProductMaterial,
             nid, marketplace_id, env, t, bad,
             CheckResult("browse_node", S_SKIPPED, "internal", False,
                         {"detail": "node_id 为空，未检索"}), _unknown_fit(
-                            "internal"))
+                            "internal"), _usability_not_assessable())
 
     kws = _bn_keywords(material)
     if not kws:
@@ -324,7 +453,7 @@ def verify_browse_node(client: SpApiClient, material: ProductMaterial,
             nid, marketplace_id, env, t, noq,
             CheckResult("browse_node", S_SKIPPED, "internal", False,
                         {"detail": "无检索词，未发起"}), _unknown_fit(
-                            "internal"))
+                            "internal"), _usability_not_assessable())
 
     kw: dict[str, Any] = {"keywords": kws, "included_data": [
         "classifications", "summaries", "productTypes"],
@@ -346,7 +475,7 @@ def verify_browse_node(client: SpApiClient, material: ProductMaterial,
                              False, d)
         return BrowseNodeVerification(
             nid, marketplace_id, env, t, failed, failed, _unknown_fit(
-                _SRC_CAT_SEARCH))
+                _SRC_CAT_SEARCH), _usability_not_assessable())
 
     items = [i for i in (r.data.get("items") or []) if isinstance(i, dict)]
     n_results = r.data.get("numberOfResults")
@@ -367,10 +496,16 @@ def verify_browse_node(client: SpApiClient, material: ProductMaterial,
                 ref_texts.append(_item_text(it))
                 break
 
+    # ②同类商品佐证（补强 2）：同类检索结果里多少引用了该节点
+    similar_seen = len(items)
+    corroboration_share = (round(len(refs) / similar_seen, 4)
+                           if similar_seen else None)
     catalog = CheckResult(
         "browse_node", S_PASSED, _SRC_CAT_SEARCH, True,
         {"query": dict(kw), "numberOfResults": n_results,
-         "items_seen": len(items), "referencing": refs,
+         "items_seen": similar_seen, "referencing": refs,
+         "similar_seen": similar_seen, "referencing_count": len(refs),
+         "corroboration_share": corroboration_share,
          "request_id": r.request_id, "attempts": r.attempts})
 
     if not refs:
@@ -384,7 +519,8 @@ def verify_browse_node(client: SpApiClient, material: ProductMaterial,
              "numberOfResults": n_results, "items_seen": len(items)})
         return BrowseNodeVerification(nid, marketplace_id, env, t,
                                       existence, catalog, _unknown_fit(
-                                          _SRC_CAT_SEARCH))
+                                          _SRC_CAT_SEARCH),
+                                      _usability_not_assessable())
 
     existence = CheckResult(
         "browse_node", S_PASSED, _SRC_CAT_SEARCH, True,
@@ -411,7 +547,8 @@ def verify_browse_node(client: SpApiClient, material: ProductMaterial,
              "threshold": SEMANTIC_FIT_MIN,
              "detail": "节点链/引用商品与本体语义有交集"})
     return BrowseNodeVerification(nid, marketplace_id, env, t,
-                                  existence, catalog, fit)
+                                  existence, catalog, fit,
+                                  _usability_not_assessable())
 
 
 # ---------------------------------------------------------------------------
@@ -452,14 +589,22 @@ def save_browse_node_verification(store, bnv: BrowseNodeVerification, *,
     display = next((x.get("node_display") for x in refs
                     if x.get("node_display")), None)
     context = " > ".join(refs[0]["path"]) if refs else None
+    # 证据四级分记（补强 2）：观察/佐证/适配/刊登可用性各入一键
     store.upsert_browse_node(
         marketplace_id=bnv.marketplace_id, node_id=bnv.node_id,
         source=OFFICIAL_BN_SOURCE, evidence_status=ev_status,
         evidence_kind=bnv.existence.detail.get("kind"),
         fit_status=fit_status, display_name=display, context_path=context,
-        evidence={"catalog": bnv.catalog.detail,
-                  "existence": bnv.existence.detail,
+        evidence={"observation": bnv.existence.detail,
+                  "corroboration": {
+                      "similar_seen": bnv.catalog.detail.get("similar_seen"),
+                      "referencing_count": len(refs),
+                      "share": bnv.catalog.detail.get(
+                          "corroboration_share")},
                   "fit": bnv.fit.detail,
+                  "listing_usability": bnv.usability.detail,
+                  "catalog": bnv.catalog.detail,
+                  "existence": bnv.existence.detail,
                   "source": bnv.existence.source, "official": True},
         checked_at=bnv.checked_at, env=bnv.env)
     return store.add_verification(

@@ -49,6 +49,10 @@ STATE: dict = {
     # 模块 5 验证层用（默认 None=不影响既有行为）：
     "known_pts": None,      # None=PTD get 全知道；传集合=白名单，外者 404
     "catalog_items": None,  # None=默认三件；传 Item 列表（make_item 构造）
+    # 模块 5 补强用：只打 /catalog 路由的定向故障（None=关闭）。取值
+    # server_error|notfound|badjson|timeout——PTD 等其余路由照常，专测
+    # 「定义拿得到、目录佐证拿不到」的降级行为。
+    "catalog_mode": None,
 }
 _LOCK = threading.Lock()
 RECORDS: list[dict] = []    # 每请求一条（不含令牌值，只记长度）
@@ -220,6 +224,25 @@ class _Handler(BaseHTTPRequestHandler):
         if mode == "no_mock_header":
             self._send(200, self._body_ok(u.path, qs, mid), mock=False)
             return
+
+        # 目录路由定向故障（模块 5 补强；默认 None 不影响任何既有行为）
+        with _LOCK:
+            cm = STATE["catalog_mode"]
+        if cm and u.path.startswith("/catalog/"):
+            if cm == "server_error":
+                self._send(500, _error_body("InternalFailure",
+                                            "目录接口故障（mock）"))
+                return
+            if cm == "notfound":
+                self._err(404, "NotFound", "目录资源不存在（mock）")
+                return
+            if cm == "badjson":
+                self._send(200, b"<<<not-json>>>")
+                return
+            if cm == "timeout":
+                time.sleep(float(STATE["sleep"]))
+                self._send(200, b'{"numberOfResults":0,"items":[]}')
+                return
 
         body = self._body(u.path, qs, mid)
         if body is None:
