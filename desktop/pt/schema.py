@@ -30,10 +30,13 @@ Schema 解析成逐属性要求清单；③attribute_gap_report=对照商品材�
 7. 缺口报告五分类（批复 ⑧）：ok=已有可靠数据 / missing_required=
    缺必填 / conditional_pending=条件必填待判断 / format_mismatch=
    格式不符 / undeterminable=无法确定；每项带来源与理由。
-8. 绝不编造商品事实（批复 ⑨）：FACT_SOURCES 只映射材料里真实存在
-   的字段（标题/型号/理解出的 product_type 等）；brand/manufacturer/
-   GTIN/认证/材质/尺寸等没有来源的必填一律 missing_required「需人工
-   提供」，报告恒带 fabrication_guard 声明。
+8. 绝不编造商品事实（批复 ⑨ + 修正 2）：FACT_SOURCES 只映射材料里
+   真实存在的字段（标题/型号/描述/要点）；官方 feed_product_type 的
+   唯一来源=「模块 4 匹配+模块 5 验证」的 PTD 候选（调用方以 pt_name
+   传入），AI 理解的 product_type 只进 ai_semantic_pt 参考字段、
+   绝不直填上传；brand/manufacturer/GTIN/认证/材质/尺寸等没有来源的
+   必填一律 missing_required「需人工提供」，报告恒带 fabrication_guard
+   声明。
 9. 只分析不代工（批复 ⑩）：不修改商品资料、不生成上传请求、不写
    「可刊登」结论——summary 最高只到 complete_for_review。
 10. 批量安全（批复三）：ensure_schema 永不抛异常——定义/下载/落盘
@@ -52,6 +55,7 @@ import json
 import logging
 import os
 import re
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -102,14 +106,16 @@ GAP_ORDER = (GAP_OK, GAP_MISSING, GAP_CONDITIONAL, GAP_FORMAT,
 FABRICATION_GUARD = (
     "本报告只对照官方 Schema 检查属性要求：不修改商品资料、不生成上传"
     "请求；品牌/制造商/GTIN/认证/材质/尺寸等商品事实一律不编造——"
-    "缺项须由人工或真实数据源提供。")
+    "缺项须由人工或真实数据源提供。官方 Product Type 只来自「模块 4 "
+    "匹配+模块 5 验证」的 PTD 候选，AI 理解词仅作语义参考、绝不直填。")
 
-# 商品事实映射（批复 ⑨：只映射材料里真实存在的来源；没映射 ≠ 可编造）
+# 商品事实映射（批复 ⑨：只映射材料里真实存在的来源；没映射 ≠ 可编造）。
+# feed_product_type 绝不经此映射（模块 6 修正 2）：官方 Product Type 的
+# 唯一合法来源是「模块 4 匹配+模块 5 验证」的 PTD 候选——调用方以
+# pt_name 传入报告；AI 理解的 product_type 只进 ai_semantic_pt 参考字段。
 FACT_SOURCES: dict[str, tuple[str, Callable[[ProductMaterial], Any]]] = {
     "item_name": ("material.title", lambda m: m.title),
     "model_number": ("material.model", lambda m: m.model),
-    "feed_product_type": ("understanding.basic_info.product_type",
-                          lambda m: m.basic_info_product_type),
     "product_description": ("material.description", lambda m: m.description),
     "bullet_point": ("material.bullets", lambda m: m.bullets or None),
 }
@@ -181,25 +187,52 @@ def _cache_filename(cache_key: str) -> str:
     return _sha256_hex(cache_key.encode("utf-8"))[:40] + ".json"
 
 
-def _atomic_write(final: Path, raw: bytes) -> bool:
+# 同一目标文件的原子替换串行化（模块 6 修正 3：Windows 上并发
+# os.replace 同一 dest 会间歇性共享冲突——按路径加锁消除竞态本身）
+_WRITE_LOCKS: dict[str, threading.Lock] = {}
+_WRITE_LOCKS_GUARD = threading.Lock()
+
+
+def _lock_for(path: Path) -> threading.Lock:
+    key = str(path).lower()
+    with _WRITE_LOCKS_GUARD:
+        lk = _WRITE_LOCKS.get(key)
+        if lk is None:
+            lk = _WRITE_LOCKS[key] = threading.Lock()
+        return lk
+
+
+def _atomic_write(final: Path, raw: bytes) -> tuple[bool, str | None]:
     """临时文件 + fsync + os.replace 原子替换（批复 ④）：
-    不完整文件绝不占据有效缓存名；.tmp 残留一律清理。"""
+    不完整文件绝不占据有效缓存名；.tmp 残留一律清理。
+    并发安全（修正 3）：同一目标按路径串行化；replace 对外部瞬时句柄
+    （杀毒/索引器）做有界重试（3 次、50/100/200ms），耗尽才失败。
+    返回 (成败, 失败阶段描述)。"""
     tmp = final.parent / f".tmp-{os.getpid()}-{uuid.uuid4().hex}.json"
-    try:
-        with open(tmp, "wb") as f:
-            f.write(raw)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, final)
-        return True
-    except OSError:
-        return False
-    finally:
-        if tmp.exists():
+    with _lock_for(final):
+        try:
             try:
-                tmp.unlink()
-            except OSError:
-                pass
+                with open(tmp, "wb") as f:
+                    f.write(raw)
+                    f.flush()
+                    os.fsync(f.fileno())
+            except OSError as e:
+                return False, f"write:{type(e).__name__}"
+            for i in range(3):
+                try:
+                    os.replace(tmp, final)
+                    return True, None
+                except OSError:
+                    if i == 2:
+                        return False, "replace:sharing"
+                    time.sleep(0.05 * (2 ** i))
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+    return False, "unreachable"
 
 
 def _mark(store, meta: dict, status: str, t: int) -> None:
@@ -408,10 +441,11 @@ def _ensure(client: SpApiClient, store, cache_root: str,
                 "expected_md5_b64": str(checksum), "actual_md5_b64": actual}
             return out
 
-    # ⑥ 原子落盘 + 元数据（批复 ④⑤⑥）
-    if not _atomic_write(final, raw):
+    # ⑥ 原子落盘 + 元数据（批复 ④⑤⑥；并发安全见 _atomic_write 修正 3）
+    wrote, phase = _atomic_write(final, raw)
+    if not wrote:
         out.status = OUT_ERROR
-        out.detail = {"kind": "write_failed",
+        out.detail = {"kind": "write_failed", "phase": phase,
                       "error": "临时文件写入/替换失败（.tmp 已清理）"}
         return out
     sha = _sha256_hex(raw)
@@ -716,6 +750,8 @@ class GapReport:
     counts: dict
     summary: str                      # 恒非放行结论；最高 complete_for_review
     fabrication_guard: str = FABRICATION_GUARD
+    ai_semantic_pt: str | None = None  # AI 理解的 product_type（仅语义参考，
+                                       # 绝不作上传 feed_product_type 来源）
 
 
 def _fact_of(material: ProductMaterial, name: str
@@ -784,12 +820,45 @@ def attribute_gap_report(material: ProductMaterial, analysis: SchemaAnalysis,
                          *, pt_name: str = "",
                          marketplace_id: str = "") -> GapReport:
     """对照商品材料出属性缺口报告（五分类，批复 ⑧；不编造，批复 ⑨；
-    只分析不代工，批复 ⑩）。可选属性不构成缺口（不进 entries）。"""
+    只分析不代工，批复 ⑩）。可选属性不构成缺口（不进 entries）。
+
+    feed_product_type 隔离（模块 6 修正 2）：官方 PT 只认 pt_name——
+    调用方须传「模块 4 匹配+模块 5 验证」链给出的 PTD 候选名；AI 理解
+    的 product_type（material.basic_info_product_type）只记入
+    ai_semantic_pt 参考字段，绝不充数、绝不直填上传。"""
+    pt_official = str(pt_name or "").strip()
+    ai_pt = str(getattr(material, "basic_info_product_type", "") or "").strip()
     entries: list[GapEntry] = []
     optional_skipped = 0
     for p in analysis.properties:
         if p.requiredness == "optional":
             optional_skipped += 1
+            continue
+        if p.name == "feed_product_type":
+            # 官方 PT 唯一来源=验证链（修正 2）；AI 理解词只进 ai_semantic_pt
+            constraint = {"types": p.types, "enum": p.enum,
+                          "pattern": p.pattern, "format": p.format}
+            if p.requiredness == "unknown":
+                category, reason = GAP_UNDETERMINABLE, (
+                    p.unknown_reason or "Schema 约束无法完整解析——按无法确定报告")
+                fact_source = preview = None
+            elif pt_official:
+                verdict, why = _validate_fact(pt_official, p)
+                category = {"ok": GAP_OK,
+                            "mismatch": GAP_FORMAT}.get(verdict, GAP_UNDETERMINABLE)
+                reason = "官方 PT 已由「模块 4 匹配+模块 5 验证」链传入" \
+                    if verdict == "ok" else why
+                fact_source = "verified_pt（模块4匹配+模块5验证）"
+                preview = pt_official[:FACT_PREVIEW]
+            else:
+                category, reason = GAP_MISSING, (
+                    "官方 Product Type 须经模块 4 匹配+模块 5 验证后传入"
+                    "——AI 理解词不充数、绝不直填上传")
+                fact_source = preview = None
+            entries.append(GapEntry(
+                path=p.path, name=p.name, requiredness=p.requiredness,
+                category=category, fact_source=fact_source,
+                fact_preview=preview, reason=reason, constraint=constraint))
             continue
         fact_source, val = _fact_of(material, p.name)
         has_fact = _present(val)
@@ -834,4 +903,5 @@ def attribute_gap_report(material: ProductMaterial, analysis: SchemaAnalysis,
     summary = "complete_for_review" if (not entries or not blocking) \
         else "incomplete"
     return GapReport(pt_name=pt_name, marketplace_id=marketplace_id,
-                     entries=entries, counts=counts, summary=summary)
+                     entries=entries, counts=counts, summary=summary,
+                     ai_semantic_pt=ai_pt or None)

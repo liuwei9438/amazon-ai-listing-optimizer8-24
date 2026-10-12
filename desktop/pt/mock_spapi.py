@@ -322,6 +322,12 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(200, b'{"numberOfResults":0,"items":[]}')
                 return
 
+        # 重定向测试端点（模块 6 修正 1：只给 _RedirectGuard 测试用，
+        # to= 目标完全由测试指定——专测跨主机/降级跳转被客户端拒）
+        if u.path == "/_redirect":
+            self._send(302, b"", extra={"Location": qs.get("to", "")})
+            return
+
         # Schema 路由定向故障（模块 6；默认 None 不影响任何既有行为）
         with _LOCK:
             sm = STATE["schema_mode"]

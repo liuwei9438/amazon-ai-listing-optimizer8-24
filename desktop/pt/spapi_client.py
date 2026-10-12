@@ -11,8 +11,10 @@ developer-docs.amazon 抓取核对，规范镜像存 spec_ptd_*.json/spec_cat_*.
   getCatalogItem                GET   /catalog/2022-04-01/items/{asin}          2 rps / burst 2
 
 另含模块 6 的受限下载 fetch_schema()（非官方 API 操作，是 PTD
-schema.link 签名 URL 的 GET）：scheme/http(s)-only、宿主沿用环境传输层
-白名单、不带令牌、大小/超时/有界重试上帽、查询串（签名参数）绝不入文。
+schema.link 签名 URL 的 GET）：scheme/http(s)-only、宿主允许列表与主
+接口端点分开管理（live 默认空=fail-closed，2026-10-12 修正 1）、DNS
+解析须公网地址（拒内网/回环/链路本地/云元数据）、重定向禁跨主机禁降级、
+不带令牌、大小/超时/有界重试上帽、查询串（签名参数）绝不入文。
 
 工程约束（模块 2 批复 12 条）在代码中的落点：
   3  不 import main：运行环境（build_environment 三模式 direct/proxy/mock）、
@@ -45,6 +47,7 @@ schema.link 签名 URL 的 GET）：scheme/http(s)-only、宿主沿用环境传�
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import re
 import socket
@@ -302,13 +305,15 @@ class Environment:
 
     mode="mock"：transport 只允许访问 mock_url 的主机，endpoint_for 恒回
     mock_url——物理上发不出真实请求，结果一律 mock=True。
-    mode="live"：transport 只允许官方 SP-API 端点（正则白名单），endpoint_for
-    =官方区域表；若响应带 X-WZ-Mock 头（说明被指到模拟服务）立即抛
-    SpApiEnvironmentError，结果作废。
+    mode="live"：transport 只允许官方 SP-API 端点（正则白名单）∪
+    schema_hosts（Schema 下载允许列表，模块 6 修正 1——默认空=一律
+    拒绝，fail-closed），endpoint_for=官方区域表；若响应带 X-WZ-Mock
+    头（说明被指到模拟服务）立即抛 SpApiEnvironmentError，结果作废。
     """
     mode: str                       # "mock" | "live"
     transport: Transport
     endpoint_for: Callable[[str], str]
+    schema_hosts: frozenset[str] = frozenset()   # Schema 下载宿主允许列表
 
 
 def _proxy_url_with_auth(proxy: ProxyConfig) -> str:
@@ -347,11 +352,8 @@ def _host_of(url: str) -> str:
 
 
 def _assert_official(url: str) -> None:
-    host = _host_of(url)
-    if not OFFICIAL_HOST_RE.match(host):
-        raise SpApiEnvironmentError(
-            f"live 环境只允许官方 SP-API 端点"
-            f"（sellingpartnerapi-na|eu|fe.amazon.com），拒绝目标：{host}")
+    """仅官方端点（=允许列表为空的特例）。"""
+    _assert_official_or(url, frozenset())
 
 
 def _assert_host(url: str, allowed_host: str) -> None:
@@ -361,10 +363,74 @@ def _assert_host(url: str, allowed_host: str) -> None:
             f"mock 环境只允许访问 {allowed_host}，拒绝目标：{host}")
 
 
+# ---- 模块 6 修正 1：Schema 下载端点与主接口端点分开管理 ----
+# 主接口（四操作）：恒为官方 SP-API 域名白名单（OFFICIAL_HOST_RE）。
+# Schema 下载：官方 SchemaLink 是独立签名的托管链接，宿主与主接口不同
+# ——允许列表单独配置（build_environment(schema_hosts=…)，装配期注入），
+# **默认空=一律拒绝（fail-closed）**。禁止凭猜测预填域名：待真实
+# PTD 响应观测到官方 SchemaLink 实际宿主后，由配置登记，不无限放开。
+
+def _assert_official_or(url: str, extra_hosts: frozenset[str]) -> None:
+    """live 传输目标=官方 SP-API 域名 ∪ Schema 下载允许列表。"""
+    host = _host_of(url)
+    if not OFFICIAL_HOST_RE.match(host) and host not in extra_hosts:
+        raise SpApiEnvironmentError(
+            f"live 环境只允许官方 SP-API 端点或已配置的 Schema 下载"
+            f"域名允许列表，拒绝目标：{host}")
+
+
+def _is_public_ip(addr: str) -> bool:
+    """公网单播才放行：回环/内网(RFC1918)/链路本地（含云元数据
+    169.254.169.254）/组播/保留/未指定一律 False。"""
+    try:
+        a = ipaddress.ip_address(addr.split("%", 1)[0])
+    except ValueError:
+        return False
+    return a.is_global and not a.is_multicast
+
+
+def _assert_resolves_public(host: str) -> None:
+    """DNS 解析校验（模块 6 修正 1）：live Schema 下载域名的全部解析
+    结果必须是公网地址——域名允许列表防不住 DNS 劫持/内网解析。"""
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        raise SpApiEnvironmentError(
+            f"Schema 下载域名解析失败：{host}") from None
+    ips = {info[4][0] for info in infos}
+    if not ips or any(not _is_public_ip(i) for i in ips):
+        raise SpApiEnvironmentError(
+            f"Schema 下载域名解析到禁入地址（本地/内网/链路本地/云元"
+            f"数据），拒绝连接：{host}")
+
+
+class _RedirectGuard(urllib.request.HTTPRedirectHandler):
+    """重定向安全（模块 6 修正 1）：跨主机重定向与 https 降级一律拒
+    绝——重定向是「先验 URL 合法、再跳去任意目标」的经典后门，最终
+    连接目标必须仍受同一套域名约束。同主机（且不降级）才放行。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        old = urllib.parse.urlparse(req.full_url)
+        new = urllib.parse.urlparse(newurl)
+        if (old.hostname or "").lower() != (new.hostname or "").lower():
+            raise SpApiEnvironmentError(
+                f"跨主机重定向被拒：{old.hostname or ''} → "
+                f"{new.hostname or ''}（下载只允许同主机跳转）")
+        if (old.scheme or "").lower() == "https" and \
+                (new.scheme or "").lower() != "https":
+            raise SpApiEnvironmentError(
+                f"https→{(new.scheme or '?').upper()} 降级重定向被拒："
+                f"{new.hostname or ''}")
+        return super().redirect_request(req, fp, code, msg, headers,
+                                        newurl)
+
+
 def _no_proxy_opener():
     """direct / mock 都显式不走环境代理（这是明确的选择，不是缺省凑合：
-    代理模式必须显式传 ProxyConfig）。单一定径，无回退路径。"""
-    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    代理模式必须显式传 ProxyConfig）。单一定径，无回退路径。
+    带 _RedirectGuard：跨主机/降级重定向一律拒（模块 6 修正 1）。"""
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                       _RedirectGuard())
 
 
 def raw_transport(method: str, url: str, headers: dict,
@@ -375,12 +441,18 @@ def raw_transport(method: str, url: str, headers: dict,
 
 
 def build_environment(mode: str, *, proxy: ProxyConfig | None = None,
-                      mock_url: str | None = None) -> Environment:
+                      mock_url: str | None = None,
+                      schema_hosts: Iterable[str] | None = None) -> Environment:
     """三模式环境工厂：
       direct：显式直连官方端点（不接受 proxy 参数）
       proxy： 经指定代理连官方端点（必须给 proxy；代理失败只报网络错误，
               绝不擅自改走直连）
       mock：  只访问 mock_url 的本地模拟服务（必须给 mock_url）
+
+    schema_hosts（模块 6 修正 1，仅 live）：Schema 下载宿主允许列表——
+    官方 SchemaLink 的实际托管域名由装配期按真实观测登记；默认空=
+    live Schema 下载一律拒绝（fail-closed，绝不凭猜测放开）。mock 的
+    Schema 宿主恒为 mock 服务自身。
     """
     if mode == "mock":
         if not mock_url:
@@ -393,7 +465,8 @@ def build_environment(mode: str, *, proxy: ProxyConfig | None = None,
             return _urllib_call(opener_holder, method, url, headers, timeout)
 
         base = mock_url.rstrip("/")
-        return Environment("mock", mock_transport, lambda mid: base)
+        return Environment("mock", mock_transport, lambda mid: base,
+                           frozenset({host}))
 
     if mode in ("direct", "proxy"):
         if mode == "direct" and proxy is not None:
@@ -401,19 +474,23 @@ def build_environment(mode: str, *, proxy: ProxyConfig | None = None,
                              "proxy 模式）")
         if mode == "proxy" and proxy is None:
             raise ValueError("proxy 模式必须给 ProxyConfig")
+        allowed = frozenset(h.strip().lower() for h in (schema_hosts or [])
+                            if h and h.strip())
         if mode == "proxy":
             proxy_url = _proxy_url_with_auth(proxy)   # 认证只进 opener
             opener = urllib.request.build_opener(
                 urllib.request.ProxyHandler(
-                    {"http": proxy_url, "https": proxy_url}))
+                    {"http": proxy_url, "https": proxy_url}),
+                _RedirectGuard())
         else:
             opener = _no_proxy_opener()
 
         def live_transport(method, url, headers, timeout):
-            _assert_official(url)          # live 只发官方端点
+            _assert_official_or(url, allowed)   # 官方端点 ∪ Schema 允许列表
             return _urllib_call(opener, method, url, headers, timeout)
 
-        return Environment("live", live_transport, official_endpoint)
+        return Environment("live", live_transport, official_endpoint,
+                           allowed)
 
     raise ValueError(f"未知传输模式：{mode!r}（可选 {TRANSPORT_MODES}）")
 
@@ -670,11 +747,18 @@ class SpApiClient:
                      max_bytes: int = 2_000_000) -> SpApiResult:
         """下载 PTD schema.link 指向的官方 JSON Schema（模块 6 专用受限 GET）。
 
-        安全模型（模块 6 批复三）：
+        安全模型（模块 6 批复三 + 2026-10-12 模块 6 修正 1）：
         - 只接受 http(s)——file:/// 等其余 scheme 一律 ValueError；
-        - 目标主机由环境传输层强制白名单：mock 只准 mock_url 主机、
-          live 只准官方 SP-API 域名（正则），任意 URL/本地文件物理不可达；
-        - live 仅允许 https；
+        - **链接来源唯一**：调用方只准传 getDefinitionsProductType 官方
+          响应里的 schema.link（本客户端不提供任何「自选 URL」入口）；
+        - 宿主与主接口端点分开管理：mock 只准 mock_url 主机；live 的
+          Schema 下载域名允许列表 Environment.schema_hosts **默认空=
+          一律拒绝（fail-closed）**，待真实官方 SchemaLink 观测后由
+          装配期配置登记，绝不猜测放开；
+        - live 仅允许 https；且 DNS 解析结果必须是公网地址——本地/
+          回环/内网/链路本地/云元数据（169.254.169.254）一律拒；
+        - 重定向经 _RedirectGuard：跨主机跳转与 https 降级一律拒，
+          最终连接目标仍受同一套约束；
         - 不携带 x-amz-access-token——官方 SchemaLink 是自带授权的签名
           URL，把令牌发给链接目标等于泄露；
         - 大小上限 max_bytes、超时 self._timeout；幂等 GET 沿用
@@ -693,6 +777,14 @@ class SpApiClient:
             raise ValueError("Schema 链接缺少主机")
         if self._env.mode == "live" and u.scheme != "https":
             raise ValueError("live 环境 Schema 链接仅允许 https")
+        host_l = u.hostname.lower()
+        if self._env.mode != "mock":
+            if host_l not in self._env.schema_hosts:
+                raise SpApiEnvironmentError(
+                    f"live 环境 Schema 下载域名不在允许列表（默认空=一律"
+                    f"拒绝，防任意 URL；待真实官方 SchemaLink 观测后由装"
+                    f"配期配置登记）：{host_l}")
+            _assert_resolves_public(host_l)   # DNS 劫持/内网/元数据防线
         max_bytes = int(max_bytes)
         if max_bytes < 1:
             raise ValueError("max_bytes 必须为正整数")
