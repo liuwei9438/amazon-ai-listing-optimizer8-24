@@ -46,9 +46,53 @@ STATE: dict = {
     "rate_limit": "5",      # 成功响应的 x-amzn-RateLimit-Limit
     "sleep": 5.0,           # timeout 模式睡眠秒
     "calls": 0,             # 总请求数（含所有路由）
+    # 模块 5 验证层用（默认 None=不影响既有行为）：
+    "known_pts": None,      # None=PTD get 全知道；传集合=白名单，外者 404
+    "catalog_items": None,  # None=默认三件；传 Item 列表（make_item 构造）
 }
 _LOCK = threading.Lock()
 RECORDS: list[dict] = []    # 每请求一条（不含令牌值，只记长度）
+
+
+def make_item(asin: str, mid: str, classification_id: str,
+              display_name: str, pt: str,
+              parents: tuple[tuple[str, str], ...] = (
+                  ("1570964031", "Car & Vehicle Electronics"),),
+              cls_mid: str | None = None) -> dict:
+    """官方 Item 形状构造器（测试用）。parents=根→…→直接父级链；
+    cls_mid 单独指定 classifications 的 marketplaceId（跨站点证据用）。"""
+    parent = None
+    for cid, name in reversed(parents):
+        parent = {"classificationId": cid, "displayName": name,
+                  "parent": parent}
+    return {
+        "asin": asin,
+        "identifiers": [{
+            "marketplaceId": mid,
+            "identifiers": [
+                {"identifierType": "EAN", "identifier": "69" + asin[-7:]},
+            ],
+        }],
+        "productTypes": [{"marketplaceId": mid, "productType": pt}],
+        "classifications": [{"marketplaceId": cls_mid or mid,
+                             "classifications": [
+                                 {"classificationId": classification_id,
+                                  "displayName": display_name,
+                                  "parent": parent}]}],
+    }
+
+
+def set_known_pts(pts) -> None:
+    """PTD get 白名单（None=恢复默认全知道）。之外的 productType 一律 404。"""
+    with _LOCK:
+        STATE["known_pts"] = set(pts) if pts is not None else None
+
+
+def set_catalog_items(items) -> None:
+    """目录检索自定义商品（None=恢复默认三件）。"""
+    with _LOCK:
+        STATE["catalog_items"] = [dict(i) for i in items] \
+            if items is not None else None
 
 
 def _error_body(code: str, message: str, details: str = "") -> bytes:
@@ -200,24 +244,8 @@ class _Handler(BaseHTTPRequestHandler):
     @staticmethod
     def _item(asin: str, mid: str, classification_id: str,
               display_name: str, pt: str) -> dict:
-        """官方 Item 形状（只放本阶段用的可选块，字段名逐字官方）。"""
-        return {
-            "asin": asin,
-            "identifiers": [{
-                "marketplaceId": mid,
-                "identifiers": [
-                    {"identifierType": "EAN",
-                     "identifier": "69" + asin[-7:]},
-                ],
-            }],
-            "productTypes": [{"marketplaceId": mid, "productType": pt}],
-            "classifications": [{"marketplaceId": mid, "classifications": [
-                {"classificationId": classification_id,
-                 "displayName": display_name,
-                 "parent": {"classificationId": "1570964031",
-                            "displayName": "Car & Vehicle Electronics",
-                            "parent": None}}]}],
-        }
+        """默认 Item 形状（历史行为不变：单层父链）。"""
+        return make_item(asin, mid, classification_id, display_name, pt)
 
     def _ptd_search(self, qs: dict, mid: str) -> bytes:
         if self._mode_force_empty():
@@ -236,7 +264,11 @@ class _Handler(BaseHTTPRequestHandler):
             }
         return json.dumps(doc, ensure_ascii=False).encode()
 
-    def _ptd_get(self, pt: str, qs: dict, mid: str) -> bytes:
+    def _ptd_get(self, pt: str, qs: dict, mid: str) -> bytes | None:
+        with _LOCK:
+            kp = STATE["known_pts"]
+        if kp is not None and pt not in kp:
+            return None                 # 白名单外 → do_GET 统一回 404
         doc = {
             "metaSchema": {
                 "link": {"resource": f"https://mock.local/meta/{pt}.json",
@@ -272,14 +304,19 @@ class _Handler(BaseHTTPRequestHandler):
             doc = {"numberOfResults": 0, "items": []}
             return json.dumps(doc, ensure_ascii=False).encode()
         cid = qs.get("classificationIds", "")
-        items = [
-            self._item("B0MOCK0001", mid, "10971181031",
-                       "GPS Trackers", "GPS_TRACKER"),
-            self._item("B0MOCK0002", mid, "10971181031",
-                       "GPS Trackers", "GPS_TRACKER"),
-            self._item("B0MOCK0003", mid, "348445031",
-                       "Phone Cases", "PHONE_CASE"),
-        ]
+        with _LOCK:
+            custom = STATE["catalog_items"]
+        if custom is not None:
+            items = [dict(i) for i in custom]
+        else:
+            items = [
+                self._item("B0MOCK0001", mid, "10971181031",
+                           "GPS Trackers", "GPS_TRACKER"),
+                self._item("B0MOCK0002", mid, "10971181031",
+                           "GPS Trackers", "GPS_TRACKER"),
+                self._item("B0MOCK0003", mid, "348445031",
+                           "Phone Cases", "PHONE_CASE"),
+            ]
         if cid:
             keep = [i for i in items
                     if any(c["classificationId"] == cid

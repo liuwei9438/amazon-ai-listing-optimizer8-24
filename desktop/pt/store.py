@@ -62,11 +62,15 @@ VALID_EVIDENCE = {"pending", "confirmed", "missing", "insufficient"}
 VALID_FIT = {"pending", "fit", "mismatch", "unknown"}
 VALID_CHECK = {"pt_exists", "semantic", "browse_node", "attribute"}
 VALID_VSTATUS = {"pending", "passed", "failed", "insufficient",
-                 "skipped", "error"}
-VALID_AGAINST = {"mock", "live"}          # Mock 验证 ≠ 真实官方验证（铁律）
-VALID_ENV = {"mock", "live"}              # 修正 3：数据行环境隔离
-# 修正 1（2026-10-12 第二轮批复）：v1 历史数据的隔离区取值——来源无法
-# 证明，不得自动获得 live 官方验证资格。仅迁移写入与显式审计读取使用。
+                 "skipped", "error",
+                 # 模块 5（2026-10-12 批复）：验证失败/证据不足/接口不可用/
+                 # 权限不足必须四态可分——unavailable=网络/5xx/429/解析失败，
+                 # forbidden=401/403（拿不到官方结论 ≠ 官方否定）
+                 "unavailable", "forbidden"}
+# Mock 验证 ≠ 真实官方验证（铁律）；修正 3：数据行环境隔离。
+# 修正 1（2026-10-12 第二轮批复）：v1 历史数据的隔离区取值 legacy_unverified
+# ——来源无法证明，不得自动获得 live 官方验证资格。仅迁移写入与显式
+# 审计读取使用（业务写入仍只有 mock|live）。
 LEGACY_ENV = "legacy_unverified"
 VALID_AGAINST = {"mock", "live", LEGACY_ENV}
 VALID_ENV = {"mock", "live", LEGACY_ENV}
