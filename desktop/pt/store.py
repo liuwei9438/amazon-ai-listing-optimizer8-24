@@ -19,6 +19,15 @@
 6. 本模块不 import main（工程约束 5）；SP-API 能力经适配层注入。
 7. 第一阶段不产生任何「可刊登」状态：状态枚举里没有它，测试守卫
    test_pt_store T14（修正 4；正式刊登属第二阶段）。
+8. Mock/Live 环境隔离贯穿候选、匹配、验证及缓存全过程
+   （2026-10-12 批复修正 3）：v2 起六张数据表带 env 列
+   （mock|live，缺省 live）——pt_type_dict / pt_schema_meta /
+   pt_browse_node / pt_candidate / pt_assignment / pt_task 全部按 env
+   分行分读；pt_verification 沿用既有 verified_against 列（同一枚举）。
+   mock 环境检索的字典/候选/schema 缓存/分配/任务对 live 读取一律不可
+   见，反之亦然。v1→v2 最小迁移：三张带唯一键的表重建
+   （pt_type_dict/pt_browse_node/pt_candidate），三张直接 ALTER 加列
+   （pt_schema_meta/pt_assignment/pt_task）；旧行 env='live'。
 
 数据库位置：默认 %LOCALAPPDATA%\\WZDesktop\\pt\\pt.sqlite3（代码更新/
 robocopy 部署不会覆盖），环境变量 WZD_PT_DATA 可改根目录；测试直接
@@ -39,7 +48,7 @@ from typing import Any, Iterable
 
 _LOG = logging.getLogger("pt.store")   # 模块 2 要求 11：异常必须可诊断
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # ---- 合法枚举（集中定义，写入前一律校验） ----
 VALID_EVIDENCE = {"pending", "confirmed", "missing", "insufficient"}
@@ -48,6 +57,13 @@ VALID_CHECK = {"pt_exists", "semantic", "browse_node", "attribute"}
 VALID_VSTATUS = {"pending", "passed", "failed", "insufficient",
                  "skipped", "error"}
 VALID_AGAINST = {"mock", "live"}          # Mock 验证 ≠ 真实官方验证（铁律）
+VALID_ENV = {"mock", "live"}              # 修正 3：数据行环境隔离
+
+
+def _check_env(env: str) -> str:
+    if env not in VALID_ENV:
+        raise ValueError(f"非法 env: {env!r}（{sorted(VALID_ENV)}）")
+    return env
 VALID_TASK_PHASE = {"created", "running", "paused", "failed",
                     "cancelled", "done", "interrupted"}
 VALID_ITEM_STATE = {"pending", "running", "done", "failed",
@@ -74,20 +90,23 @@ CREATE TABLE IF NOT EXISTS pt_meta(
   value TEXT NOT NULL
 );
 
--- 概念①：ProductType 字典（官方公共数据；站点维度隔离，跨店共享）
+-- 概念①：ProductType 字典（官方公共数据；站点维度隔离，跨店共享；
+-- env 隔离：mock 检索结果绝不混进 live 字典）
 CREATE TABLE IF NOT EXISTS pt_type_dict(
   marketplace_id TEXT NOT NULL,
   pt_name        TEXT NOT NULL,
   display_name   TEXT,
   locale         TEXT,
   source         TEXT NOT NULL DEFAULT 'search',
+  env            TEXT NOT NULL DEFAULT 'live',
   first_seen_at  INTEGER NOT NULL,
   last_seen_at   INTEGER NOT NULL,
-  PRIMARY KEY(marketplace_id, pt_name)
+  PRIMARY KEY(marketplace_id, pt_name, env)
 );
 
 -- 概念③：ProductTypeSchema 元数据（payload 存 pt/schemas/ 文件，库里
--- 只放元数据+哈希；cache_key 覆盖全部影响响应的参数与卖家上下文）
+-- 只放元数据+哈希；cache_key 覆盖全部影响响应的参数与卖家上下文
+-- + env——mock schema 绝不给 live 复用）
 CREATE TABLE IF NOT EXISTS pt_schema_meta(
   cache_key              TEXT PRIMARY KEY,
   marketplace_id         TEXT NOT NULL,
@@ -101,10 +120,12 @@ CREATE TABLE IF NOT EXISTS pt_schema_meta(
   payload_sha256         TEXT,
   payload_path           TEXT,
   status                 TEXT NOT NULL DEFAULT 'pending',
+  env                    TEXT NOT NULL DEFAULT 'live',
   fetched_at             INTEGER
 );
 
--- 概念②：BrowseNode（与 PT 完全分表；证据分级，见文件头）
+-- 概念②：BrowseNode（与 PT 完全分表；证据分级，见文件头；env 分行：
+-- mock catalog 证据不冒充官方证据）
 CREATE TABLE IF NOT EXISTS pt_browse_node(
   id               INTEGER PRIMARY KEY AUTOINCREMENT,
   marketplace_id   TEXT NOT NULL,
@@ -116,11 +137,12 @@ CREATE TABLE IF NOT EXISTS pt_browse_node(
   display_name     TEXT,
   context_path     TEXT,
   evidence_json    TEXT,
+  env              TEXT NOT NULL DEFAULT 'live',
   checked_at       INTEGER,
-  UNIQUE(marketplace_id, node_id, source)
+  UNIQUE(marketplace_id, node_id, source, env)
 );
 
--- 产品维度（store_id × marketplace_id 双重隔离）----
+-- 产品维度（store_id × marketplace_id × env 三重隔离）----
 CREATE TABLE IF NOT EXISTS pt_candidate(
   id             INTEGER PRIMARY KEY AUTOINCREMENT,
   store_id       TEXT NOT NULL DEFAULT '',
@@ -132,8 +154,9 @@ CREATE TABLE IF NOT EXISTS pt_candidate(
   display_name   TEXT,
   score          REAL,
   evidence_json  TEXT,
+  env            TEXT NOT NULL DEFAULT 'live',
   retrieved_at   INTEGER NOT NULL,
-  UNIQUE(store_id, marketplace_id, pid, pt_name, strategy)
+  UNIQUE(store_id, marketplace_id, pid, pt_name, strategy, env)
 );
 
 CREATE TABLE IF NOT EXISTS pt_assignment(
@@ -146,12 +169,13 @@ CREATE TABLE IF NOT EXISTS pt_assignment(
   chosen_by        TEXT NOT NULL,
   confidence       REAL,
   reason           TEXT,
+  env              TEXT NOT NULL DEFAULT 'live',
   is_current       INTEGER NOT NULL DEFAULT 0,
   superseded_by    INTEGER,
   created_at       INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_assignment_current
-  ON pt_assignment(store_id, marketplace_id, pid, is_current);
+  ON pt_assignment(store_id, marketplace_id, pid, env, is_current);
 
 CREATE TABLE IF NOT EXISTS pt_verification(
   id               INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -182,12 +206,14 @@ CREATE TABLE IF NOT EXISTS pt_correction(
   created_at          INTEGER NOT NULL
 );
 
--- 任务（修正 2：逐商品条目；last_pid 仅便利字段，恢复不依赖它）
+-- 任务（修正 2：逐商品条目；last_pid 仅便利字段，恢复不依赖它；
+-- env：任务在哪个环境跑的，mock 任务与 live 任务互不可见混淆）
 CREATE TABLE IF NOT EXISTS pt_task(
   id             TEXT PRIMARY KEY,
   kind           TEXT NOT NULL,
   store_id       TEXT NOT NULL DEFAULT '',
   marketplace_id TEXT NOT NULL,
+  env            TEXT NOT NULL DEFAULT 'live',
   phase          TEXT NOT NULL DEFAULT 'created',
   progress_done  INTEGER NOT NULL DEFAULT 0,
   progress_total INTEGER NOT NULL DEFAULT 0,
@@ -211,6 +237,18 @@ CREATE TABLE IF NOT EXISTS pt_task_item(
 CREATE INDEX IF NOT EXISTS idx_task_item
   ON pt_task_item(task_id, state);
 """
+
+# 索引单独一份：v1→v2 表重建后旧索引随旧表丢弃，需要重建
+# （逐条 execute，execute() 不收多语句；excludescript 会隐式 COMMIT
+#  破坏迁移事务，所以这里存语句元组）
+_IDX_STATEMENTS = (
+    "CREATE INDEX IF NOT EXISTS idx_assignment_current"
+    " ON pt_assignment(store_id, marketplace_id, pid, env, is_current)",
+    "CREATE INDEX IF NOT EXISTS idx_verification"
+    " ON pt_verification(store_id, marketplace_id, pid, check_kind, id)",
+    "CREATE INDEX IF NOT EXISTS idx_task_item"
+    " ON pt_task_item(task_id, state)",
+)
 
 
 def _row(r: sqlite3.Row | None) -> dict | None:
@@ -279,8 +317,85 @@ class PtStore:
                 )
             if v == SCHEMA_VERSION:
                 return
-            self._db.executescript(_SCHEMA_SQL)   # 全部 IF NOT EXISTS，可重跑
-            self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+            if v == 0:
+                self._db.executescript(_SCHEMA_SQL)  # 全 IF NOT EXISTS 可重跑
+                self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+                return
+            if v == 1:
+                # v1→v2（修正 3）：env 隔离列。三张带唯一键的表重建
+                # （唯一键必须含 env），三张 ALTER 加列；旧行 env='live'。
+                self._migrate_1_to_2()
+                self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
+                return
+            raise RuntimeError(f"未知 schema 版本 v{v}")
+
+    def _migrate_1_to_2(self) -> None:
+        rebuilds = (
+            # (表名, v2 建表 SQL 不含 IF NOT EXISTS, 旧列清单按 v1 顺序)
+            ("pt_type_dict",
+             "CREATE TABLE pt_type_dict("
+             "marketplace_id TEXT NOT NULL, pt_name TEXT NOT NULL,"
+             " display_name TEXT, locale TEXT, source TEXT NOT NULL"
+             " DEFAULT 'search', env TEXT NOT NULL DEFAULT 'live',"
+             " first_seen_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL,"
+             " PRIMARY KEY(marketplace_id, pt_name, env))",
+             "marketplace_id,pt_name,display_name,locale,source,"
+             "first_seen_at,last_seen_at"),
+            ("pt_browse_node",
+             "CREATE TABLE pt_browse_node("
+             "id INTEGER PRIMARY KEY AUTOINCREMENT, marketplace_id TEXT"
+             " NOT NULL, node_id TEXT NOT NULL, source TEXT NOT NULL"
+             " DEFAULT 'btmap', evidence_status TEXT NOT NULL DEFAULT"
+             " 'pending', evidence_kind TEXT, fit_status TEXT NOT NULL"
+             " DEFAULT 'pending', display_name TEXT, context_path TEXT,"
+             " evidence_json TEXT, env TEXT NOT NULL DEFAULT 'live',"
+             " checked_at INTEGER, UNIQUE(marketplace_id,node_id,source,env))",
+             "id,marketplace_id,node_id,source,evidence_status,evidence_kind,"
+             "fit_status,display_name,context_path,evidence_json,checked_at"),
+            ("pt_candidate",
+             "CREATE TABLE pt_candidate("
+             "id INTEGER PRIMARY KEY AUTOINCREMENT, store_id TEXT NOT NULL"
+             " DEFAULT '', marketplace_id TEXT NOT NULL, pid TEXT NOT NULL,"
+             " task_id TEXT NOT NULL DEFAULT '', strategy TEXT NOT NULL,"
+             " pt_name TEXT NOT NULL, display_name TEXT, score REAL,"
+             " evidence_json TEXT, env TEXT NOT NULL DEFAULT 'live',"
+             " retrieved_at INTEGER NOT NULL, UNIQUE(store_id,marketplace_id,"
+             "pid,pt_name,strategy,env))",
+             "id,store_id,marketplace_id,pid,task_id,strategy,pt_name,"
+             "display_name,score,evidence_json,retrieved_at"),
+        )
+        alters = ("pt_schema_meta", "pt_assignment", "pt_task")
+        # 异常 v1 库缺表时先幂等补建（含 pt_verification 等），索引才有落点
+        self._db.executescript(_SCHEMA_SQL)
+        with self._tx():
+            for name, ddl, old_cols in rebuilds:
+                has = self._db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND"
+                    " name=?", (name,)).fetchone()
+                if has is None:
+                    continue          # v1 库缺表（异常旧库）→ 跳过，建库脚本补
+                self._db.execute(f"ALTER TABLE {name} RENAME TO {name}__v1")
+                self._db.execute(ddl)
+                self._db.execute(
+                    f"INSERT INTO {name}({old_cols},env) SELECT {old_cols},"
+                    f" 'live' FROM {name}__v1")
+                self._db.execute(f"DROP TABLE {name}__v1")
+            for name in alters:
+                has = self._db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND"
+                    " name=?", (name,)).fetchone()
+                if has is None:
+                    continue
+                cols = {r[1] for r in self._db.execute(
+                    f"PRAGMA table_info({name})").fetchall()}
+                if "env" not in cols:
+                    self._db.execute(
+                        f"ALTER TABLE {name} ADD COLUMN env TEXT NOT NULL"
+                        " DEFAULT 'live'")
+            for stmt in _IDX_STATEMENTS:   # 表重建后索引随旧表丢弃，重建
+                self._db.execute(stmt)
+            _LOG.info("pt.store v1→v2 迁移完成（env 隔离列，旧行=live）"
+                      " db=%s", self.path)
 
     def integrity_ok(self) -> bool:
         with self._lock:
@@ -308,8 +423,11 @@ class PtStore:
     def upsert_types(
         self, marketplace_id: str, types: Iterable[dict],
         source: str = "search", now_ts: int | None = None,
+        env: str = "live",
     ) -> int:
-        """types: [{pt_name, display_name?, locale?}]，返回写入条数。"""
+        """types: [{pt_name, display_name?, locale?}]，返回写入条数。
+        env（mock|live）：mock 检索的字典与 live 严格分行（修正 3）。"""
+        _check_env(env)
         t = now_ts or now()
         n = 0
         with self._tx():
@@ -319,33 +437,36 @@ class PtStore:
                     continue
                 self._db.execute(
                     "INSERT INTO pt_type_dict(marketplace_id,pt_name,"
-                    "display_name,locale,source,first_seen_at,last_seen_at)"
-                    " VALUES(?,?,?,?,?,?,?) ON CONFLICT(marketplace_id,"
-                    "pt_name) DO UPDATE SET display_name=excluded.display_name"
-                    ", locale=excluded.locale, source=excluded.source"
-                    ", last_seen_at=excluded.last_seen_at",
+                    "display_name,locale,source,env,first_seen_at,"
+                    "last_seen_at) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT("
+                    "marketplace_id,pt_name,env) DO UPDATE SET display_name="
+                    "excluded.display_name, locale=excluded.locale, source="
+                    "excluded.source, last_seen_at=excluded.last_seen_at",
                     (marketplace_id, pt, r.get("display_name"),
-                     r.get("locale"), source, t, t),
+                     r.get("locale"), source, env, t, t),
                 )
                 n += 1
         return n
 
-    def types_for(self, marketplace_id: str) -> list[dict]:
+    def types_for(self, marketplace_id: str, env: str = "live") -> list[dict]:
+        _check_env(env)
         with self._lock:
             rows = self._db.execute(
-                "SELECT * FROM pt_type_dict WHERE marketplace_id=?"
-                " ORDER BY pt_name", (marketplace_id,),
+                "SELECT * FROM pt_type_dict WHERE marketplace_id=? AND env=?"
+                " ORDER BY pt_name", (marketplace_id, env),
             ).fetchall()
         return [dict(r) for r in rows]
 
     def stale_type_names(
-        self, marketplace_id: str, ttl_seconds: int,
+        self, marketplace_id: str, ttl_seconds: int, env: str = "live",
     ) -> list[str]:
+        _check_env(env)
         cutoff = now() - int(ttl_seconds)
         with self._lock:
             rows = self._db.execute(
                 "SELECT pt_name FROM pt_type_dict WHERE marketplace_id=?"
-                " AND last_seen_at<?", (marketplace_id, cutoff),
+                " AND env=? AND last_seen_at<?",
+                (marketplace_id, env, cutoff),
             ).fetchall()
         return [r[0] for r in rows]
 
@@ -356,12 +477,15 @@ class PtStore:
         marketplace_id: str, pt_name: str, seller_id: str = "",
         locale: str = "", requirements: str = "",
         requirements_enforced: str = "", parentage_level: str = "",
-        product_type_version: str = "",
+        product_type_version: str = "", env: str = "live",
     ) -> str:
-        """缓存键必须覆盖全部影响响应的参数 + 卖家上下文（修正 3）。"""
+        """缓存键必须覆盖全部影响响应的参数 + 卖家上下文 + env（修正 3：
+        mock schema 与 live schema 绝不同键互取）。"""
+        _check_env(env)
         parts = (
             marketplace_id, pt_name, seller_id, locale, requirements,
             requirements_enforced, parentage_level, product_type_version,
+            "env=" + env,
         )
         return "|".join(str(p or "").strip() for p in parts)
 
@@ -371,11 +495,13 @@ class PtStore:
         requirements_enforced: str = "", parentage_level: str = "",
         product_type_version: str = "", payload_sha256: str | None = None,
         payload_path: str | None = None, status: str = "ok",
-        fetched_at: int | None = None,
+        fetched_at: int | None = None, env: str = "live",
     ) -> str:
+        _check_env(env)
         key = self.schema_cache_key(
             marketplace_id, pt_name, seller_id, locale, requirements,
             requirements_enforced, parentage_level, product_type_version,
+            env,
         )
         t = fetched_at or now()
         with self._lock:
@@ -383,15 +509,16 @@ class PtStore:
                 "INSERT INTO pt_schema_meta(cache_key,marketplace_id,pt_name,"
                 "seller_id,locale,requirements,requirements_enforced,"
                 "parentage_level,product_type_version,payload_sha256,"
-                "payload_path,status,fetched_at) VALUES(?,?,?,?,?,?,?,?,?,?,"
-                "?,?,?) ON CONFLICT(cache_key) DO UPDATE SET "
+                "payload_path,status,env,fetched_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(cache_key) DO UPDATE SET "
                 "payload_sha256=excluded.payload_sha256, payload_path="
                 "excluded.payload_path, status=excluded.status, fetched_at="
                 "excluded.fetched_at",
                 (key, marketplace_id, pt_name, seller_id, locale,
                  requirements, requirements_enforced, parentage_level,
                  product_type_version, payload_sha256, payload_path,
-                 status, t),
+                 status, env, t),
             )
         return key
 
@@ -405,10 +532,12 @@ class PtStore:
 
     def schema_metas_for(
         self, marketplace_id: str, pt_name: str | None = None,
-        seller_id: str | None = None,
+        seller_id: str | None = None, env: str = "live",
     ) -> list[dict]:
-        q = "SELECT * FROM pt_schema_meta WHERE marketplace_id=?"
-        args: list[Any] = [marketplace_id]
+        _check_env(env)
+        q = ("SELECT * FROM pt_schema_meta WHERE marketplace_id=?"
+             " AND env=?")
+        args: list[Any] = [marketplace_id, env]
         if pt_name is not None:
             q += " AND pt_name=?"
             args.append(pt_name)
@@ -426,9 +555,11 @@ class PtStore:
         evidence_status: str | None = None, evidence_kind: str | None = None,
         fit_status: str | None = None, display_name: str | None = None,
         context_path: str | None = None, evidence: dict | None = None,
-        checked_at: int | None = None,
+        checked_at: int | None = None, env: str = "live",
     ) -> None:
-        """None 的可选字段=不改动（首次插入用默认 pending）。"""
+        """None 的可选字段=不改动（首次插入用默认 pending）。
+        env：mock catalog 证据与 live 官方证据分行（修正 3）。"""
+        _check_env(env)
         if evidence_status is not None and evidence_status not in VALID_EVIDENCE:
             raise ValueError(f"非法 evidence_status: {evidence_status}")
         if fit_status is not None and fit_status not in VALID_FIT:
@@ -438,19 +569,19 @@ class PtStore:
         with self._lock:
             cur = self._db.execute(
                 "SELECT id FROM pt_browse_node WHERE marketplace_id=? AND"
-                " node_id=? AND source=?",
-                (marketplace_id, node_id, source),
+                " node_id=? AND source=? AND env=?",
+                (marketplace_id, node_id, source, env),
             ).fetchone()
             if cur is None:
                 self._db.execute(
                     "INSERT INTO pt_browse_node(marketplace_id,node_id,"
                     "source,evidence_status,evidence_kind,fit_status,"
-                    "display_name,context_path,evidence_json,checked_at)"
-                    " VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    "display_name,context_path,evidence_json,env,checked_at)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                     (marketplace_id, node_id, source,
                      evidence_status or "pending", evidence_kind,
                      fit_status or "pending", display_name, context_path,
-                     ev, checked_at or now()),
+                     ev, env, checked_at or now()),
                 )
                 return
             sets, args = [], []
@@ -474,20 +605,24 @@ class PtStore:
                 args,
             )
 
-    def browse_nodes(self, marketplace_id: str) -> list[dict]:
+    def browse_nodes(self, marketplace_id: str, env: str = "live"
+                     ) -> list[dict]:
+        _check_env(env)
         with self._lock:
             rows = self._db.execute(
                 "SELECT * FROM pt_browse_node WHERE marketplace_id=?"
-                " ORDER BY node_id", (marketplace_id,),
+                " AND env=? ORDER BY node_id", (marketplace_id, env),
             ).fetchall()
         return [dict(r) for r in rows]
 
     def browse_node(
         self, marketplace_id: str, node_id: str,
-        source: str | None = None,
+        source: str | None = None, env: str = "live",
     ) -> dict | None:
-        q = "SELECT * FROM pt_browse_node WHERE marketplace_id=? AND node_id=?"
-        args: list[Any] = [marketplace_id, node_id]
+        _check_env(env)
+        q = ("SELECT * FROM pt_browse_node WHERE marketplace_id=? AND"
+             " node_id=? AND env=?")
+        args: list[Any] = [marketplace_id, node_id, env]
         if source is not None:
             q += " AND source=?"
             args.append(source)
@@ -500,8 +635,11 @@ class PtStore:
     def upsert_candidates(
         self, store_id: str, marketplace_id: str, pid: str,
         rows: Iterable[dict], task_id: str = "", now_ts: int | None = None,
+        env: str = "live",
     ) -> int:
-        """rows: [{strategy, pt_name, display_name?, score?, evidence?}]。"""
+        """rows: [{strategy, pt_name, display_name?, score?, evidence?}]。
+        env：mock 环境检索的候选与 live 候选分行（修正 3）。"""
+        _check_env(env)
         t = now_ts or now()
         n = 0
         with self._tx():
@@ -514,29 +652,32 @@ class PtStore:
                 self._db.execute(
                     "INSERT INTO pt_candidate(store_id,marketplace_id,pid,"
                     "task_id,strategy,pt_name,display_name,score,"
-                    "evidence_json,retrieved_at) VALUES(?,?,?,?,?,?,?,?,?,?)"
+                    "evidence_json,env,retrieved_at)"
+                    " VALUES(?,?,?,?,?,?,?,?,?,?,?)"
                     " ON CONFLICT(store_id,marketplace_id,pid,pt_name,"
-                    "strategy) DO UPDATE SET task_id=excluded.task_id, "
+                    "strategy,env) DO UPDATE SET task_id=excluded.task_id, "
                     "display_name=excluded.display_name, score=excluded.score"
                     ", evidence_json=excluded.evidence_json, retrieved_at="
                     "excluded.retrieved_at",
                     (store_id, marketplace_id, pid, task_id, st, pt,
                      r.get("display_name"), r.get("score"),
                      json.dumps(ev, ensure_ascii=False) if ev is not None
-                     else None, t),
+                     else None, env, t),
                 )
                 n += 1
         return n
 
     def candidates(
         self, store_id: str, marketplace_id: str, pid: str,
+        env: str = "live",
     ) -> list[dict]:
+        _check_env(env)
         with self._lock:
             rows = self._db.execute(
                 "SELECT * FROM pt_candidate WHERE store_id=? AND"
-                " marketplace_id=? AND pid=? ORDER BY score IS NULL,"
-                " score DESC, id ASC",
-                (store_id, marketplace_id, pid),
+                " marketplace_id=? AND pid=? AND env=?"
+                " ORDER BY score IS NULL, score DESC, id ASC",
+                (store_id, marketplace_id, pid, env),
             ).fetchall()
         out = []
         for r in rows:
@@ -546,22 +687,24 @@ class PtStore:
             out.append(d)
         return out
 
-    # ---- 分配（追加式历史，is_current 单活） ----
+    # ---- 分配（追加式历史，is_current 单活；env 内单活） ----
 
     def add_assignment(
         self, *, store_id: str, marketplace_id: str, pid: str,
         pt_name: str, schema_cache_key: str | None = None,
         chosen_by: str, confidence: float | None = None,
         reason: str | None = None, now_ts: int | None = None,
+        env: str = "live",
     ) -> int:
         if chosen_by not in VALID_CHOSEN_BY:
             raise ValueError(f"非法 chosen_by: {chosen_by}")
+        _check_env(env)
         t = now_ts or now()
         with self._tx():
             old = self._db.execute(
                 "SELECT id FROM pt_assignment WHERE store_id=? AND"
-                " marketplace_id=? AND pid=? AND is_current=1",
-                (store_id, marketplace_id, pid),
+                " marketplace_id=? AND pid=? AND env=? AND is_current=1",
+                (store_id, marketplace_id, pid, env),
             ).fetchone()
             if old is not None:
                 self._db.execute(
@@ -570,10 +713,10 @@ class PtStore:
                 )
             cur = self._db.execute(
                 "INSERT INTO pt_assignment(store_id,marketplace_id,pid,"
-                "pt_name,schema_cache_key,chosen_by,confidence,reason,"
-                "is_current,created_at) VALUES(?,?,?,?,?,?,?,?,1,?)",
+                "pt_name,schema_cache_key,chosen_by,confidence,reason,env,"
+                "is_current,created_at) VALUES(?,?,?,?,?,?,?,?,?,1,?)",
                 (store_id, marketplace_id, pid, pt_name, schema_cache_key,
-                 chosen_by, confidence, reason, t),
+                 chosen_by, confidence, reason, env, t),
             )
             new_id = int(cur.lastrowid)
             if old is not None:
@@ -585,22 +728,26 @@ class PtStore:
 
     def current_assignment(
         self, store_id: str, marketplace_id: str, pid: str,
+        env: str = "live",
     ) -> dict | None:
+        _check_env(env)
         with self._lock:
             return _row(self._db.execute(
                 "SELECT * FROM pt_assignment WHERE store_id=? AND"
-                " marketplace_id=? AND pid=? AND is_current=1",
-                (store_id, marketplace_id, pid),
+                " marketplace_id=? AND pid=? AND env=? AND is_current=1",
+                (store_id, marketplace_id, pid, env),
             ).fetchone())
 
     def assignment_history(
         self, store_id: str, marketplace_id: str, pid: str,
+        env: str = "live",
     ) -> list[dict]:
+        _check_env(env)
         with self._lock:
             rows = self._db.execute(
                 "SELECT * FROM pt_assignment WHERE store_id=? AND"
-                " marketplace_id=? AND pid=? ORDER BY id DESC",
-                (store_id, marketplace_id, pid),
+                " marketplace_id=? AND pid=? AND env=? ORDER BY id DESC",
+                (store_id, marketplace_id, pid, env),
             ).fetchall()
         return [dict(r) for r in rows]
 
@@ -699,8 +846,9 @@ class PtStore:
     def create_task(
         self, task_id: str, kind: str, store_id: str,
         marketplace_id: str, pids: Iterable[str],
-        now_ts: int | None = None,
+        now_ts: int | None = None, env: str = "live",
     ) -> int:
+        _check_env(env)
         t = now_ts or now()
         seen: list[str] = []
         for p in pids or []:
@@ -709,10 +857,10 @@ class PtStore:
                 seen.append(p)
         with self._tx():
             self._db.execute(
-                "INSERT INTO pt_task(id,kind,store_id,marketplace_id,phase,"
-                "progress_done,progress_total,created_at,updated_at)"
-                " VALUES(?,?,?,?,?,0,?,?,?)",
-                (task_id, kind, store_id, marketplace_id, "created",
+                "INSERT INTO pt_task(id,kind,store_id,marketplace_id,env,"
+                "phase,progress_done,progress_total,created_at,updated_at)"
+                " VALUES(?,?,?,?,?,?,0,?,?,?)",
+                (task_id, kind, store_id, marketplace_id, env, "created",
                  len(seen), t, t),
             )
             self._db.executemany(

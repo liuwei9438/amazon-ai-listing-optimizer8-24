@@ -6,13 +6,20 @@
 2. 不重新调用 AI 理解：理解结果（analyzer profile）作为输入注入，有就用、
    没有就按原始资料降级（degraded=True），缺什么记什么（missing），
    绝不编造缺失事实（空就是空，不填 "unknown"）。
-3. 身份优先级（要求 3）：理解输出的 product_identity（准确英文身份）
-   > identifiers.model_numbers（本体型号）> SKU > 原始标题（最后兜底，
-   identity_source 标明来源）。
-4. 本体与兼容严格分开（要求 4/5）：compatibility{brands,models,
-   part_numbers} 与标题里「适用于/兼容/for」启发式抽取全部进 compat 列表
-   （带 kind 与 source），绝不混入产品本体身份；S1/S2 检索词永远排除
-   兼容词——「适用 iPhone 15 的手机壳」绝不能按 iPhone 去搜。
+3. 身份优先级（要求 3 + 2026-10-12 批复修正 1）：理解输出的
+   product_identity（准确英文身份）> identifiers.model_numbers（本体
+   型号）> 剥离适配语后的原始标题（最后兜底，identity_source 标明
+   来源）。**SKU 永不充当商品身份或分类语义检索词**——只作商品标识；
+   仅当 SKU 片段与标题/理解等语义语料重合（明确语义证据）时才可提取
+   （见 sku_semantic_tokens，且这些词已经由语料进入检索词，SKU 不额外
+   贡献检索词）。
+4. 本体与兼容严格分开（要求 4/5 + 2026-10-12 批复修正 2）：
+   compatibility{brands,models,part_numbers} 与标题里「适用于/兼容/
+   for」启发式抽取全部进 compat 列表（带 kind 与 source），绝不混入
+   产品本体身份；**兼容品牌绝不当作商品品牌**；适配设备类型与用途
+   场景经 auxiliary_signals() 作为分类判断的辅助信息（模块 4 用）；
+   S1/S2 检索词永远排除兼容词——「适用 iPhone 15 的手机壳」绝不能按
+   iPhone 去搜。
 
 输入形状（与现状逐字一致，不发明字段）：
   record: 桌面版产品记录 {pid, sku, title, cat, opt:{title,short_title,
@@ -85,7 +92,7 @@ class ProductMaterial:
     description: str = ""
     model: str = ""               # 本体型号（identifiers.model_numbers[0]）
     product_identity: str = ""    # 准确身份（英文优先）
-    identity_source: str = ""     # understanding|model|sku|title_raw
+    identity_source: str = ""     # understanding|model|title_raw（SKU 不参与）
     basic_info_product_type: str = ""   # 理解输出的旧线索（只做参考，不当候选）
     usage_scenarios: list[str] = field(default_factory=list)
     compat: list[CompatFact] = field(default_factory=list)
@@ -98,7 +105,7 @@ class ProductMaterial:
         return [f.value.strip().lower() for f in self.compat if f.value.strip()]
 
     def body_terms(self) -> list[str]:
-        """产品本体检索词（已排除全部兼容词）——S1/S2 用。"""
+        """产品本体检索词（已排除全部兼容词；SKU 永不参与）——S1/S2 用。"""
         seeds: list[str] = []
         if self.product_identity:
             seeds.append(self.product_identity)
@@ -116,6 +123,34 @@ class ProductMaterial:
                 if low not in out:
                     out.append(low)
         return out[:10]
+
+    def sku_semantic_tokens(self) -> list[str]:
+        """修正 1：SKU 默认只是商品标识。仅当 SKU 的分词片段与语义语料
+        （标题/五点/详情/身份/型号/basic_info）重合——即有明确商品语义
+        证据——才允许提取；这些词早已由语料进入 body_terms，SKU 本身
+        不向检索词贡献任何新词。"""
+        corpus = {t.lower() for src in (self.title_raw, self.title,
+                                        self.product_identity, self.model,
+                                        self.basic_info_product_type,
+                                        " ".join(self.bullets),
+                                        self.description)
+                  for t in _tokenize(src)}
+        return [t for t in _tokenize(self.sku) if t.lower() in corpus]
+
+    def auxiliary_signals(self) -> dict:
+        """修正 2：分类判断的辅助信息（模块 4 matcher 用）。用途场景与
+        适配设备/型号可作辅助；兼容品牌（compatible_brand）只是适配
+        关系，绝不当商品品牌或本体身份参与判断。"""
+        return {
+            "usage_scenarios": list(self.usage_scenarios),
+            "fits": [{"kind": f.kind, "value": f.value}
+                     for f in self.compat
+                     if f.kind in ("fits_model", "fits_part")],
+            "compatible_brands": [f.value for f in self.compat
+                                  if f.kind == "compatible_brand"],
+            "note": "compatible_brands 是适配关系不是商品品牌；分类判断"
+                    "只可作配件语境参考，禁止当成本体品牌或身份",
+        }
 
 
 def _tokenize(text: str) -> list[str]:
@@ -174,8 +209,11 @@ def extract_material(pid: str, record: dict | None,
                 _split_images(r.get(COL_DETAIL_IMAGES)):
             if u not in m.images:
                 m.images.append(u)
+    # SKU 列读进 m.sku 仅作商品标识（修正 1），不参与身份/检索词
     raw_sku = next((str(r.get(COL_SKU) or "").strip() for r in raw_rows
                     if str(r.get(COL_SKU) or "").strip()), "")
+    if raw_sku and not m.sku:
+        m.sku = raw_sku
 
     # ---- AI 优化结果（只读优先级：opt 标题五点 > 原始） ----
     m.title = _first_text((opt or {}).get("title"), m.title_raw)
@@ -204,7 +242,7 @@ def extract_material(pid: str, record: dict | None,
         understanding = None
     m.degraded = understanding is None
 
-    # 身份优先级（要求 3）
+    # 身份优先级（要求 3 + 修正 1：SKU 只是标识，永不充当身份）
     m.product_identity = _first_text(
         ident.get("title_product_identity"),
         ident.get("buyer_search_identity"),
@@ -216,9 +254,6 @@ def extract_material(pid: str, record: dict | None,
         m.identity_source = "understanding"
     elif m.model:
         m.product_identity, m.identity_source = m.model, "model"
-    elif m.sku or raw_sku:
-        m.product_identity = m.sku or raw_sku
-        m.identity_source = "sku"
     elif m.title_raw:
         # 剥掉适配语再当身份（「手机壳 适用于iPhone 15 Pro」→「手机壳」）
         stripped = _strip_fitment(m.title_raw)
@@ -279,7 +314,9 @@ def extract_material(pid: str, record: dict | None,
         miss.append("description")
     if not m.images:
         miss.append("images")
-    if m.identity_source in ("sku", "title_raw"):
+    if not m.product_identity:
+        miss.append("identity")
+    elif m.identity_source == "title_raw":
         miss.append("accurate_identity")
     m.missing = miss
     return m
