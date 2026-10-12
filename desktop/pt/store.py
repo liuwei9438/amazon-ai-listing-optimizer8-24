@@ -27,7 +27,14 @@
    mock 环境检索的字典/候选/schema 缓存/分配/任务对 live 读取一律不可
    见，反之亦然。v1→v2 最小迁移：三张带唯一键的表重建
    （pt_type_dict/pt_browse_node/pt_candidate），三张直接 ALTER 加列
-   （pt_schema_meta/pt_assignment/pt_task）；旧行 env='live'。
+   （pt_schema_meta/pt_assignment/pt_task）。
+9. 历史数据不得自动获得官方资格（2026-10-12 第二轮批复修正 1）：
+   v1→v2 迁移的旧行一律落 env='legacy_unverified' 隔离区——来源无法
+   证明的数据不得冒充 live 官方数据；live/mock 读写永远看不见 legacy
+   分区，显式传 env="legacy_unverified" 可审计；pt_verification 的
+   历史行 verified_against='live' 同步降级 'legacy_unverified'
+   （mock 行保持 mock——mock 声称本来就是诚实的）。新写入不走
+   legacy 值：业务代码仍只写 mock|live。
 
 数据库位置：默认 %LOCALAPPDATA%\\WZDesktop\\pt\\pt.sqlite3（代码更新/
 robocopy 部署不会覆盖），环境变量 WZD_PT_DATA 可改根目录；测试直接
@@ -58,6 +65,11 @@ VALID_VSTATUS = {"pending", "passed", "failed", "insufficient",
                  "skipped", "error"}
 VALID_AGAINST = {"mock", "live"}          # Mock 验证 ≠ 真实官方验证（铁律）
 VALID_ENV = {"mock", "live"}              # 修正 3：数据行环境隔离
+# 修正 1（2026-10-12 第二轮批复）：v1 历史数据的隔离区取值——来源无法
+# 证明，不得自动获得 live 官方验证资格。仅迁移写入与显式审计读取使用。
+LEGACY_ENV = "legacy_unverified"
+VALID_AGAINST = {"mock", "live", LEGACY_ENV}
+VALID_ENV = {"mock", "live", LEGACY_ENV}
 
 
 def _check_env(env: str) -> str:
@@ -238,17 +250,10 @@ CREATE INDEX IF NOT EXISTS idx_task_item
   ON pt_task_item(task_id, state);
 """
 
-# 索引单独一份：v1→v2 表重建后旧索引随旧表丢弃，需要重建
-# （逐条 execute，execute() 不收多语句；excludescript 会隐式 COMMIT
-#  破坏迁移事务，所以这里存语句元组）
-_IDX_STATEMENTS = (
-    "CREATE INDEX IF NOT EXISTS idx_assignment_current"
-    " ON pt_assignment(store_id, marketplace_id, pid, env, is_current)",
-    "CREATE INDEX IF NOT EXISTS idx_verification"
-    " ON pt_verification(store_id, marketplace_id, pid, check_kind, id)",
-    "CREATE INDEX IF NOT EXISTS idx_task_item"
-    " ON pt_task_item(task_id, state)",
-)
+# 索引不单独成份：全部在 _SCHEMA_SQL 里（CREATE INDEX IF NOT EXISTS）。
+# v1→v2 迁移必须**先**给旧表补 env 列/重建，**最后**再跑 executescript
+# 建索引——索引引用 env 列，v1 旧表（pt_assignment 等）还没有它，
+# 先跑脚本会直接 OperationalError（真实老库的坑，2026-10-12 二轮修正）。
 
 
 def _row(r: sqlite3.Row | None) -> dict | None:
@@ -323,7 +328,9 @@ class PtStore:
                 return
             if v == 1:
                 # v1→v2（修正 3）：env 隔离列。三张带唯一键的表重建
-                # （唯一键必须含 env），三张 ALTER 加列；旧行 env='live'。
+                # （唯一键必须含 env），三张 ALTER 加列；旧行一律落
+                # legacy_unverified 隔离区（修正 1：历史来源无法证明，
+                # 不得自动获得 live 官方资格）。
                 self._migrate_1_to_2()
                 self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                 return
@@ -365,37 +372,54 @@ class PtStore:
              "display_name,score,evidence_json,retrieved_at"),
         )
         alters = ("pt_schema_meta", "pt_assignment", "pt_task")
-        # 异常 v1 库缺表时先幂等补建（含 pt_verification 等），索引才有落点
-        self._db.executescript(_SCHEMA_SQL)
         with self._tx():
-            for name, ddl, old_cols in rebuilds:
-                has = self._db.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND"
-                    " name=?", (name,)).fetchone()
-                if has is None:
-                    continue          # v1 库缺表（异常旧库）→ 跳过，建库脚本补
-                self._db.execute(f"ALTER TABLE {name} RENAME TO {name}__v1")
-                self._db.execute(ddl)
-                self._db.execute(
-                    f"INSERT INTO {name}({old_cols},env) SELECT {old_cols},"
-                    f" 'live' FROM {name}__v1")
-                self._db.execute(f"DROP TABLE {name}__v1")
+            # ① 三张 ALTER 表先补 env 列（存量行=加列默认值 legacy）。
+            #    必须在 executescript 之前：脚本里的 idx_assignment_current
+            #    引用 env，v1 旧表没有它会直接 OperationalError。
             for name in alters:
                 has = self._db.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND"
                     " name=?", (name,)).fetchone()
                 if has is None:
-                    continue
+                    continue          # v1 库缺表（异常旧库）→ 脚本稍后补
                 cols = {r[1] for r in self._db.execute(
                     f"PRAGMA table_info({name})").fetchall()}
                 if "env" not in cols:
+                    # 加列默认值只作用于「加列当时的存量行」=历史行，
+                    # 全部落 legacy 隔离区（修正 1）；此后新写入走方法层
+                    # env 参数（缺省 live），不受表级默认影响
                     self._db.execute(
                         f"ALTER TABLE {name} ADD COLUMN env TEXT NOT NULL"
-                        " DEFAULT 'live'")
-            for stmt in _IDX_STATEMENTS:   # 表重建后索引随旧表丢弃，重建
-                self._db.execute(stmt)
-            _LOG.info("pt.store v1→v2 迁移完成（env 隔离列，旧行=live）"
-                      " db=%s", self.path)
+                        f" DEFAULT '{LEGACY_ENV}'")
+            # ② 三张唯一键表重建（唯一键必须含 env；旧行落 legacy）
+            for name, ddl, old_cols in rebuilds:
+                has = self._db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND"
+                    " name=?", (name,)).fetchone()
+                if has is None:
+                    continue
+                self._db.execute(f"ALTER TABLE {name} RENAME TO {name}__v1")
+                self._db.execute(ddl)
+                self._db.execute(
+                    f"INSERT INTO {name}({old_cols},env) SELECT {old_cols},"
+                    f" '{LEGACY_ENV}' FROM {name}__v1")
+                self._db.execute(f"DROP TABLE {name}__v1")
+            # ③ 修正 1（续）：v1 时代的验证记录声称 live 的同样不可信——
+            #    降级 legacy_unverified；mock 声称保持 mock（本就诚实）。
+            #    异常缺表库无行可降，跳过（脚本稍后补空表）。
+            has_v = self._db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND"
+                " name='pt_verification'").fetchone()
+            if has_v is not None:
+                self._db.execute(
+                    "UPDATE pt_verification SET verified_against=? WHERE"
+                    " verified_against='live'", (LEGACY_ENV,))
+        # ④ 建库脚本幂等补齐缺表 + 索引（此刻所有已存在的表都带 env，
+        #    索引安全；重建表丢弃的旧索引在这里重建）
+        self._db.executescript(_SCHEMA_SQL)
+        _LOG.info("pt.store v1→v2 迁移完成（env 隔离列；旧行与历史"
+                  " live 验证记录一律降级 %s，不自动获得官方资格）"
+                  " db=%s", LEGACY_ENV, self.path)
 
     def integrity_ok(self) -> bool:
         with self._lock:
