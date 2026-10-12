@@ -340,9 +340,22 @@ class PtStore:
         )
         self._db.row_factory = sqlite3.Row
         self._db.isolation_level = None        # 纯自动提交 + 手动事务
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute("PRAGMA synchronous=NORMAL")
+        # busy_timeout 必须先行：journal_mode 切换要独占锁，多进程/多连接
+        # 同时打开同一库时切换会撞锁（且该路径不吃 connect 的 busy 超时）
         self._db.execute("PRAGMA busy_timeout=5000")
+        try:
+            self._db.execute("PRAGMA journal_mode=WAL")
+        except sqlite3.OperationalError as e:
+            # 并发打开竞态：若库已是 WAL（另一连接刚切完），本次打开照常
+            # 可用；确实拿不到 WAL 才是故障。
+            mode = self._db.execute(
+                "PRAGMA journal_mode").fetchone()[0]
+            if str(mode).lower() != "wal":
+                raise
+            _LOG.warning(
+                "pt.store init: journal_mode=WAL 并发竞态（库已是 WAL，"
+                "继续）db=%s err=%r", self.path, e)
+        self._db.execute("PRAGMA synchronous=NORMAL")
         self._migrate()
 
     # ---- 基础设施 ----
