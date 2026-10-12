@@ -26,10 +26,21 @@ SpApiClient 据此把结果标 mock=True——Mock 通过永不等于真实官�
   bad_token             令牌=="BAD_TOKEN" 时 401（模拟令牌失效）
   no_token              无 x-amz-access-token 头 → 401
   no_mock_header        正常响应但不带 X-WZ-Mock 头
+
+模块 6 STATE 新键（默认关闭，不影响任何既有行为）：
+  schema_serve   True=PTD schema.link 指向本服务 /schemas/{pt}.json，
+                 checksum=真实 md5 摘要 base64（客户端按此校验）
+  schemas        None=按需生成默认 Schema（$ref/allOf/if-then/枚举/
+                 pattern/数组嵌套/条件必填俱全）；dict {pt: bytes|str} 可覆盖
+  schema_mode    /schemas/ 定向故障：link_dead(404)|timeout|badjson|
+                 oversize(~2.5MB)；hash_wrong=PTD 里的 checksum 给错值
+  pt_version     覆盖 productTypeVersion（版本变更测试用）
 """
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 import threading
 import time
@@ -53,6 +64,12 @@ STATE: dict = {
     # server_error|notfound|badjson|timeout——PTD 等其余路由照常，专测
     # 「定义拿得到、目录佐证拿不到」的降级行为。
     "catalog_mode": None,
+    # 模块 6 Schema 层用（默认 None/False=不影响任何既有行为）：
+    "schema_serve": False,   # True=PTD schema.link 指向本服务 /schemas/ 且带真 md5
+    "schemas": None,         # None=按需生成默认 Schema；dict {pt_name: bytes|str} 自定义
+    "schema_mode": None,     # /schemas/ 定向故障：link_dead|timeout|badjson|oversize；
+                             # hash_wrong 只把 PTD 里的 checksum 换成错的
+    "pt_version": None,      # 覆盖 productTypeVersion（None=mock-ver-1；版本变更测试用）
 }
 _LOCK = threading.Lock()
 RECORDS: list[dict] = []    # 每请求一条（不含令牌值，只记长度）
@@ -97,6 +114,67 @@ def set_catalog_items(items) -> None:
     with _LOCK:
         STATE["catalog_items"] = [dict(i) for i in items] \
             if items is not None else None
+
+
+# 模块 6：默认 JSON Schema（官方 draft 风状：$ref/allOf/if-then/枚举/
+# pattern/数组嵌套/条件必填俱全——分析器契约测试就按这份断言）。
+_DEFAULT_SCHEMA = {
+    "$schema": "http://json-schema.org/draft-04/schema#",
+    "type": "object",
+    "required": ["item_name", "brand", "feed_product_type",
+                 "external_product_id"],
+    "properties": {
+        "item_name": {"type": "string", "maxLength": 200},
+        "brand": {"$ref": "#/definitions/brand_def"},
+        "feed_product_type": {"type": "string",
+                              "enum": ["GPS_TRACKER", "LUGGAGE"]},
+        "external_product_id": {"type": "string",
+                                "pattern": "^[0-9A-Za-z\\-]{6,14}$"},
+        "quantity": {"type": "integer", "minimum": 1},
+        "material": {"type": "string"},
+        "batteries": {
+            "type": "array",
+            "items": {"type": "object",
+                      "properties": {"cell_composition": {
+                          "type": "string",
+                          "enum": ["lithium_ion", "alkaline"]}},
+                      "required": ["cell_composition"]}},
+    },
+    "allOf": [
+        {"if": {"properties": {"quantity": {"minimum": 10}}},
+         "then": {"required": ["item_package_quantity"]}},
+        {"properties": {"supplier_declared_value_per_unit": {
+            "type": ["number", "null"]}}},
+    ],
+    "definitions": {
+        "brand_def": {"type": "object",
+                      "properties": {"value": {"type": "string",
+                                               "maxLength": 50}},
+                      "required": ["value"]},
+    },
+}
+
+
+def default_schema(pt: str) -> bytes:
+    """默认 Schema（确定性字节：sort_keys 紧凑序列化）。"""
+    doc = json.loads(json.dumps(_DEFAULT_SCHEMA))     # 深拷贝防串改
+    doc["product_type"] = str(pt)
+    return json.dumps(doc, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":")).encode()
+
+
+def schema_bytes(pt: str) -> bytes:
+    """STATE["schemas"] 自定义优先，缺省按需生成。"""
+    with _LOCK:
+        custom = (STATE["schemas"] or {}).get(pt)
+    if custom is not None:
+        return custom.encode("utf-8") if isinstance(custom, str) else custom
+    return default_schema(pt)
+
+
+def md5_b64(data: bytes) -> str:
+    """官方 checksum 同式：MD5 摘要的 base64（客户端按此校验）。"""
+    return base64.b64encode(hashlib.md5(data).digest()).decode()
 
 
 def _error_body(code: str, message: str, details: str = "") -> bytes:
@@ -244,6 +322,25 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send(200, b'{"numberOfResults":0,"items":[]}')
                 return
 
+        # Schema 路由定向故障（模块 6；默认 None 不影响任何既有行为）
+        with _LOCK:
+            sm = STATE["schema_mode"]
+            schema_sleep = STATE["sleep"]
+        if sm and u.path.startswith("/schemas/"):
+            if sm == "link_dead":
+                self._err(404, "NotFound", "Schema 链接已失效（mock）")
+                return
+            if sm == "timeout":
+                time.sleep(float(schema_sleep))
+                self._send(200, b'{"type":"object"}')
+                return
+            if sm == "badjson":
+                self._send(200, b"<<<not-json>>>")
+                return
+            if sm == "oversize":
+                self._send(200, b'{"padding":"' + b"x" * 2_500_000 + b'"}')
+                return
+
         body = self._body(u.path, qs, mid)
         if body is None:
             self._err(404, "NotFound", f"mock 无此路由：{u.path}")
@@ -253,6 +350,8 @@ class _Handler(BaseHTTPRequestHandler):
     # ---- 响应构造（按官方 OpenAPI 形状） ----
 
     def _body(self, path: str, qs: dict, mid: str) -> bytes | None:
+        if path.startswith("/schemas/"):
+            return self._schema_get(path.rsplit("/", 1)[1])
         if path == "/definitions/2020-09-01/productTypes":
             return self._ptd_search(qs, mid)
         if path.startswith("/definitions/2020-09-01/productTypes/"):
@@ -290,6 +389,9 @@ class _Handler(BaseHTTPRequestHandler):
     def _ptd_get(self, pt: str, qs: dict, mid: str) -> bytes | None:
         with _LOCK:
             kp = STATE["known_pts"]
+            serve = STATE["schema_serve"]
+            smode = STATE["schema_mode"]
+            ver = STATE["pt_version"]
         if kp is not None and pt not in kp:
             return None                 # 白名单外 → do_GET 统一回 404
         doc = {
@@ -315,8 +417,19 @@ class _Handler(BaseHTTPRequestHandler):
             "marketplaceIds": [mid],
             "productType": pt,
             "displayName": pt.replace("_", " ").title(),
-            "productTypeVersion": "mock-ver-1",
+            "productTypeVersion": ver or "mock-ver-1",
         }
+        if serve:
+            # 模块 6：schema.link 指向本服务 /schemas/ 路由，checksum=真实
+            # md5(base64)（客户端可校验）；hash_wrong=故意给错值
+            body = schema_bytes(pt)
+            host = self.headers.get("Host") or "127.0.0.1"
+            doc["schema"] = {
+                "link": {"resource": f"http://{host}/schemas/{pt}.json",
+                         "verb": "GET"},
+                "checksum": ("intentionally-wrong==" if smode == "hash_wrong"
+                             else md5_b64(body)),
+            }
         if qs.get("sellerId"):
             # 官方 2020-09-01 响应无 sellerId 字段——故意不加（契约测试守卫）
             pass
@@ -362,6 +475,11 @@ class _Handler(BaseHTTPRequestHandler):
         return json.dumps(self._item(asin, mid, cid, name, pt),
                           ensure_ascii=False).encode()
 
+    def _schema_get(self, fname: str) -> bytes:
+        """/schemas/{pt}.json（模块 6）——自定义优先，缺省按需生成。"""
+        name = fname[:-5] if fname.endswith(".json") else fname
+        return schema_bytes(name)
+
     def _mode_force_empty(self) -> bool:
         with _LOCK:
             return STATE["mode"] == "empty"
@@ -373,6 +491,8 @@ class _Handler(BaseHTTPRequestHandler):
                                    "productTypeVersion": "mock-ver-1"}
                                   ).encode()
             return json.dumps({"numberOfResults": 0, "items": []}).encode()
+        if path.startswith("/schemas/"):
+            return self._schema_get(path.rsplit("/", 1)[1])
         if path == "/definitions/2020-09-01/productTypes":
             return self._ptd_search(qs, mid)
         if path.startswith("/definitions/2020-09-01/productTypes/"):

@@ -10,6 +10,10 @@ developer-docs.amazon 抓取核对，规范镜像存 spec_ptd_*.json/spec_cat_*.
   searchCatalogItems            GET   /catalog/2022-04-01/items                 2 rps / burst 2
   getCatalogItem                GET   /catalog/2022-04-01/items/{asin}          2 rps / burst 2
 
+另含模块 6 的受限下载 fetch_schema()（非官方 API 操作，是 PTD
+schema.link 签名 URL 的 GET）：scheme/http(s)-only、宿主沿用环境传输层
+白名单、不带令牌、大小/超时/有界重试上帽、查询串（签名参数）绝不入文。
+
 工程约束（模块 2 批复 12 条）在代码中的落点：
   3  不 import main：运行环境（build_environment 三模式 direct/proxy/mock）、
      取令牌回调全部构造注入，main 在装配期把自己的 SP-API 请求能力
@@ -205,7 +209,7 @@ class SpApiParseError(SpApiError):
 
 @dataclass
 class SpApiResult:
-    op: str                      # search_product_types / ...
+    op: str                      # search_product_types / ... / fetch_schema
     marketplace_id: str
     status: int
     data: Any                    # 官方响应原样（dict）
@@ -214,6 +218,7 @@ class SpApiResult:
     rate_limit: float | None = None   # 本次响应 x-amzn-RateLimit-Limit
     attempts: int = 1            # 含重试的总尝试次数
     elapsed: float = 0.0         # 秒
+    raw: bytes = b""             # 模块 6：Schema 下载的原始字节（哈希/落盘用）
 
 
 # ---------------------------------------------------------------------------
@@ -658,6 +663,129 @@ class SpApiClient:
         return self._call_checked(
             "get_catalog_item", marketplace_id, params,
             path_args={"asin": a}, required=("asin",))
+
+    # ---- 模块 6：官方 Schema 受限下载（PTD schema.link 的 GET）----
+
+    def fetch_schema(self, link_url: str, *,
+                     max_bytes: int = 2_000_000) -> SpApiResult:
+        """下载 PTD schema.link 指向的官方 JSON Schema（模块 6 专用受限 GET）。
+
+        安全模型（模块 6 批复三）：
+        - 只接受 http(s)——file:/// 等其余 scheme 一律 ValueError；
+        - 目标主机由环境传输层强制白名单：mock 只准 mock_url 主机、
+          live 只准官方 SP-API 域名（正则），任意 URL/本地文件物理不可达；
+        - live 仅允许 https；
+        - 不携带 x-amz-access-token——官方 SchemaLink 是自带授权的签名
+          URL，把令牌发给链接目标等于泄露；
+        - 大小上限 max_bytes、超时 self._timeout；幂等 GET 沿用
+          RetryConfig 有界重试（仅 429/5xx/网络错误）。不设独立限流器：
+          Schema 下载属低频操作，节奏由上层批量调度约束；
+        - 异常文本只带「主机+路径」——查询串（可能含 X-Amz-Signature
+          等签名参数）绝不进任何消息/日志。
+        返回 SpApiResult（data=解析后 JSON，raw=原始字节供校验落盘）。
+        """
+        url = str(link_url or "").strip()
+        u = urllib.parse.urlparse(url)
+        where = f"{u.hostname or ''}{u.path}"    # 查询串绝不入文
+        if u.scheme not in ("http", "https"):
+            raise ValueError(f"Schema 链接只允许 http(s)：{u.scheme!r}")
+        if not u.hostname:
+            raise ValueError("Schema 链接缺少主机")
+        if self._env.mode == "live" and u.scheme != "https":
+            raise ValueError("live 环境 Schema 链接仅允许 https")
+        max_bytes = int(max_bytes)
+        if max_bytes < 1:
+            raise ValueError("max_bytes 必须为正整数")
+        headers = {"Accept": "application/json",
+                   "User-Agent": self._user_agent}    # 无令牌（见 docstring）
+        retry = self._retry
+        attempts = 0
+        t0 = time.monotonic()
+        last_error: SpApiError | None = None
+        while True:
+            attempts += 1
+            delay = min(retry.base_delay * (2 ** (attempts - 1)),
+                        retry.max_delay)
+            try:
+                status, resp_headers, body = self._transport(
+                    "GET", url, headers, self._timeout)
+            except (socket.timeout, TimeoutError):
+                last_error = SpApiNetworkError(
+                    f"Schema 下载超时（>{self._timeout}s）{where}",
+                    phase="timeout", op="fetch_schema")
+            except urllib.error.URLError as e:
+                reason = getattr(e, "reason", e)
+                if isinstance(reason, (socket.timeout, TimeoutError)):
+                    last_error = SpApiNetworkError(
+                        f"Schema 下载超时 {where}", phase="timeout",
+                        op="fetch_schema")
+                else:
+                    last_error = SpApiNetworkError(
+                        f"Schema 下载连接失败："
+                        f"{type(reason).__name__} {where}",
+                        phase="connect", op="fetch_schema")
+            except (ConnectionError, OSError) as e:
+                last_error = SpApiNetworkError(
+                    f"Schema 下载连接失败：{type(e).__name__} {where}",
+                    phase="connect", op="fetch_schema")
+            else:
+                if 200 <= status < 300:
+                    # 环境信任与 _call 同尺（模块 2 修正 2）：
+                    # live 环境收到 X-WZ-Mock=目标可疑，结果作废
+                    if self._env.mode != "mock" and _is_mock(resp_headers):
+                        raise SpApiEnvironmentError(
+                            "live 环境 Schema 下载收到 X-WZ-Mock 响应头"
+                            f"——请求目标疑似模拟服务，结果作废（{where}）",
+                            op="fetch_schema", status=status,
+                            request_id=resp_headers.get("x-amzn-requestid"))
+                    if len(body) > max_bytes:
+                        raise ValueError(
+                            f"Schema 响应 {len(body)} 字节超过上限 "
+                            f"{max_bytes}（{where}）")
+                    data, parsed_errs = _parse_json(body)
+                    if parsed_errs is None:
+                        return SpApiResult(
+                            op="fetch_schema", marketplace_id="",
+                            status=status, data=data,
+                            mock=self._env.mode == "mock", raw=body,
+                            request_id=resp_headers.get("x-amzn-requestid"),
+                            rate_limit=_rate_of(resp_headers),
+                            attempts=attempts,
+                            elapsed=time.monotonic() - t0)
+                    raise SpApiParseError(
+                        f"Schema 响应不是合法 JSON（{parsed_errs}）{where}",
+                        op="fetch_schema", status=status,
+                        request_id=resp_headers.get("x-amzn-requestid"))
+                errs = _error_list(body)
+                req_id = resp_headers.get("x-amzn-requestid")
+                kw = dict(op="fetch_schema", marketplace_id="",
+                          status=status, errors=errs, request_id=req_id)
+                if status == 429:
+                    ra = _retry_after(resp_headers)
+                    if ra is not None and ra > retry.retry_after_cap:
+                        raise SpApiRateLimitError(
+                            f"Schema 下载限流且 Retry-After={ra}s 超过上限"
+                            f" {retry.retry_after_cap}s，放弃（{where}）",
+                            retry_after=ra, **kw)
+                    last_error = SpApiRateLimitError(
+                        f"Schema 下载限流（429）{where}", retry_after=ra,
+                        **kw)
+                    if ra is not None:
+                        delay = ra
+                elif status >= 500:
+                    last_error = SpApiServerError(
+                        f"Schema 下载服务端错误（{status}）{where}", **kw)
+                    ra = _retry_after(resp_headers)
+                    if ra is not None:
+                        delay = ra
+                else:
+                    # 400/401/403/404 等客户端错误一律不重试
+                    raise _client_error(f"Schema 下载 {where}", **kw)
+            if attempts < retry.max_attempts:      # 幂等 GET，有界重试
+                time.sleep(max(delay, 0.0))
+                continue
+            assert last_error is not None
+            raise last_error
 
     # ---- 引擎 ----
 

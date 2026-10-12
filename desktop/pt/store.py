@@ -524,15 +524,21 @@ class PtStore:
         product_type_version: str = "", payload_sha256: str | None = None,
         payload_path: str | None = None, status: str = "ok",
         fetched_at: int | None = None, env: str = "live",
+        cache_key: str | None = None,
     ) -> str:
+        """cache_key（模块 6）：显式指定主键——「最新版」语义的键版本段为空，
+        而 product_type_version 列记录实际拉到的官方版本；不传则按参数
+        重算（既有调用行为不变）。"""
         _check_env(env)
-        key = self.schema_cache_key(
+        key = cache_key or self.schema_cache_key(
             marketplace_id, pt_name, seller_id, locale, requirements,
             requirements_enforced, parentage_level, product_type_version,
             env,
         )
         t = fetched_at or now()
         with self._lock:
+            # ON CONFLICT 连 product_type_version 一并更新（模块 6 要求 ⑥：
+            # 元数据与实际文件一致——同键下官方版本推进时旧版本号不得残留）
             self._db.execute(
                 "INSERT INTO pt_schema_meta(cache_key,marketplace_id,pt_name,"
                 "seller_id,locale,requirements,requirements_enforced,"
@@ -542,7 +548,8 @@ class PtStore:
                 " ON CONFLICT(cache_key) DO UPDATE SET "
                 "payload_sha256=excluded.payload_sha256, payload_path="
                 "excluded.payload_path, status=excluded.status, fetched_at="
-                "excluded.fetched_at",
+                "excluded.fetched_at, product_type_version=excluded."
+                "product_type_version",
                 (key, marketplace_id, pt_name, seller_id, locale,
                  requirements, requirements_enforced, parentage_level,
                  product_type_version, payload_sha256, payload_path,
