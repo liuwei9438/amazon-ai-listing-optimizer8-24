@@ -624,6 +624,11 @@ class TaskEngine:
             detail={"source": "internal", "official": False,
                     "summary": gap.summary, "counts": gap.counts,
                     "ai_semantic_pt": gap.ai_semantic_pt,
+                    "entries": [{"name": e.name, "path": e.path,
+                                 "required": e.requiredness,
+                                 "category": e.category,
+                                 "reason": str(e.reason)[:150]}
+                                for e in gap.entries][:60],
                     "note": "缺口报告只对照官方 Schema：incomplete≠不可完成，"
                             "complete_for_review≠可刊登"},
             verified_against=ctx.env)

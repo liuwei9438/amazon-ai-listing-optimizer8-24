@@ -146,6 +146,7 @@ function enterApp() {
   setTimeout(() => loadProducts(true), 1200);  // 随后拉最新
   pollTask();  // 万一上次任务还在跑
   pollAutoCat();  // AI 归类同理（在跑就接上进度，空闲首轮即停）
+  if (window.PtUI) PtUI.enter();  // 🧭 亚马逊 AI 分类（pt.js 独立模块）
 }
 
 async function doLogout() {
@@ -1899,13 +1900,14 @@ function applyView() {
   const v = S.view;
   $("sidenav").querySelectorAll(".nav-item").forEach((el) =>
     el.classList.toggle("on", el.dataset.view === v));
-  $("catPanel").classList.toggle("hidden", v === "list" || v === "words");
+  $("catPanel").classList.toggle("hidden", v === "list" || v === "words" || v === "pt");
   $("catHead").classList.toggle("hidden", v !== "cat");
   $("recycleBox").classList.toggle("hidden", v !== "recycle");
-  $("wordsBox").classList.toggle("hidden", v !== "words");
-  $("selCat").classList.toggle("hidden", v === "cat" || v === "words");   // 分类视图用树筛，不重复
+  $("wordsBox").classList.toggle("hidden", v !== "words" && v !== "pt");
+  $("ptBox").classList.toggle("hidden", v !== "pt");          // 🧭 亚马逊 AI 分类视图
+  $("selCat").classList.toggle("hidden", v === "cat" || v === "words" || v === "pt");   // 分类视图用树筛，不重复
 
-  const showProducts = v !== "recycle" && v !== "words";   // 回收站/词典视图只看自己的表格
+  const showProducts = v !== "recycle" && v !== "words" && v !== "pt";   // 回收站/词典/pt 视图只看自己的表格
   $("statusTabs").classList.toggle("hidden", !showProducts);
   $("dateTabs").classList.toggle("hidden", !showProducts);
   $("filterRow").classList.toggle("hidden", !showProducts);

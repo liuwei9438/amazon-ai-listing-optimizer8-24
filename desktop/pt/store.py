@@ -920,6 +920,40 @@ class PtStore:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def assignments_all(self, store_id: str, marketplace_id: str,
+                        env: str = "live") -> dict:
+        """模块 8：一次取全部当前分配 {pid: 行}（UI 商品列表状态用）。"""
+        _check_env(env)
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM pt_assignment WHERE store_id=? AND"
+                " marketplace_id=? AND env=? AND is_current=1",
+                (store_id, marketplace_id, env),
+            ).fetchall()
+        return {str(r["pid"]): dict(r) for r in rows}
+
+    def latest_item_states(self, store_id: str, marketplace_id: str,
+                           env: str = "live") -> dict:
+        """模块 8：每个商品最近一次任务条目状态 {pid: {task_id,state,
+        error_kind}}（同一商品多次任务取最新任务里的条目）。"""
+        _check_env(env)
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT i.pid AS pid, i.task_id AS task_id, i.state AS"
+                " state, i.error_kind AS error_kind, t.created_at AS"
+                " t_created, i.id AS item_id FROM pt_task_item i JOIN"
+                " pt_task t ON t.id = i.task_id WHERE t.store_id=? AND"
+                " t.marketplace_id=? AND t.env=?"
+                " ORDER BY t.created_at DESC, i.id DESC",
+                (store_id, marketplace_id, env),
+            ).fetchall()
+        out: dict = {}
+        for r in rows:                     # 已按新→旧排，首个即最新
+            out.setdefault(str(r["pid"]), {
+                "task_id": str(r["task_id"]), "state": str(r["state"]),
+                "error_kind": r["error_kind"]})
+        return out
+
     # ---- 验证记录（四类独立成行；Mock/Live 严格分开） ----
 
     def add_verification(

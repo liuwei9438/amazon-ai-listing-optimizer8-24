@@ -457,3 +457,75 @@ body {
   text-align: left; vertical-align: top; word-break: break-word;
 }
 #amzResult th { background: #fafbfc; color: #555; }
+
+/* ---------- 🧭 亚马逊 AI 分类（pt 模块 8，独立样式段） ---------- */
+.pt-root { display: block; }
+.pt-top {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin-bottom: 12px; font-size: 13px; color: #555;
+}
+.pt-mock {
+  background: #7b1fa2; color: #fff; border-radius: 999px;
+  padding: 2px 10px; font-size: 12px; font-weight: 600;
+}
+.chip.ok { background: #e8f5e9; color: #1b5e20; }
+.chip.run { background: #fff3e0; color: #a15c00; }
+.chip.warn { background: #fdecea; color: #b71c1c; }
+.pt-tasklist { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+.pt-taskchip {
+  border: 1px solid #eef0f3; border-radius: 999px; padding: 2px 10px;
+  font-size: 12px; color: #666; cursor: pointer; background: #fafbfc;
+}
+.pt-taskchip:hover { border-color: #ff9900; color: #232f3e; }
+.pt-taskchip.run { border-color: #ff9900; color: #a15c00; background: #fff8ee; }
+
+.pt-main { display: flex; gap: 14px; align-items: flex-start; }
+.pt-list { flex: 1; min-width: 0; }
+.pt-rowbad td { background: #fffafb; }
+.pt-err { color: #c0392b; }
+.pt-b {
+  display: inline-block; border-radius: 999px; padding: 1px 8px;
+  font-size: 12px; background: #f0f2f5; color: #666; white-space: nowrap;
+}
+.pt-b.ok { background: #e8f5e9; color: #1b5e20; }
+.pt-b.run { background: #fff3e0; color: #a15c00; }
+.pt-b.rev { background: #ede7f6; color: #4527a0; }
+.pt-b.err { background: #fdecea; color: #b71c1c; }
+.pt-b.warn { background: #fdf3e3; color: #8a6d3b; }
+
+/* B/D 侧板（分类详情 + 人工复核） */
+.pt-detail {
+  width: 400px; flex: none; border: 1px solid #e5e9ef; border-radius: 10px;
+  background: #fff; position: sticky; top: 8px; max-height: calc(100vh - 24px);
+  display: flex; flex-direction: column;
+}
+.pt-detail-head {
+  display: flex; align-items: center; gap: 8px; padding: 10px 12px;
+  border-bottom: 1px solid #eef0f3; font-size: 14px;
+}
+.pt-detail-head b { flex: 1; min-width: 0; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap; }
+.pt-detail-body { padding: 10px 14px 16px; overflow-y: auto; font-size: 13px; }
+.pt-detail-body .d-sub {
+  font-size: 12px; color: #666; font-weight: 600; margin: 12px 0 4px;
+}
+.pt-detail-body .warn {
+  background: #fdecea; color: #b71c1c; border-radius: 8px;
+  padding: 6px 10px; font-size: 12px; margin: 6px 0;
+}
+.pt-asg {
+  border: 1px solid #e8f5e9; background: #f6fbf7; border-radius: 8px;
+  padding: 8px 10px; display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+}
+.pt-gap td { font-size: 12px; }
+.pt-review { display: flex; flex-direction: column; gap: 8px; }
+.pt-review label { font-size: 12px; color: #666; }
+.pt-cand {
+  display: flex; align-items: center; gap: 8px; border: 1px solid #eef0f3;
+  border-radius: 8px; padding: 6px 10px; cursor: pointer;
+}
+.pt-cand:hover { border-color: #ff9900; }
+@media (max-width: 1100px) {
+  .pt-main { flex-direction: column; }
+  .pt-detail { width: 100%; position: static; max-height: none; }
+}

@@ -9,6 +9,7 @@
   matcher.py       AI 匹配（只准回真实候选）
   verifier.py      V1-V4 独立验证
   tasks.py         任务编排（单商品/批量/重试/恢复/进度）
+  ai_gpt.py        模块 8：真实 GPT 决策器适配（凭证/网络全注入）
 
 工程约束：本包绝不 import main —— SP-API 能力（取令牌/发请求）一律由
 main 在装配期以回调注入（见 spapi_client 的 configure），防循环导入。
