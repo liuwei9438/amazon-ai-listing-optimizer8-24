@@ -431,7 +431,7 @@
       <div id="azMgmt" class="hidden">
         <div class="d-sub">🏪 店铺管理（已绑定 = 已安全保存在服务器，换电脑免重绑）</div>
         <table class="recycle-table"><thead><tr>
-          <th>店铺</th><th>站点</th><th>卖家 ID</th><th>授权时间</th><th style="width:110px">令牌状态</th><th style="width:150px">操作</th>
+          <th>店铺</th><th>站点</th><th>卖家 ID</th><th>授权时间</th><th title="来源 · 站点参与核对 · 卖家ID人工核对">验证</th><th style="width:110px">令牌状态</th><th style="width:150px">操作</th>
         </tr></thead><tbody id="azMgmtBody"></tbody></table>
         <div id="azEanBox" class="d-imghint"></div>
       </div>
@@ -472,6 +472,27 @@
         <label>站点</label>
         <select id="azMarket" class="inp"></select>
         <button id="azAuth" class="btn small primary wide">🔓 开始授权（复制链接，去店铺自己的环境打开）</button>
+
+        <!-- v14.7：自授权 Refresh Token 导入（应用草稿期被 MD9100 挡时的备用路，仅管理员） -->
+        <div class="d-imghint" style="margin-top:10px">走不了上面（应用还在审核/MD9100）？在开发者后台「授权 → 授权应用」拿到这家店的自授权 Refresh Token，从这里导入。</div>
+        <button id="azImpToggle" class="btn small wide">🔑 导入自授权令牌（备用方式，仅管理员）</button>
+        <div id="azImpBox" class="hidden">
+          <label>店铺名称（自己起个好认的，比如「英国店-xhsm」）</label>
+          <input id="azImpName" class="inp" placeholder="例如：英国店-xhsm" maxlength="40">
+          <label>卖家 ID（Seller Central → 设置 → 账户信息 → 商家令牌，A 开头）</label>
+          <input id="azImpSeller" class="inp" placeholder="例如 A1B2C3D4E5F6G7" maxlength="40">
+          <label>站点</label>
+          <select id="azImpMarket" class="inp"></select>
+          <label>Refresh Token（只存服务器，不回显、不落本机文件）</label>
+          <input id="azImpRt" class="inp" type="password" autocomplete="off" placeholder="粘贴开发者后台拿到的自授权令牌">
+          <label style="display:flex;gap:6px;align-items:center;margin:8px 0">
+            <input type="checkbox" id="azImpManual">
+            <span>我已打开 Seller Central「商家令牌」页<b>人工核对</b>：上面的卖家 ID 与页面一致</span>
+          </label>
+          <button id="azImpGo" class="btn small primary wide">🔑 验证并导入（先验证后保存）</button>
+          <div class="d-imghint">服务器先用令牌换 Access Token、只读核对站点参与，全部通过才写入绑定；失败或「待验证」都不会改动现有绑定。重复导入同一家店 = 换新令牌（店铺和已传记录都保留）。</div>
+          <div id="azImpReceipt"></div>
+        </div>
 
         <div id="azPasteBox" class="hidden">
           <div class="d-sub">第 1 步 · 复制这条授权链接</div>

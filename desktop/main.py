@@ -4595,6 +4595,58 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"ok": True})
                 return
 
+            # v14.7：导入自授权 Refresh Token（仅管理员；「先验证后提交」
+            # 全在服务器端完成，失败/待验证都不写。本机不落盘任何凭证，
+            # 回执也不带秘密——防御性弹掉万一混进来的令牌字段）
+            if url.path == "/api/amazon/store/import":
+                if not is_admin():
+                    self._json(
+                        {"ok": False, "error": "只有管理员能导入授权令牌"},
+                        403,
+                    )
+                    return
+                store = {
+                    "name": str(body.get("name") or "").strip()[:40],
+                    "seller_id":
+                        str(body.get("seller_id") or "").strip()[:40],
+                    "marketplace":
+                        str(body.get("marketplace") or "").strip(),
+                }
+                rt = str(body.get("refresh_token") or "").strip()[:2048]
+                manual = bool(body.get("seller_id_manual_checked"))
+                if not (store["name"] and store["seller_id"] and rt):
+                    self._json({
+                        "ok": False,
+                        "error": "店铺名称 / 卖家ID / Refresh Token 都要填",
+                    }, 400)
+                    return
+                if store["marketplace"] not in _MARKETPLACES:
+                    self._json({
+                        "ok": False,
+                        "error": "站点不对（在表单里选一个）",
+                    }, 400)
+                    return
+                try:
+                    r = _amz_store_api(
+                        {
+                            "action": "import_rt",
+                            "refresh_token": rt,
+                            "seller_id_manual_checked": manual,
+                            "store": store,
+                        },
+                        timeout=60,
+                    )
+                except Exception as exc:
+                    r = {"ok": False, "error": f"连不上服务器：{exc}"[:200]}
+                for k in ("refresh_token", "client_secret", "access_token"):
+                    r.pop(k, None)
+                (r.get("store") or {}).pop("refresh_token", None)
+                if r.get("ok") and (r.get("store") or {}).get("id"):
+                    # 轮换后旧 AT 属旧令牌，本机缓存一并清掉
+                    _AMZ_TOKENS.pop(str(r["store"]["id"]), None)
+                self._json(r)   # ok:false 也回 200，前端照渲染回执
+                return
+
             # 解绑店铺（仅管理员——worker 校验 admin_key）
             if url.path == "/api/amazon/store/delete":
                 sid = str(body.get("id") or "").strip()

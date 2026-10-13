@@ -2283,6 +2283,7 @@ async function refreshAmz() {
     $("azStoreDel").classList.toggle("hidden", !s.is_admin || !stores.length);
     $("azMgmtBtn").classList.toggle("hidden", !stores.length);
     $("azAppBox").classList.toggle("hidden", !s.is_admin || !!s.app_set);
+    $("azImpToggle").classList.toggle("hidden", !s.is_admin);   // 导入入口仅管理员
     if (!$("azMgmt").classList.contains("hidden")) azMgmtRender();
     $("azEanBox").innerHTML = s.ean
       ? `🏷 EAN 条码池 · 前缀(厂商编号) <b>${esc(s.ean.prefix || "未初始化")}</b> 已锁定 · 已用 ${s.ean.used} · 剩余 ${s.ean.remaining} · 上传时自动补码，产品↔码永久绑定（重传不换码）`
@@ -2294,6 +2295,8 @@ async function refreshAmz() {
 
     $("azMarket").innerHTML = (s.markets || []).map(([id, label]) =>
       `<option value="${esc(id)}" ${id === s.marketplace ? "selected" : ""}>${esc(label)}</option>`).join("");
+    $("azImpMarket").innerHTML = $("azMarket").innerHTML;       // 导入表单站点同源
+    $("azImpMarket").value = $("azMarket").value;
     $("azType").value = s.product_type === "PRODUCT" ? "" : s.product_type;
 
     // D1.5.0：分类→商品类型映射，自动填（精确路径优先，其次顶级段）
@@ -2421,6 +2424,56 @@ function azReceipt(r) {
     : `<div class="warn">❌ ${esc(r.message || "绑定没成功，请重新走一遍")}</div>`;
 }
 
+/* v14.7 导入自授权 Refresh Token：服务器端「先验证后提交」。
+   令牌输入框提交后无条件清空（成功失败都一样，不留痕）。 */
+async function azImport() {
+  const rt = $("azImpRt").value.trim();
+  if (!rt) { toast("先粘上 Refresh Token", "err", 6000); return; }
+  let r = null;
+  try {
+    busy(true, "验证并导入…（服务器先验令牌，全过才写绑定）");
+    const res = await fetch("/api/amazon/store/import", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        name: $("azImpName").value.trim(),
+        seller_id: $("azImpSeller").value.trim(),
+        marketplace: $("azImpMarket").value,
+        refresh_token: rt,
+        seller_id_manual_checked: $("azImpManual").checked,
+      }),
+    });
+    try { r = await res.json(); } catch (e) { r = { ok: false, error: `服务器没回话（HTTP ${res.status}）` }; }
+  } catch (e) {
+    r = { ok: false, error: e.message || String(e) };
+  } finally {
+    $("azImpRt").value = "";          // 提交后必清空
+    busy(false);
+  }
+  azImpReceipt(r);
+  if (r && r.ok) {
+    toast("✅ 导入成功，店铺已绑定", "ok", 6000);
+    await refreshAmz();
+    setTimeout(refreshAmz, 8000);     // KV 边缘同步最长约 60 秒
+    setTimeout(refreshAmz, 30000);
+  }
+}
+
+/* 导入回执三态：绿=验证全过已保存 / 黄=待验证（没写）/ 红=没成功（没写） */
+function azImpReceipt(r) {
+  r = r || {};
+  const st = r.store || {};
+  const box = $("azImpReceipt");
+  if (r.ok) {
+    box.innerHTML = `<div class="az-ok">✅ 导入成功！<b>${esc(st.name || "店铺")}</b> 已通过验证并安全保存在服务器（换电脑免重绑）`
+      + `<br>令牌有效 ✅ · 站点参与 ✅ · 卖家ID人工核对 ${r.seller_id_manual_checked ? "✅" : "⬜（还没勾：去 Seller Central「商家令牌」页核对后重新导入打勾）"} · ${fmtMs(Number(st.at) || 0)}</div>`;
+  } else if (r.pending) {
+    box.innerHTML = `<div class="warn">⏳ ${esc(r.error || "待验证——绑定未写入")}<br>令牌本身有效，但站点核对没完成（限流/权限/网络）。绑定没写入、现有店铺不受影响——稍后重试一次导入即可。</div>`;
+  } else {
+    box.innerHTML = `<div class="warn">❌ ${esc(r.error || "导入没成功")}<br>${r.token_valid === false ? "令牌无效——回开发者后台重新生成，再用新令牌粘过来。" : "绑定未写入，现有店铺和已传记录都不受影响。"}</div>`;
+  }
+}
+
 async function azAppSave() {
   try {
     busy(true, "保存应用凭证…");
@@ -2457,6 +2510,7 @@ function azMgmtRender() {
       <td>${esc(mkName(st.marketplace))}</td>
       <td>${esc(st.seller_id)}</td>
       <td>${fmtMs(Number(st.at) || 0)}</td>
+      <td title="来源 · 站点参与核对 · 卖家ID人工核对">${st.via === "import" ? "🔑导入" : st.via === "oauth" ? "🔓授权" : "—"} · 站点${st.marketplace_verified ? "✅" : "⬜"} · ID人工${st.seller_id_manual_checked ? "✅" : "⬜"}</td>
       <td id="aztok-${esc(st.id)}">－</td>
       <td>
         <button class="btn small" onclick="azTestStore('${esc(st.id)}')">测连接</button>
@@ -2870,6 +2924,8 @@ function bindEvents() {
   };
   $("azBatchN").oninput = azByCatInfo;
   $("azAuth").onclick = azAuthorize;
+  $("azImpToggle").onclick = () => $("azImpBox").classList.toggle("hidden");
+  $("azImpGo").onclick = azImport;
   $("azCopy").onclick = azCopy;
   $("azFinish").onclick = azFinish;
   $("azAppSave").onclick = azAppSave;
