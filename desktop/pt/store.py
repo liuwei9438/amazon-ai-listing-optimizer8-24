@@ -75,7 +75,7 @@ from typing import Any, Iterable
 
 _LOG = logging.getLogger("pt.store")   # 模块 2 要求 11：异常必须可诊断
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # ---- 合法枚举（集中定义，写入前一律校验） ----
 VALID_EVIDENCE = {"pending", "confirmed", "missing", "insufficient"}
@@ -278,6 +278,7 @@ CREATE TABLE IF NOT EXISTS pt_task(
   error          TEXT,
   source         TEXT NOT NULL DEFAULT '',
   idem_key       TEXT,
+  resume_pending INTEGER NOT NULL DEFAULT 0,
   created_at     INTEGER NOT NULL,
   updated_at     INTEGER NOT NULL,
   finished_at    INTEGER
@@ -415,9 +416,26 @@ class PtStore:
             if v in (1, 2):
                 # v2→v3（模块 7）：任务词表/新列/幂等键（见文件头 10）。
                 self._migrate_2_to_3()
+                self._db.execute("PRAGMA user_version=3")
+            if v in (1, 2, 3):
+                # v3→v4（集成加固）：pausing 窗口 resume 的持久化意图列。
+                self._migrate_3_to_4()
                 self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                 return
             raise RuntimeError(f"未知 schema 版本 v{v}")
+
+    def _migrate_3_to_4(self) -> None:
+        """v3→v4：pt_task 加 resume_pending（pausing 窗口里收到 resume
+        请求时置位；暂停落定即消费并自动续跑——意图持久化在库，进程
+        重启也不丢语义）。老库 ALTER 补列，全新库由 _SCHEMA_SQL 直接带。
+        消费语义=原子（consume 只有置位方拿得到 True），多次点击不会
+        产生重复续跑。"""
+        cols = {r[1] for r in self._db.execute(
+            "PRAGMA table_info(pt_task)")}
+        if "resume_pending" not in cols:
+            self._db.execute(
+                "ALTER TABLE pt_task ADD COLUMN"
+                " resume_pending INTEGER NOT NULL DEFAULT 0")
 
     def _migrate_1_to_2(self) -> None:
         rebuilds = (
@@ -1136,20 +1154,43 @@ class PtStore:
     ) -> bool:
         """条件相变（compare-and-set）：当前相位 ∈ from_phases 才改成
         to_phase。返回是否改成功——并发控制请求（暂停/取消/完成推导）
-        互相竞争时的唯一裁决手段，绝不出现相位回退。"""
+        互相竞争时的唯一裁决手段，绝不出现相位回退。
+        非终态目标一并清 finished_at（同一条 UPDATE=事务一致）：终态
+        重跑（retry/resume）后 running 不得残留旧完成时间；历史完成
+        时间由操作日志（ops.jsonl 的 prev_finished_at）审计保留。"""
         if to_phase not in VALID_TASK_PHASE:
             raise ValueError(f"非法任务状态: {to_phase}")
         t = now_ts or now()
         frm = tuple(from_phases)
         marks = ",".join("?" for _ in frm)
+        clears_finish = (
+            not finished and to_phase not in
+            ("completed", "completed_with_issues", "failed", "cancelled"))
         with self._lock:
             cur = self._db.execute(
                 f"UPDATE pt_task SET phase=?, error=?, updated_at=?"
                 + (", finished_at=?" if finished else "")
+                + (", finished_at=NULL" if clears_finish else "")
                 + f" WHERE id=? AND phase IN ({marks})",
                 (to_phase, error, t, t, task_id, *frm) if finished
                 else (to_phase, error, t, task_id, *frm),
             )
+            return int(cur.rowcount) == 1
+
+    def set_resume_pending(self, task_id: str, on: bool = True) -> None:
+        """置位/复位「继续」意图（幂等：重复置位不叠加语义）。"""
+        with self._lock:
+            self._db.execute(
+                "UPDATE pt_task SET resume_pending=?, updated_at=?"
+                " WHERE id=?", (1 if on else 0, now(), task_id))
+
+    def consume_resume_pending(self, task_id: str) -> bool:
+        """原子消费「继续」意图：只有一个调用方拿到 True（重复点击/
+        并发续跑方都不会二次消费）。"""
+        with self._lock:
+            cur = self._db.execute(
+                "UPDATE pt_task SET resume_pending=0, updated_at=?"
+                " WHERE id=? AND resume_pending=1", (now(), task_id))
             return int(cur.rowcount) == 1
 
     def get_task(self, task_id: str) -> dict | None:
@@ -1338,8 +1379,8 @@ class PtStore:
                 return []
             marks = ",".join("?" for _ in ids)
             self._db.execute(
-                f"UPDATE pt_task SET phase='interrupted', updated_at=?"
-                f" WHERE id IN ({marks})", [t, *ids],
+                f"UPDATE pt_task SET phase='interrupted', updated_at=?,"
+                f" resume_pending=0 WHERE id IN ({marks})", [t, *ids],
             )
             self._db.execute(
                 f"UPDATE pt_task_item SET state='pending',"

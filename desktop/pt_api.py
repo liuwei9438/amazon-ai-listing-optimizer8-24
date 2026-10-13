@@ -213,6 +213,37 @@ class PtApi:
             raise PtApiError(f"单次最多 {_MAX_PIDS} 个商品", 400)
         return out
 
+    def _my_store_ids(self) -> set:
+        """当前账号可用的店铺 id 集（权限边界=服务器店铺清单，token
+        鉴权，客户端不可伪造）。"""
+        stores, err = self._deps["stores"]()
+        if err:
+            raise PtApiError(f"读店铺清单失败：{err}", 502)
+        return {str(s.get("id")) for s in stores}
+
+    def _auth_task(self, task_id: str) -> dict:
+        """任务访问/控制统一闸：不存在与无权限**同一响应**（404「任务
+        不存在」）——不给猜 ID 探测任务存在性的口子。"""
+        task = self._store.get_task(str(task_id))
+        if task is None or task["store_id"] not in self._my_store_ids():
+            raise PtApiError("任务不存在", 404)
+        return task
+
+    def _own_pid_set(self) -> set:
+        """本账号商品 pid 全集（服务器索引一次读取）。status_map 按
+        它过滤：即便同店内混入他人商品，其分类状态/候选元数据也一个
+        都不外泄（服务器端过滤，前端隐藏不算数）。"""
+        try:
+            data = self._deps["prod_list"](None)
+        except Exception:  # noqa: BLE001 —— 索引读不到=宁可拒绝不泄露
+            raise PtApiError("读商品索引时服务器不可达——为避免越权泄露，"
+                             "本次查询取消（稍后重试）", 502)
+        items = (data or {}).get("items")
+        if not (data or {}).get("ok") or not isinstance(items, list):
+            raise PtApiError("商品索引读取失败（稍后重试）", 502)
+        return {str(x.get("pid")) for x in items
+                if isinstance(x, dict) and x.get("pid") is not None}
+
     def _own_products(self, pids: list) -> dict:
         """所有权：逐一经服务器 token 读取（服务器强制归属）。"""
         missing = []
@@ -253,9 +284,11 @@ class PtApi:
         key, provider, model = self._deps["resolve_ai"]()
         mock_url = str(self._deps["mock_url"]() or "")
         live_ok = self._deps["live_env"]() is not None
+        my = self._my_store_ids()          # 只统计自己店铺的任务相位
         counts: dict[str, int] = {}
         for t in self._store.tasks():
-            counts[t["phase"]] = counts.get(t["phase"], 0) + 1
+            if t["store_id"] in my:
+                counts[t["phase"]] = counts.get(t["phase"], 0) + 1
         return {
             "ok": True,
             "stores": [{"id": str(s.get("id") or ""),
@@ -280,15 +313,23 @@ class PtApi:
             (q.get("store") or [""])[0] if isinstance(q.get("store"), list)
             else str(q.get("store") or ""))
         sid, mid = store["id"], store["marketplace_id"]
+        # 权限轴：本账号商品集之外的 pid，其分配/条目元数据一个都不出
+        # （服务器端过滤，不是前端隐藏）
+        own = self._own_pid_set()
         asg = self._store.assignments_all(sid, mid, env=env)
+        items = self._store.latest_item_states(sid, mid, env=env)
         items = self._store.latest_item_states(sid, mid, env=env)
         out: dict = {}
         for pid, a in asg.items():
+            if pid not in own:
+                continue
             out[pid] = {"pt": a.get("pt_name"),
                         "chosen_by": a.get("chosen_by"),
                         "confidence": a.get("confidence"),
                         "state": "classified"}
         for pid, it in items.items():
+            if pid not in own:
+                continue
             row = out.setdefault(pid, {})
             row["task_state"] = it["state"]
             row["error_kind"] = it.get("error_kind") or None
@@ -352,6 +393,13 @@ class PtApi:
         store = self._resolve_store(
             (q.get("store") or [""])[0] if isinstance(q.get("store"), list)
             else str(q.get("store") or ""))
+        # 所有权：候选元数据（官方证据/评分）与商品详情同一道闸
+        try:
+            data = self._deps["prod_list"](pid)
+        except Exception:  # noqa: BLE001
+            raise PtApiError("读商品时服务器不可达", 502)
+        if not (data or {}).get("ok") or not (data or {}).get("product"):
+            raise PtApiError("商品不存在或不归当前账号", 403)
         rows = self._store.candidates(store["id"], store["marketplace_id"],
                                       pid, env=env)
         return {"ok": True, "pid": pid, "env": env,
@@ -368,8 +416,15 @@ class PtApi:
         except (TypeError, ValueError):
             pass
         eng = self._light_engine()
+        my = self._my_store_ids()          # 任务列表只出自己店铺的任务
         rows = []
-        for t in self._store.tasks()[:limit]:
+        n = 0
+        for t in self._store.tasks():
+            if t["store_id"] not in my:
+                continue
+            n += 1
+            if n > limit:
+                break
             pr = eng.task_progress(t["id"])
             rows.append({**t, **({
                 "total": pr.total, "progress_percent": pr.progress_percent,
@@ -381,9 +436,7 @@ class PtApi:
 
     def task_detail(self, task_id: str) -> dict:
         self._user()
-        task = self._store.get_task(str(task_id))
-        if task is None:
-            raise PtApiError("任务不存在", 404)
+        task = self._auth_task(str(task_id))   # 他人任务=同一句 404
         pr = self._light_engine().task_progress(task["id"])
         return {"ok": True, "task": task, "progress": _progress_dict(pr),
                 "env_note": "模拟数据（Mock 演示）"
@@ -391,9 +444,7 @@ class PtApi:
 
     def task_items(self, task_id: str) -> dict:
         self._user()
-        task = self._store.get_task(str(task_id))
-        if task is None:
-            raise PtApiError("任务不存在", 404)
+        task = self._auth_task(str(task_id))   # 条目含 PID/SKU：同闸
         eng = self._light_engine()
         items = []
         for x in eng.item_results(task["id"]):
@@ -449,12 +500,11 @@ class PtApi:
 
     def task_control(self, task_id: str, op: str, body: dict) -> dict:
         user = self._user()
-        task = self._store.get_task(str(task_id))
-        if task is None:
-            raise PtApiError("任务不存在", 404)
+        task = self._auth_task(str(task_id))   # 控制面同闸：越权=不存在
         env, sid = task["env"], task["store_id"]
         eng = self._light_engine()
         tid = task["id"]
+        pending = False     # resume 撞上 pausing 窗口：意图已受理、待落定
         if op == "pause":
             ok = eng.request_pause(tid)
         elif op == "cancel":
@@ -463,6 +513,13 @@ class PtApi:
             ok = eng.resume(tid)
             if ok:
                 self._spawn_run(env, sid, tid)
+            elif task["phase"] == "pausing":
+                # 暂停尚未落定：CAS 抢不到相位是预期竞争而非失败。
+                # 把「继续」意图持久化进任务行，暂停落定时由引擎原子
+                # 消费并自动续跑（状态机层收敛，不是前端延时重试）。
+                # 后到的 pause/cancel 会先压掉该意图——后到指令说了算。
+                self._store.set_resume_pending(tid)
+                pending = True
         elif op == "retry":
             # 显式重试（用户操作）：失败条目拉回 pending 后续跑；
             # needs_review 是人工判断位，绝不自动重跑（模块 7 语义）。
@@ -482,16 +539,24 @@ class PtApi:
                 tid, ("completed", "completed_with_issues", "failed",
                       "paused", "interrupted"), "running")
             if ok:
+                self._store.set_resume_pending(tid, False)  # 意图随重跑达成
                 self._spawn_run(env, sid, tid)
             else:
                 raise PtApiError("重试没抢到运行相位（任务状态刚变了，"
                                  "刷新再看）", 409)
         else:                                    # pragma: no cover
             raise PtApiError("未知操作", 400)
-        self._op(user, f"task_{op}", task_id=tid, ok=bool(ok),
-                 phase=self._store.get_task(tid)["phase"])
+        extra: dict = {"phase": self._store.get_task(tid)["phase"]}
+        if op == "resume":
+            extra["pending"] = bool(pending)
+        if op == "retry":
+            # 历史完成时间审计：cas_task_phase 回 running 时已清
+            # finished_at，旧值只留在操作日志里（可追溯，不误导现态）
+            extra["prev_finished_at"] = task.get("finished_at")
+        self._op(user, f"task_{op}", task_id=tid, ok=bool(ok), **extra)
         cur = self._store.get_task(tid)
-        return {"ok": True, "applied": bool(ok), "task": cur}
+        return {"ok": True, "applied": bool(ok), "pending": bool(pending),
+                "task": cur}
 
     def assignment_confirm(self, pid: str, body: dict) -> dict:
         """人工复核确认（批复五·D / 批复七）：从官方候选证据里选一个

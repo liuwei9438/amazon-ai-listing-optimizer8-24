@@ -227,12 +227,19 @@ class TaskEngine:
             source=source, idem_key=idem_key)
 
     def resume(self, task_id: str) -> bool:
-        """恢复/起跑：created|paused|interrupted → running（CAS）。"""
-        return self._store.cas_task_phase(task_id, RESUMABLE_PHASES, "running")
+        """恢复/起跑：created|paused|interrupted → running（CAS）。
+        成功即清掉挂起的「继续」意图（意图已达成；防崩溃残留的陈旧
+        意图在下个暂停周期被误消费成意外自动续跑）。"""
+        ok = self._store.cas_task_phase(task_id, RESUMABLE_PHASES, "running")
+        if ok:
+            self._store.set_resume_pending(task_id, False)
+        return ok
 
     def request_pause(self, task_id: str) -> bool:
         """请求暂停：在途到安全检查点后 paused（不领新、不强杀）。
-        created/无在途时直接落 paused（无 run 循环可等）。"""
+        created/无在途时直接落 paused（无 run 循环可等）。
+        暂停请求一律压掉挂起的「继续」意图（后到的指令说了算）。"""
+        self._store.set_resume_pending(task_id, False)
         ok = self._store.cas_task_phase(
             task_id, ("created", "running"), "pausing")
         if ok and self._store.task_item_counts(task_id)["running"] == 0:
@@ -241,7 +248,9 @@ class TaskEngine:
 
     def request_cancel(self, task_id: str) -> bool:
         """请求取消：任何活跃相位可请求；终态条目保留、审计不删。
-        无在途时直接收尾（未执行条目记 cancelled）。"""
+        无在途时直接收尾（未执行条目记 cancelled）。取消同样压掉
+        挂起的「继续」意图（取消是终局指令）。"""
+        self._store.set_resume_pending(task_id, False)
         ok = self._store.cas_task_phase(
             task_id, ACTIVE_TASK_PHASES, "cancelling")
         if ok and self._store.task_item_counts(task_id)["running"] == 0:
@@ -292,50 +301,58 @@ class TaskEngine:
         ctx = _Ctx(task_id=task_id, store_id=task["store_id"],
                    marketplace_id=task["marketplace_id"], env=task["env"])
         auth_evt = threading.Event()
-        inflight: set = set()
-        pool = ThreadPoolExecutor(
-            max_workers=self._max_workers,
-            thread_name_prefix=f"pt-{str(task_id)[:16]}")
-        try:
-            while True:
-                phase = self._phase_of(task_id)
-                stop = phase != "running" or auth_evt.is_set()
-                if not stop:
-                    # 补位领取（store 层原子：pending→running，相位门控）
-                    while len(inflight) < self._max_workers:
-                        try:
-                            pid = self._store.claim_item(task_id)
-                        except sqlite3.Error as e:
-                            # 领取层存储故障=任务级不可恢复（批复二）
-                            _LOG.exception("claim_item 存储故障，任务失败")
-                            self._store.set_task_phase(
-                                task_id, "failed",
-                                error=f"领取失败（存储）: {e}")
-                            phase = "failed"
+        while True:
+            # 外层循环：暂停落定时消费到持久化的「继续」意图（相位已回
+            # running）就重建线程池直接续跑；其余相位由 _finalize 如实
+            # 推导后经下方 return 返回。
+            inflight: set = set()
+            pool = ThreadPoolExecutor(
+                max_workers=self._max_workers,
+                thread_name_prefix=f"pt-{str(task_id)[:16]}")
+            try:
+                while True:
+                    phase = self._phase_of(task_id)
+                    stop = phase != "running" or auth_evt.is_set()
+                    if not stop:
+                        # 补位领取（store 层原子：pending→running，相位门控）
+                        while len(inflight) < self._max_workers:
+                            try:
+                                pid = self._store.claim_item(task_id)
+                            except sqlite3.Error as e:
+                                # 领取层存储=任务级不可恢复（批复二）
+                                _LOG.exception("claim_item 存储故障，任务失败")
+                                self._store.set_task_phase(
+                                    task_id, "failed",
+                                    error=f"领取失败（存储）: {e}")
+                                phase = "failed"
+                                break
+                            if pid is None:
+                                break
+                            inflight.add(pool.submit(
+                                self._process_item_safe, ctx, pid, auth_evt))
+                        if phase == "failed":
                             break
-                        if pid is None:
-                            break
-                        inflight.add(pool.submit(
-                            self._process_item_safe, ctx, pid, auth_evt))
-                    if phase == "failed":
+                    if inflight:
+                        # 等任一在途到检查点/终态（暂停不强杀：等它自己到边界）
+                        _, inflight = self._wait_some(inflight)
+                        continue
+                    if stop:
                         break
-                if inflight:
-                    # 等任一在途到检查点/终态（暂停不强杀：等它自己到边界）
-                    _, inflight = self._wait_some(inflight)
-                    continue
-                if stop:
-                    break
-                # 无在途：失败预算内的条目拉回 pending 继续本轮
-                requeued = self._store.requeue_retryable(
-                    task_id, self._item_max_attempts)
-                counts = self._store.task_item_counts(task_id)
-                if counts["pending"] == 0:
-                    break                       # 全部条目已到终态
-                if requeued == 0:
-                    time.sleep(0.01)            # 有 pending 领不出=相位瞬变
-        finally:
-            pool.shutdown(wait=True)
-        return self._finalize(task_id, auth_evt)
+                    # 无在途：失败预算内的条目拉回 pending 继续本轮
+                    requeued = self._store.requeue_retryable(
+                        task_id, self._item_max_attempts)
+                    counts = self._store.task_item_counts(task_id)
+                    if counts["pending"] == 0:
+                        break                   # 全部条目已到终态
+                    if requeued == 0:
+                        time.sleep(0.01)        # 有 pending 领不出=相位瞬变
+            finally:
+                pool.shutdown(wait=True)
+            task = self._finalize(task_id, auth_evt)
+            if task["phase"] != "running" or auth_evt.is_set():
+                return task
+            # running=消费到了挂起的「继续」意图：回到外层循环顶部
+            # 重建线程池续跑（无需任何再点击）。
 
     # ------------------------------------------------------------------
     # 进度与结果（批复九：真源=逐商品状态，不依赖内存计数器）
@@ -777,6 +794,11 @@ class TaskEngine:
             cur = self._store.get_task(task_id)
             self._store.cas_task_phase(
                 task_id, ("pausing",), "paused", error=cur["error"])
+            # 暂停刚落定：消费 pausing 窗口里持久化的「继续」意图——
+            # 立即回 running，run() 外层循环会重建线程池续跑（多次
+            # 点击只有一个消费方，绝不重复执行）
+            if self._store.consume_resume_pending(task_id):
+                self._store.cas_task_phase(task_id, ("paused",), "running")
         elif phase == "cancelling":
             # 未执行条目记 cancelled；终态条目（含已完成结果）原样保留
             for it in self._store.task_items(

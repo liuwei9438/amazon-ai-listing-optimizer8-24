@@ -158,7 +158,9 @@ function ptRenderTaskCard() {
       ? ` · 失败 ${(t.retryable_failed || 0) + (t.permanent_failed || 0)}` : "")
     + (t.id ? ` · 任务 ${String(t.id).slice(0, 14)}…` : "");
   pt$("ptPause").disabled = !["running", "created"].includes(t.phase);
-  pt$("ptResume").disabled = !["paused", "interrupted"].includes(t.phase);
+  // pausing 窗口也允许点「继续」：后端把意图持久化受理，落定后自动
+  // 续跑（响应 pending=true→toast 已接受；绝不静默丢弃用户指令）
+  pt$("ptResume").disabled = !["paused", "interrupted", "pausing"].includes(t.phase);
   pt$("ptCancel").disabled = !PT_ACTIVE.has(t.phase);
   pt$("ptRetry").disabled =
     !["completed", "completed_with_issues", "failed", "paused", "interrupted"].includes(t.phase);
@@ -178,7 +180,13 @@ async function ptTaskOp(op) {
   if (op === "cancel" && !confirm("确定取消这个分类任务？已完成的结果会保留。")) return;
   try {
     busy(true, "操作中…");
-    await api(`/api/pt/tasks/${encodeURIComponent(PT.taskId)}/${op}`, {});
+    const r = await api(`/api/pt/tasks/${encodeURIComponent(PT.taskId)}/${op}`, {});
+    if (r && r.pending) {
+      // resume 撞上 pausing 窗口：意图已持久化受理，落定后自动续跑
+      toast("已接受：任务正在暂停落定，之后会自动继续");
+    } else if (r && !r.applied) {
+      toast("未生效：任务状态已变化，已刷新为最新状态");
+    }
     await ptTickNow();
   } catch (e) {
     toast(e.message, "err");
