@@ -4386,10 +4386,19 @@ class Handler(BaseHTTPRequestHandler):
 
             # ---- 亚马逊上传（D1.4.0） ----
             if url.path == "/api/amazon/config":
-                # 保存授权配置（空值不覆盖，防止误清）；test=1 顺手自检
+                # 遗留路由（v14.7 安全加固）：D1.6.0 智赢式授权后前端已
+                # 不再调用；仅管理员可用，且不再把 client_secret /
+                # refresh_token 写进本机 config.json——密钥只进服务器。
+                # 旧配置里已有的值原样保留（不删除，本机旧凭证回退路径
+                # 仍可读），空值依旧不覆盖防误清。
+                if not is_admin():
+                    self._json(
+                        {"ok": False, "error": "只有管理员能改授权配置"},
+                        403,
+                    )
+                    return
                 amz = dict(CONFIG.get("amazon") or {})
-                for k in ("client_id", "client_secret", "refresh_token",
-                          "seller_id", "app_id"):
+                for k in ("client_id", "seller_id", "app_id"):
                     v = str(body.get(k) or "").strip()
                     if v:
                         amz[k] = v
