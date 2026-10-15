@@ -2254,13 +2254,39 @@ async function openAmz() {
   $("amzProg").classList.add("hidden");
   $("amzResult").innerHTML = "";
   $("amzCfgBox").classList.add("hidden");
+  await azMarketsFill();   // D1.12.2：先出站点下拉（静态清单，不等 Worker）
   await refreshAmz();
+}
+
+// D1.12.2：站点下拉独立取数。/api/amazon/markets 是纯静态接口（本地
+// _MARKETPLACES，无 Worker 调用），Worker 不可达导致 status 慢/失败时，
+// 两张表单的站点下拉也能立即出全；拿不到就留给 refreshAmz 兜底。
+async function azMarketsFill() {
+  if ($("azMarket").options.length) return;
+  try {
+    const m = await api("/api/amazon/markets");
+    if ((m.markets || []).length) {
+      $("azMarket").innerHTML = m.markets.map(([id, label]) =>
+        `<option value="${esc(id)}">${esc(label)}</option>`).join("");
+      $("azImpMarket").innerHTML = $("azMarket").innerHTML;
+    }
+  } catch (e) { /* 静态清单拿不到：保持现状，refreshAmz 会再试 */ }
 }
 
 async function refreshAmz() {
   try {
     const s = await api("/api/amazon/status");
     AZ.status = s;
+
+    // D1.12.2：站点下拉最先填（纯静态数据）——即使后面任何渲染步骤
+    // 出问题，两张表单的站点选择也保持可用
+    const impVal = $("azImpMarket").value;   // 记住导入表单当前选择（''=还没选）
+    $("azMarket").innerHTML = (s.markets || []).map(([id, label]) =>
+      `<option value="${esc(id)}" ${id === s.marketplace ? "selected" : ""}>${esc(label)}</option>`).join("");
+    $("azImpMarket").innerHTML = $("azMarket").innerHTML;       // 导入表单站点同源
+    // 重建 options 会连带清掉用户已选站点，这里还原；没选过才跟默认走
+    $("azImpMarket").value = impVal || $("azMarket").value;
+
     const stores = s.stores || [];
     const mkName = (id) => {
       const m = (s.markets || []).find(([i]) => i === id);
@@ -2291,10 +2317,6 @@ async function refreshAmz() {
     AZ.up = s.uploaded || {};
     azByCatRender();
 
-    $("azMarket").innerHTML = (s.markets || []).map(([id, label]) =>
-      `<option value="${esc(id)}" ${id === s.marketplace ? "selected" : ""}>${esc(label)}</option>`).join("");
-    $("azImpMarket").innerHTML = $("azMarket").innerHTML;       // 导入表单站点同源
-    $("azImpMarket").value = $("azMarket").value;
     $("azType").value = s.product_type === "PRODUCT" ? "" : s.product_type;
 
     // D1.5.0：分类→商品类型映射，自动填（精确路径优先，其次顶级段）

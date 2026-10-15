@@ -42,7 +42,7 @@ ROOT = APP_DIR.parent                          # 仓库根
 os.chdir(ROOT)                                 # 引擎的 tasks/ 落在根目录
 sys.path.insert(0, str(ROOT))
 
-VERSION = "D1.12.1"
+VERSION = "D1.12.2"
 APP_DIR_NAME = "app"
 
 DEFAULT_CONFIG = {
@@ -3451,6 +3451,19 @@ class Handler(BaseHTTPRequestHandler):
                     self._json(
                         {"ok": False, "error": f"取图失败：{exc}"}, 502
                     )
+                return
+
+            # D1.12.2：站点清单独立轻量接口。纯静态 _MARKETPLACES（公开数据，
+            # 不碰 Worker、不回任何密钥）——status 要聚合多个 Worker 调用，
+            # Worker 不可达时慢（十几秒）甚至失败，下拉框不该被它拖住。
+            if url.path == "/api/amazon/markets":
+                self._json({
+                    "ok": True,
+                    "markets": [
+                        [i, f"{v[2]}（{v[0].upper()}）"]
+                        for i, v in _MARKETPLACES.items()
+                    ],
+                })
                 return
 
             # ---- 亚马逊上传（D1.4.1）：店铺清单 / 任务进度（不回显密钥） ----
