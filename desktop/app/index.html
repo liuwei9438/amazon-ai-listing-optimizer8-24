@@ -41,6 +41,7 @@
   <nav id="sidenav" class="sidenav">
     <div class="nav-cap">产品</div>
     <div class="nav-item on" data-view="list" title="全部产品">📋 产品列表</div>
+    <div class="nav-item" data-view="pt" title="亚马逊 AI 分类（Product Type / 分类节点 / 属性缺口 / 人工复核）">🧭 亚马逊 AI 分类</div>
     <div class="nav-item" data-view="cat" title="分类管理 + 分类产品">🗂 产品分类</div>
     <div class="nav-item" data-view="recycle" title="已删除的分类">♻️ 分类回收站</div>
     <div class="nav-item" data-view="words" title="侵权词对照表 + 分类→商品类型映射（上传时自动替换/自动填）">🛡 侵权词库</div>
@@ -121,6 +122,71 @@
         <tbody id="btBody"></tbody>
       </table>
       <div id="btEmpty" class="empty hidden" style="padding:40px 0">还没有映射。节点 ID 从亚马逊后台（添加商品时的分类选择页）或已刊登商品的分类里能查到。</div>
+    </div>
+
+    <!-- ============ 🧭 亚马逊 AI 分类（pt 模块 8：A 商品列表 / C 任务中心 / B·D 侧板详情与复核） ============ -->
+    <div id="ptBox" class="pt-root hidden">
+      <div class="pt-top">
+        <label>店铺</label>
+        <select id="ptStore" class="inp" style="max-width:200px"></select>
+        <label>环境</label>
+        <select id="ptEnv" class="inp" style="max-width:150px">
+          <option value="live">官方环境（Live）</option>
+          <option value="mock">模拟环境（Mock·演示用）</option>
+        </select>
+        <button id="ptRefresh" class="btn small">🔄 刷新</button>
+        <span id="ptAiState" class="d-imghint"></span>
+        <span id="ptMockBadge" class="pt-mock hidden">模拟数据（不是官方结论）</span>
+      </div>
+
+      <!-- C 批量任务中心（刷新/重开自动从库里恢复） -->
+      <div id="ptTaskCard" class="task-card hidden">
+        <div class="task-head">
+          <b>🧭 分类任务</b><span id="ptTaskPhase" class="chip"></span>
+          <span id="ptTaskMsg" class="task-msg"></span>
+          <span class="task-acts">
+            <button id="ptPause" class="btn small">⏸ 暂停</button>
+            <button id="ptResume" class="btn small">▶ 继续</button>
+            <button id="ptCancel" class="btn small">⛔ 取消</button>
+            <button id="ptRetry" class="btn small">🔁 重试失败</button>
+            <button id="ptCloseTask" class="btn small">✖ 收起</button>
+          </span>
+        </div>
+        <div class="bar"><div id="ptTaskBar" class="bar-in"></div></div>
+        <div id="ptTaskStat" class="task-stat"></div>
+      </div>
+      <div id="ptTaskList" class="pt-tasklist"></div>
+
+      <div class="pt-main">
+        <!-- A 商品列表 -->
+        <div class="pt-list">
+          <div class="tabs small" id="ptFilterTabs"></div>
+          <div class="filter-row">
+            <input id="ptQ" class="inp grow" placeholder="搜索：标题 / SKU">
+            <button id="ptBatch" class="btn primary small">🧭 批量 AI 分类（0）</button>
+            <button id="ptBackList" class="btn small hidden">↩ 返回商品列表</button>
+          </div>
+          <table class="recycle-table">
+            <thead><tr>
+              <th style="width:36px"><input type="checkbox" id="ptSelAll"></th>
+              <th>商品</th><th style="width:120px">当前分类</th>
+              <th style="width:110px">任务状态</th><th style="width:90px">操作</th>
+            </tr></thead>
+            <tbody id="ptBody"></tbody>
+          </table>
+          <div id="ptEmpty" class="empty hidden" style="padding:36px 0">这里会列出产品库里的商品和它们的 AI 分类进度。</div>
+        </div>
+
+        <!-- B 分类详情 / D 人工复核（侧板） -->
+        <div id="ptDetail" class="pt-detail hidden">
+          <div class="pt-detail-head">
+            <b id="ptdTitle"></b>
+            <button id="ptdClose" class="btn ghost small">✖</button>
+          </div>
+          <div id="ptdEnv" class="d-imghint"></div>
+          <div id="ptdBody" class="pt-detail-body"></div>
+        </div>
+      </div>
     </div>
 
     <!-- 优化任务卡 -->
@@ -517,5 +583,6 @@
 <div id="busy" class="busy hidden"><div class="busy-box"><div class="spin"></div><span id="busyText">处理中…</span></div></div>
 
 <script src="/app.js"></script>
+<script src="/pt.js"></script>
 </body>
 </html>

@@ -3191,6 +3191,74 @@ def _amz_start_upload(
 # HTTP 服务
 # =====================================================
 
+# =====================================================
+# 亚马逊 AI 分类（pt 模块 8）：独立适配层装配。
+# 只在此处把 main 侧能力注入 pt_api.PtApi——pt 包/pt_api 均不
+# import main（工程约束）；HTTP 转发在 Handler.do_GET/do_POST
+# 各一行（/api/pt/* 前缀），其余路由零改动。
+# =====================================================
+
+try:
+    import pt_api as _pt_api_mod
+    from pt.spapi_client import ProxyConfig, build_environment
+
+    def _pt_cfg() -> dict:
+        return CONFIG.get("pt") or {}
+
+    def _pt_live_env():
+        """live 传输环境（官方端点白名单 + 可选代理 + Schema 允许列表
+        fail-closed：没登记的宿主一律拒下载）。没配置=不具备 live 能力。"""
+        c = _pt_cfg()
+        mode = str(c.get("live_transport") or "direct")
+        if mode == "proxy":
+            px = c.get("proxy") or {}
+            if not (px.get("url") or "").strip():
+                return None
+            return build_environment(
+                "proxy",
+                proxy=ProxyConfig(url=str(px["url"]),
+                                  user=str(px.get("user") or ""),
+                                  password=str(px.get("password") or "")),
+                schema_hosts=c.get("schema_hosts"))
+        if mode != "direct":
+            return None
+        return build_environment("direct",
+                                 schema_hosts=c.get("schema_hosts"))
+
+    def _pt_store_token(sid: str) -> str:
+        """店铺 SP-API 短令牌（密钥不落地，与上传管道同源不同实例：
+        pt 不依赖上传上下文 _AMZ_RUN）。"""
+        r = _amz_store_api({"action": "token", "id": sid}, timeout=25)
+        if not r.get("ok") or not str(r.get("access_token") or ""):
+            raise RuntimeError(
+                "拿店铺令牌失败："
+                + str(r.get("error") or "服务器没返回令牌")[:200]
+            )
+        return str(r["access_token"])
+
+    PT_API = _pt_api_mod.PtApi(app_dir=APP_DIR, deps={
+        "user": lambda: _logged_user(),
+        "prod_list": lambda pid: src_api(
+            "/prod_list", _prod_auth() | {"pid": pid}, timeout=30),
+        "stores": _amz_stores,
+        "active_store_id": lambda: str(
+            (CONFIG.get("amazon") or {}).get("active_store") or ""),
+        "resolve_ai": resolve_ai,
+        "ai_base": lambda: str(
+            (_pt_cfg().get("ai") or {}).get("base")
+            or (CONFIG.get("ai") or {}).get("base") or ""),
+        "mock_url": lambda: str(_pt_cfg().get("mock_url") or ""),
+        "live_env": _pt_live_env,
+        "store_token": _pt_store_token,
+    })
+except Exception:                       # pt 装配失败不拖垮主程序
+    import traceback as _pt_tb
+
+    print("[pt] 适配层装配失败，/api/pt/* 将不可用：")
+    _pt_tb.print_exc()
+    PT_API = None
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -3260,12 +3328,20 @@ class Handler(BaseHTTPRequestHandler):
         url = urlparse(self.path)
         q = parse_qs(url.query)
 
+        if url.path.startswith("/api/pt/"):
+            if PT_API is None:
+                self._json({"ok": False, "error": "pt 模块不可用"}, 503)
+            else:
+                payload, code = PT_API.handle("GET", url.path, q, None)
+                self._json(payload, code)
+            return
+
         try:
             if url.path in ("/", "/index.html"):
                 self._static("index.html")
                 return
 
-            if url.path in ("/app.js", "/style.css"):
+            if url.path in ("/app.js", "/style.css", "/pt.js"):
                 self._static(url.path.lstrip("/"))
                 return
 
@@ -3536,6 +3612,14 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         url = urlparse(self.path)
         body = self._body()
+
+        if url.path.startswith("/api/pt/"):
+            if PT_API is None:
+                self._json({"ok": False, "error": "pt 模块不可用"}, 503)
+            else:
+                payload, code = PT_API.handle("POST", url.path, {}, body)
+                self._json(payload, code)
+            return
 
         try:
             if url.path == "/api/login":

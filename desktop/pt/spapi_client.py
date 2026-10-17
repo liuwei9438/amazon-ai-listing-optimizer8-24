@@ -1,0 +1,1105 @@
+# -*- coding: utf-8 -*-
+"""pt.spapi_client —— 第一阶段模块 2：SP-API 客户端（注入式适配层）。
+
+覆盖四个官方操作（契约逐字抄自官方 OpenAPI，2026-10-10 从
+developer-docs.amazon 抓取核对，规范镜像存 spec_ptd_*.json/spec_cat_*.json）：
+
+  操作                          方法  路径                                     用量计划
+  searchDefinitionsProductTypes GET   /definitions/2020-09-01/productTypes      5 rps / burst 10
+  getDefinitionsProductType     GET   /definitions/2020-09-01/productTypes/{pt} 5 rps / burst 10
+  searchCatalogItems            GET   /catalog/2022-04-01/items                 2 rps / burst 2
+  getCatalogItem                GET   /catalog/2022-04-01/items/{asin}          2 rps / burst 2
+
+另含模块 6 的受限下载 fetch_schema()（非官方 API 操作，是 PTD
+schema.link 签名 URL 的 GET）：scheme/http(s)-only、宿主允许列表与主
+接口端点分开管理（live 默认空=fail-closed，2026-10-12 修正 1）、DNS
+解析须公网地址（拒内网/回环/链路本地/云元数据）、重定向禁跨主机禁降级、
+不带令牌、大小/超时/有界重试上帽、查询串（签名参数）绝不入文。
+
+工程约束（模块 2 批复 12 条）在代码中的落点：
+  3  不 import main：运行环境（build_environment 三模式 direct/proxy/mock）、
+     取令牌回调全部构造注入，main 在装配期把自己的 SP-API 请求能力
+     （代理配置、令牌、区域表）注入进来。direct=显式直连官方端点；
+     proxy=经指定代理（认证只进 opener，repr/日志零秘密，代理失败只报
+     网络错误、绝不擅自改道直连）；mock=只访问 mock_url，物理上发不出
+     真实请求。
+  4  错误分类：SpApiAuthError(401) / SpApiForbiddenError(403) /
+     SpApiBadRequestError(400 及 413/415 等其他 4xx) / SpApiNotFoundError(404) /
+     SpApiRateLimitError(429) / SpApiServerError(5xx) / SpApiNetworkError(网络
+     超时/连接失败) / SpApiParseError(响应不是合法官方形状) /
+     SpApiEnvironmentError(环境隔离违反)。
+  5  有界重试：仅 429 / 5xx / 网络错误重试（本客户端四个操作全是 GET，天然
+     幂等；重试引擎按 method==GET 守卫，非幂等操作永不自动重试）。指数退避
+     base=0.5s 翻倍，上限 max_delay；429 优先遵守 Retry-After（秒），超过
+     retry_after_cap 直接放弃返回限流错误，绝不无限等。
+  6  限流：每操作独立 RateLimiter（官方用量计划做缺省），可构造覆盖；每次
+     响应读 x-amzn-RateLimit-Limit 实时修正速率。
+  7  区域正确：marketplace_id → 区域端点（18 站点表与 main._MARKETPLACES
+     逐条一致），未知站点直接 ValueError，绝不猜区域。
+  9  Mock/Live 严格隔离（模块 2 修正 2）：可信判定=客户端环境配置——
+     mock 环境的结果一律 SpApiResult.mock=True；live 环境结果只能来自
+     官方端点白名单（正则校验），且一旦出现 X-WZ-Mock 头立即抛
+     SpApiEnvironmentError 作废。响应头只是交叉校验，不是判定依据。
+  10 认证秘密绝不入日志/异常文本：令牌只在发请求瞬间进 header；代理
+     密码只进 urllib opener（ProxyConfig repr 已抹除）；异常只带状态码、
+     官方 ErrorList、request id。
+"""
+
+from __future__ import annotations
+
+import ipaddress
+import json
+import re
+import socket
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass, field
+from typing import Any, Callable, Iterable
+
+# ---------------------------------------------------------------------------
+# 官方契约常量（逐字抄自官方 OpenAPI，禁止手改）
+# ---------------------------------------------------------------------------
+
+PTD_BASE = "/definitions/2020-09-01"
+CATALOG_BASE = "/catalog/2022-04-01"
+
+# searchDefinitionsProductTypes.query.keywords 与 itemName 官方互斥
+# （描述原文："Cannot be used with ..."）
+# searchCatalogItems.query.identifiers 与 keywords 官方互斥；
+# identifiersType "is required when identifiers is in the request"；
+# classificationIds "Cannot be used with identifiers"；
+# identifiers/keywords 官方 maxItems=20；marketplaceIds maxItems=1。
+
+IDENTIFIERS_TYPES = frozenset({
+    "ASIN", "EAN", "GTIN", "ISBN", "JAN", "MINSAN", "SKU", "UPC",
+})
+INCLUDED_DATA = frozenset({
+    "attributes", "classifications", "dimensions", "identifiers", "images",
+    "productTypes", "relationships", "salesRanks", "summaries", "vendorDetails",
+})
+REQUIREMENTS = frozenset({
+    "LISTING", "LISTING_PRODUCT_ONLY", "LISTING_OFFER_ONLY",
+})
+REQUIREMENTS_ENFORCED = frozenset({"ENFORCED", "NOT_ENFORCED"})
+PARENTAGE_LEVEL = frozenset({"NONE", "CHILD", "PARENT"})
+# getDefinitionsProductType.locale 官方枚举（39 值，逐字抄）
+PTD_LOCALES = frozenset({
+    "DEFAULT", "ar", "ar_AE", "de", "de_DE", "en", "en_AE", "en_AU", "en_CA",
+    "en_GB", "en_IN", "en_SG", "en_US", "es", "es_ES", "es_MX", "es_US", "fr",
+    "fr_CA", "fr_FR", "it", "it_IT", "ja", "ja_JP", "nl", "nl_NL", "pl",
+    "pl_PL", "pt", "pt_BR", "pt_PT", "sv", "sv_SE", "tr", "tr_TR", "zh",
+    "zh_CN", "zh_TW",
+})
+
+# 18 站点 marketplace_id → 区域（与 main._MARKETPLACES 逐条一致）
+REGION_BY_MARKETPLACE = {
+    "ATVPDKIKX0DER": "na", "A2EUQ1WTGCTBG2": "na",
+    "A1AM78C64UM0Y8": "na", "A2Q3Y263D00KWC": "na",
+    "A1F83G8C2ARO7P": "eu", "A1PA6795UKMFR9": "eu",
+    "A13V1IB3VIYZZH": "eu", "APJ6JRA9NG5V4": "eu",
+    "A1RKKUPIHCS9HS": "eu", "A2NODRKZP88ZB9": "eu",
+    "A1805IZSGTT6HS": "eu", "A1C3SOZRARQ6R3": "eu",
+    "A2VIGQ35RCS4UG": "eu", "A17E79C6D8DWNP": "eu",
+    "A21TJRUUN4KGV": "eu",
+    "A1VC38T7YXB528": "fe", "A39IBJ37TRP1C6": "fe",
+    "A19VAU5U5O7RUS": "fe",
+}
+REGION_HOSTS = {
+    "na": "https://sellingpartnerapi-na.amazon.com",
+    "eu": "https://sellingpartnerapi-eu.amazon.com",
+    "fe": "https://sellingpartnerapi-fe.amazon.com",
+}
+
+# 官方用量计划缺省值（页内 Usage Plan 表逐字抄）
+DEFAULT_RATE_PLANS = {
+    "search_product_types": (5.0, 10.0),
+    "get_product_type": (5.0, 10.0),
+    "search_catalog_items": (2.0, 2.0),
+    "get_catalog_item": (2.0, 2.0),
+}
+
+
+def official_endpoint(marketplace_id: str) -> str:
+    """marketplace → 区域端点；未知站点 ValueError（绝不猜区域）。"""
+    region = REGION_BY_MARKETPLACE.get(marketplace_id)
+    if region is None:
+        raise ValueError(
+            f"未知 marketplace_id：{marketplace_id!r}（已知 "
+            f"{len(REGION_BY_MARKETPLACE)} 个官方站点）"
+        )
+    return REGION_HOSTS[region]
+
+
+# ---------------------------------------------------------------------------
+# 错误分类（要求 4）
+# ---------------------------------------------------------------------------
+
+
+class SpApiError(Exception):
+    """SP-API 调用失败基类。携带 op / marketplace_id / HTTP 状态 / 官方
+    ErrorList（{code,message,details?} 列表）/ x-amzn-RequestId。
+    绝不携带请求头或令牌（要求 10）。"""
+
+    def __init__(self, message: str, *, op: str = "", marketplace_id: str = "",
+                 status: int | None = None,
+                 errors: list[dict] | None = None,
+                 request_id: str | None = None):
+        self.op = op
+        self.marketplace_id = marketplace_id
+        self.status = status
+        self.errors = errors or []
+        self.request_id = request_id
+        super().__init__(message)
+
+    def official_messages(self) -> list[str]:
+        out = []
+        for e in self.errors:
+            m = f"[{e.get('code','')}] {e.get('message','')}".strip()
+            if e.get("details"):
+                m += f" ({e['details']})"
+            out.append(m)
+        return out
+
+
+class SpApiAuthError(SpApiError):
+    """401 认证失败 / 令牌获取失败。"""
+
+
+class SpApiForbiddenError(SpApiError):
+    """403 权限不足。"""
+
+
+class SpApiBadRequestError(SpApiError):
+    """400 参数错误（含 413/415 等其他 4xx）。"""
+
+
+class SpApiNotFoundError(SpApiError):
+    """404 资源不存在。"""
+
+
+class SpApiRateLimitError(SpApiError):
+    """429 限流（重试耗尽或 Retry-After 超帽后抛出）。"""
+
+    def __init__(self, *a, retry_after: float | None = None, **kw):
+        self.retry_after = retry_after
+        super().__init__(*a, **kw)
+
+
+class SpApiServerError(SpApiError):
+    """5xx 服务端错误（重试耗尽后抛出）。"""
+
+
+class SpApiNetworkError(SpApiError):
+    """连接失败 / 超时（重试耗尽后抛出）。"""
+
+    def __init__(self, message, *, phase: str = "connect", **kw):
+        # phase: "timeout"（发出后超时）/ "connect"（根本没连上）
+        self.phase = phase
+        super().__init__(message, **kw)
+
+
+class SpApiParseError(SpApiError):
+    """200 但响应体不是官方合法形状（非 JSON / 缺必填字段）。"""
+
+
+# ---------------------------------------------------------------------------
+# 结果对象（要求 9：mock 显式标记）
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SpApiResult:
+    op: str                      # search_product_types / ... / fetch_schema
+    marketplace_id: str
+    status: int
+    data: Any                    # 官方响应原样（dict）
+    mock: bool = False           # 可信环境判定：mock 环境恒 True（铁律）
+    request_id: str | None = None
+    rate_limit: float | None = None   # 本次响应 x-amzn-RateLimit-Limit
+    attempts: int = 1            # 含重试的总尝试次数
+    elapsed: float = 0.0         # 秒
+    raw: bytes = b""             # 模块 6：Schema 下载的原始字节（哈希/落盘用）
+
+
+# ---------------------------------------------------------------------------
+# 限流（要求 6）
+# ---------------------------------------------------------------------------
+
+
+class RateLimiter:
+    """令牌桶（速率 rps + 桶容量 burst）。acquire() 阻塞到有令牌；
+    等待封顶 max_wait 秒（防外部时钟/参数异常导致死等）。"""
+
+    def __init__(self, rate: float, burst: float, max_wait: float = 20.0):
+        self.rate = max(float(rate), 0.01)
+        self.burst = max(float(burst), 1.0)
+        self.max_wait = float(max_wait)
+        self._tokens = self.burst
+        self._last = time.monotonic()
+        self._lock = threading.Lock()
+
+    def _refill(self) -> None:
+        now = time.monotonic()
+        self._tokens = min(self.burst,
+                           self._tokens + (now - self._last) * self.rate)
+        self._last = now
+
+    def acquire(self) -> float:
+        """返回实际等待的秒数。"""
+        with self._lock:
+            self._refill()
+            if self._tokens >= 1.0:
+                self._tokens -= 1.0
+                return 0.0
+            need = 1.0 - self._tokens
+            wait = min(need / self.rate, self.max_wait)
+            time.sleep(wait)
+            self._refill()
+            self._tokens = max(self._tokens - 1.0, 0.0)
+            return wait
+
+    def update_rate(self, rate: float) -> None:
+        """用响应头 x-amzn-RateLimit-Limit 实测速率修正（burst 不变）。"""
+        with self._lock:
+            try:
+                r = float(rate)
+            except (TypeError, ValueError):
+                return
+            if r > 0:
+                self.rate = r
+
+
+# ---------------------------------------------------------------------------
+# 传输层与环境隔离（模块 2 修正：显式 Direct/Proxy/Mock 三模式）
+# ---------------------------------------------------------------------------
+
+Transport = Callable[[str, str, dict, float], tuple[int, dict, bytes]]
+# transport(method, url, headers, timeout) -> (status, headers小写dict, body字节)
+
+TRANSPORT_MODES = ("direct", "proxy", "mock")
+
+# 官方 SP-API 端点唯一合法形态（live 环境的目标白名单）
+OFFICIAL_HOST_RE = re.compile(r"^sellingpartnerapi-(na|eu|fe)\.amazon\.com$")
+
+
+class SpApiEnvironmentError(SpApiError):
+    """环境隔离被违反：live 环境碰了非官方端点 / mock 环境要出网 /
+    live 环境收到 X-WZ-Mock 响应头。结果一律作废，绝不降级放行。"""
+
+
+@dataclass
+class ProxyConfig:
+    """代理配置由 main 的配置体系注入本模块（代理地址、认证）。
+    密码只进 urllib opener，repr/日志永不携带（repr=False）。"""
+    url: str                        # 如 http://127.0.0.1:1080（可含认证）
+    user: str = field(default="", repr=False)
+    password: str = field(default="", repr=False)
+
+
+@dataclass
+class Environment:
+    """可信运行环境（模块 2 修正 2：Mock/Live 由客户端配置确定，不靠响应头）。
+
+    mode="mock"：transport 只允许访问 mock_url 的主机，endpoint_for 恒回
+    mock_url——物理上发不出真实请求，结果一律 mock=True。
+    mode="live"：transport 只允许官方 SP-API 端点（正则白名单）∪
+    schema_hosts（Schema 下载允许列表，模块 6 修正 1——默认空=一律
+    拒绝，fail-closed），endpoint_for=官方区域表；若响应带 X-WZ-Mock
+    头（说明被指到模拟服务）立即抛 SpApiEnvironmentError，结果作废。
+    """
+    mode: str                       # "mock" | "live"
+    transport: Transport
+    endpoint_for: Callable[[str], str]
+    schema_hosts: frozenset[str] = frozenset()   # Schema 下载宿主允许列表
+
+
+def _proxy_url_with_auth(proxy: ProxyConfig) -> str:
+    """把 user/password 并进代理 URL（认证信息只在这里出现，绝不进日志）。"""
+    url = proxy.url.strip()
+    if not url:
+        raise ValueError("ProxyConfig.url 不能为空")
+    if proxy.user or proxy.password:
+        if "@" in url.split("://", 1)[-1]:
+            return url                       # URL 自带认证，原样用
+        scheme, _, rest = url.partition("://")
+        cred = urllib.parse.quote(proxy.user or "") + ":" + \
+            urllib.parse.quote(proxy.password or "")
+        return f"{scheme}://{cred}@{rest}"
+    return url
+
+
+def _urllib_call(opener, method: str, url: str, headers: dict,
+                 timeout: float) -> tuple[int, dict, bytes]:
+    """统一 urllib 调用：HTTPError 拆成三元组返回（状态分类在客户端做）。"""
+    req = urllib.request.Request(url, method=method, headers=headers)
+    try:
+        with opener.open(req, timeout=timeout) as resp:
+            return int(resp.status), _lc(resp.headers), resp.read()
+    except urllib.error.HTTPError as e:
+        body = b""
+        try:
+            body = e.read()
+        except Exception:  # noqa: BLE001
+            pass
+        return int(e.code), _lc(e.headers), body
+
+
+def _host_of(url: str) -> str:
+    return (urllib.parse.urlparse(url).hostname or "").lower()
+
+
+def _assert_official(url: str) -> None:
+    """仅官方端点（=允许列表为空的特例）。"""
+    _assert_official_or(url, frozenset())
+
+
+def _assert_host(url: str, allowed_host: str) -> None:
+    host = _host_of(url)
+    if host != allowed_host.lower():
+        raise SpApiEnvironmentError(
+            f"mock 环境只允许访问 {allowed_host}，拒绝目标：{host}")
+
+
+# ---- 模块 6 修正 1：Schema 下载端点与主接口端点分开管理 ----
+# 主接口（四操作）：恒为官方 SP-API 域名白名单（OFFICIAL_HOST_RE）。
+# Schema 下载：官方 SchemaLink 是独立签名的托管链接，宿主与主接口不同
+# ——允许列表单独配置（build_environment(schema_hosts=…)，装配期注入），
+# **默认空=一律拒绝（fail-closed）**。禁止凭猜测预填域名：待真实
+# PTD 响应观测到官方 SchemaLink 实际宿主后，由配置登记，不无限放开。
+
+def _assert_official_or(url: str, extra_hosts: frozenset[str]) -> None:
+    """live 传输目标=官方 SP-API 域名 ∪ Schema 下载允许列表。"""
+    host = _host_of(url)
+    if not OFFICIAL_HOST_RE.match(host) and host not in extra_hosts:
+        raise SpApiEnvironmentError(
+            f"live 环境只允许官方 SP-API 端点或已配置的 Schema 下载"
+            f"域名允许列表，拒绝目标：{host}")
+
+
+def _is_public_ip(addr: str) -> bool:
+    """公网单播才放行：回环/内网(RFC1918)/链路本地（含云元数据
+    169.254.169.254）/组播/保留/未指定一律 False。"""
+    try:
+        a = ipaddress.ip_address(addr.split("%", 1)[0])
+    except ValueError:
+        return False
+    return a.is_global and not a.is_multicast
+
+
+def _assert_resolves_public(host: str) -> None:
+    """DNS 解析校验（模块 6 修正 1）：live Schema 下载域名的全部解析
+    结果必须是公网地址——域名允许列表防不住 DNS 劫持/内网解析。"""
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        raise SpApiEnvironmentError(
+            f"Schema 下载域名解析失败：{host}") from None
+    ips = {info[4][0] for info in infos}
+    if not ips or any(not _is_public_ip(i) for i in ips):
+        raise SpApiEnvironmentError(
+            f"Schema 下载域名解析到禁入地址（本地/内网/链路本地/云元"
+            f"数据），拒绝连接：{host}")
+
+
+class _RedirectGuard(urllib.request.HTTPRedirectHandler):
+    """重定向安全（模块 6 修正 1）：跨主机重定向与 https 降级一律拒
+    绝——重定向是「先验 URL 合法、再跳去任意目标」的经典后门，最终
+    连接目标必须仍受同一套域名约束。同主机（且不降级）才放行。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        old = urllib.parse.urlparse(req.full_url)
+        new = urllib.parse.urlparse(newurl)
+        if (old.hostname or "").lower() != (new.hostname or "").lower():
+            raise SpApiEnvironmentError(
+                f"跨主机重定向被拒：{old.hostname or ''} → "
+                f"{new.hostname or ''}（下载只允许同主机跳转）")
+        if (old.scheme or "").lower() == "https" and \
+                (new.scheme or "").lower() != "https":
+            raise SpApiEnvironmentError(
+                f"https→{(new.scheme or '?').upper()} 降级重定向被拒："
+                f"{new.hostname or ''}")
+        return super().redirect_request(req, fp, code, msg, headers,
+                                        newurl)
+
+
+def _no_proxy_opener():
+    """direct / mock 都显式不走环境代理（这是明确的选择，不是缺省凑合：
+    代理模式必须显式传 ProxyConfig）。单一定径，无回退路径。
+    带 _RedirectGuard：跨主机/降级重定向一律拒（模块 6 修正 1）。"""
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                       _RedirectGuard())
+
+
+def raw_transport(method: str, url: str, headers: dict,
+                  timeout: float) -> tuple[int, dict, bytes]:
+    """无守卫裸传输：仅供测试构造「环境配置被绕过」的故障注入场景，
+    业务代码禁止使用。"""
+    return _urllib_call(_no_proxy_opener(), method, url, headers, timeout)
+
+
+def build_environment(mode: str, *, proxy: ProxyConfig | None = None,
+                      mock_url: str | None = None,
+                      schema_hosts: Iterable[str] | None = None) -> Environment:
+    """三模式环境工厂：
+      direct：显式直连官方端点（不接受 proxy 参数）
+      proxy： 经指定代理连官方端点（必须给 proxy；代理失败只报网络错误，
+              绝不擅自改走直连）
+      mock：  只访问 mock_url 的本地模拟服务（必须给 mock_url）
+
+    schema_hosts（模块 6 修正 1，仅 live）：Schema 下载宿主允许列表——
+    官方 SchemaLink 的实际托管域名由装配期按真实观测登记；默认空=
+    live Schema 下载一律拒绝（fail-closed，绝不凭猜测放开）。mock 的
+    Schema 宿主恒为 mock 服务自身。
+    """
+    if mode == "mock":
+        if not mock_url:
+            raise ValueError("mock 模式必须给 mock_url")
+        host = _host_of(mock_url)
+        opener_holder = _no_proxy_opener()
+
+        def mock_transport(method, url, headers, timeout):
+            _assert_host(url, host)
+            return _urllib_call(opener_holder, method, url, headers, timeout)
+
+        base = mock_url.rstrip("/")
+        return Environment("mock", mock_transport, lambda mid: base,
+                           frozenset({host}))
+
+    if mode in ("direct", "proxy"):
+        if mode == "direct" and proxy is not None:
+            raise ValueError("direct 模式不接受 proxy 参数（要用代理请选 "
+                             "proxy 模式）")
+        if mode == "proxy" and proxy is None:
+            raise ValueError("proxy 模式必须给 ProxyConfig")
+        allowed = frozenset(h.strip().lower() for h in (schema_hosts or [])
+                            if h and h.strip())
+        if mode == "proxy":
+            proxy_url = _proxy_url_with_auth(proxy)   # 认证只进 opener
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler(
+                    {"http": proxy_url, "https": proxy_url}),
+                _RedirectGuard())
+        else:
+            opener = _no_proxy_opener()
+
+        def live_transport(method, url, headers, timeout):
+            _assert_official_or(url, allowed)   # 官方端点 ∪ Schema 允许列表
+            return _urllib_call(opener, method, url, headers, timeout)
+
+        return Environment("live", live_transport, official_endpoint,
+                           allowed)
+
+    raise ValueError(f"未知传输模式：{mode!r}（可选 {TRANSPORT_MODES}）")
+
+
+def _lc(h) -> dict:
+    return {str(k).lower(): v for k, v in (h.items() if hasattr(h, "items")
+                                           else h)}
+
+
+# ---------------------------------------------------------------------------
+# 重试配置（要求 5）
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class RetryConfig:
+    max_attempts: int = 3          # 总尝试次数上限（含首次）
+    base_delay: float = 0.5        # 指数退避基数（秒）
+    max_delay: float = 8.0         # 单次退避上限（秒）
+    retry_after_cap: float = 30.0  # Retry-After 超过它=直接放弃（防无限等）
+
+
+@dataclass
+class _OpSpec:
+    name: str
+    method: str
+    path: str
+    official: str                  # 官方操作名（诊断用）
+
+
+OPS = {
+    "search_product_types": _OpSpec(
+        "search_product_types", "GET", f"{PTD_BASE}/productTypes",
+        "searchDefinitionsProductTypes"),
+    "get_product_type": _OpSpec(
+        "get_product_type", "GET", f"{PTD_BASE}/productTypes/{{productType}}",
+        "getDefinitionsProductType"),
+    "search_catalog_items": _OpSpec(
+        "search_catalog_items", "GET", f"{CATALOG_BASE}/items",
+        "searchCatalogItems"),
+    "get_catalog_item": _OpSpec(
+        "get_catalog_item", "GET", f"{CATALOG_BASE}/items/{{asin}}",
+        "getCatalogItem"),
+}
+
+
+def _csv(values: Iterable) -> str:
+    return ",".join(str(v) for v in values)
+
+
+# ---------------------------------------------------------------------------
+# 客户端
+# ---------------------------------------------------------------------------
+
+
+class SpApiClient:
+    """四个官方操作的客户端。运行环境（direct/proxy/mock）由
+    build_environment 构造后注入——Mock/Live 的判定以这份可信配置为准，
+    响应头 X-WZ-Mock 只用作 live 环境的交叉校验（出现即作废）。
+    取令牌回调注入；令牌只在发请求瞬间进 header。"""
+
+    def __init__(self, environment: Environment, *,
+                 token_provider: Callable[[], str] | None = None,
+                 rate_overrides: dict[str, tuple[float, float]] | None = None,
+                 retry: RetryConfig | None = None,
+                 timeout: float = 20.0,
+                 user_agent: str = "wz-desktop-pt/1.0"):
+        self._env = environment
+        self._transport = environment.transport
+        self._token_provider = token_provider
+        self._retry = retry or RetryConfig()
+        self._timeout = float(timeout)
+        self._user_agent = user_agent
+        self._limiters: dict[str, RateLimiter] = {}
+        for op, (r, b) in DEFAULT_RATE_PLANS.items():
+            if rate_overrides and op in rate_overrides:
+                r, b = rate_overrides[op]
+            self._limiters[op] = RateLimiter(r, b)
+
+    @property
+    def env_mode(self) -> str:
+        """当前可信环境（mock|live）——上层据此决定 verified_against。"""
+        return self._env.mode
+
+    # ---- 对外诊断 ----
+
+    def rate_status(self) -> dict[str, dict]:
+        return {op: {"rate": lim.rate, "burst": lim.burst}
+                for op, lim in self._limiters.items()}
+
+    def op_methods(self) -> dict[str, str]:
+        """四个操作全是官方 GET（幂等）——非 GET 在重试引擎里被硬拒。"""
+        return {name: spec.method for name, spec in OPS.items()}
+
+    # ---- 四个官方操作 ----
+
+    def search_product_types(self, marketplace_id: str, *,
+                             keywords: list[str] | None = None,
+                             item_name: str | None = None,
+                             locale: str | None = None,
+                             search_locale: str | None = None) -> SpApiResult:
+        """官方：keywords 与 itemName 互斥，必须给其一。"""
+        keywords = [k for k in (keywords or []) if k]
+        item_name = (item_name or "").strip()
+        if keywords and item_name:
+            raise ValueError("keywords 与 itemName 官方互斥，只能给其一")
+        if not keywords and not item_name:
+            raise ValueError("必须给 keywords 或 itemName 其一")
+        params: dict[str, str] = {"marketplaceIds": marketplace_id}
+        if keywords:
+            params["keywords"] = _csv(keywords)
+        if item_name:
+            params["itemName"] = item_name
+        if locale:
+            params["locale"] = locale
+        if search_locale:
+            params["searchLocale"] = search_locale
+        return self._call_checked(
+            "search_product_types", marketplace_id, params,
+            required=("productTypes", "productTypeVersion"))
+
+    def get_product_type(self, product_type: str, marketplace_id: str, *,
+                         seller_id: str | None = None,
+                         product_type_version: str | None = None,
+                         requirements: str | None = None,
+                         requirements_enforced: str | None = None,
+                         locale: str | None = None,
+                         parentage_level: str | None = None) -> SpApiResult:
+        pt = (product_type or "").strip()
+        if not pt:
+            raise ValueError("productType 不能为空")
+        for name, val, allowed in (
+            ("requirements", requirements, REQUIREMENTS),
+            ("requirementsEnforced", requirements_enforced,
+             REQUIREMENTS_ENFORCED),
+            ("parentageLevel", parentage_level, PARENTAGE_LEVEL),
+            ("locale", locale, PTD_LOCALES),
+        ):
+            if val is not None and val not in allowed:
+                raise ValueError(f"非法 {name}：{val!r}（官方枚举见 "
+                                 "spapi_client 常量）")
+        params = {"marketplaceIds": marketplace_id}
+        if seller_id:
+            params["sellerId"] = seller_id
+        if product_type_version:
+            params["productTypeVersion"] = product_type_version
+        if requirements:
+            params["requirements"] = requirements
+        if requirements_enforced:
+            params["requirementsEnforced"] = requirements_enforced
+        if locale:
+            params["locale"] = locale
+        if parentage_level:
+            params["parentageLevel"] = parentage_level
+        return self._call_checked(
+            "get_product_type", marketplace_id, params,
+            path_args={"productType": pt},
+            required=("schema", "requirements", "requirementsEnforced",
+                      "propertyGroups", "locale", "marketplaceIds",
+                      "productType", "displayName", "productTypeVersion"))
+
+    def search_catalog_items(self, marketplace_id: str, *,
+                             identifiers: list[str] | None = None,
+                             identifiers_type: str | None = None,
+                             keywords: list[str] | None = None,
+                             included_data: list[str] | None = None,
+                             locale: str | None = None,
+                             seller_id: str | None = None,
+                             brand_names: list[str] | None = None,
+                             classification_ids: list[str] | None = None,
+                             page_size: int | None = None,
+                             page_token: str | None = None,
+                             keywords_locale: str | None = None) -> SpApiResult:
+        identifiers = [i for i in (identifiers or []) if i]
+        keywords = [k for k in (keywords or []) if k]
+        included_data = [d for d in (included_data or []) if d]
+        brand_names = [b for b in (brand_names or []) if b]
+        classification_ids = [c for c in (classification_ids or []) if c]
+        if identifiers and keywords:
+            raise ValueError("identifiers 与 keywords 官方互斥，只能给其一")
+        if not identifiers and not keywords:
+            raise ValueError("必须给 identifiers 或 keywords 其一")
+        if len(identifiers) > 20:
+            raise ValueError(f"identifiers 官方上限 20 个（给了 "
+                             f"{len(identifiers)}）")
+        if len(keywords) > 20:
+            raise ValueError(f"keywords 官方上限 20 个（给了 "
+                             f"{len(keywords)}）")
+        if identifiers_type is not None and identifiers_type \
+                not in IDENTIFIERS_TYPES:
+            raise ValueError(f"非法 identifiersType：{identifiers_type!r}")
+        if identifiers and not identifiers_type:
+            raise ValueError("官方规定：给了 identifiers 就必须给 "
+                             "identifiersType")
+        if identifiers_type and not identifiers:
+            raise ValueError("identifiersType 只能配合 identifiers 使用")
+        if classification_ids and identifiers:
+            raise ValueError("classificationIds 官方规定不能与 identifiers "
+                             "同用（只配合 keywords）")
+        bad = [d for d in included_data if d not in INCLUDED_DATA]
+        if bad:
+            raise ValueError(f"非法 includedData：{bad}（官方枚举 10 种）")
+        if page_size is not None and (not isinstance(page_size, int)
+                                      or page_size < 1):
+            raise ValueError(f"非法 pageSize：{page_size!r}（正整数）")
+        params = {"marketplaceIds": marketplace_id}   # 官方 maxItems=1
+        if identifiers:
+            params["identifiers"] = _csv(identifiers)
+            params["identifiersType"] = identifiers_type
+        if keywords:
+            params["keywords"] = _csv(keywords)
+        if included_data:
+            params["includedData"] = _csv(included_data)
+        if locale:
+            params["locale"] = locale
+        if seller_id:
+            params["sellerId"] = seller_id
+        if brand_names:
+            params["brandNames"] = _csv(brand_names)
+        if classification_ids:
+            params["classificationIds"] = _csv(classification_ids)
+        if page_size is not None:
+            params["pageSize"] = str(page_size)
+        if page_token:
+            params["pageToken"] = page_token
+        if keywords_locale:
+            params["keywordsLocale"] = keywords_locale
+        return self._call_checked(
+            "search_catalog_items", marketplace_id, params,
+            required=("numberOfResults",))
+
+    def get_catalog_item(self, asin: str, marketplace_id: str, *,
+                         included_data: list[str] | None = None,
+                         locale: str | None = None) -> SpApiResult:
+        a = (asin or "").strip()
+        if not a:
+            raise ValueError("asin 不能为空")
+        included_data = [d for d in (included_data or []) if d]
+        bad = [d for d in included_data if d not in INCLUDED_DATA]
+        if bad:
+            raise ValueError(f"非法 includedData：{bad}（官方枚举 10 种）")
+        params = {"marketplaceIds": marketplace_id}
+        if included_data:
+            params["includedData"] = _csv(included_data)
+        if locale:
+            params["locale"] = locale
+        return self._call_checked(
+            "get_catalog_item", marketplace_id, params,
+            path_args={"asin": a}, required=("asin",))
+
+    # ---- 模块 6：官方 Schema 受限下载（PTD schema.link 的 GET）----
+
+    def fetch_schema(self, link_url: str, *,
+                     max_bytes: int = 2_000_000) -> SpApiResult:
+        """下载 PTD schema.link 指向的官方 JSON Schema（模块 6 专用受限 GET）。
+
+        安全模型（模块 6 批复三 + 2026-10-12 模块 6 修正 1）：
+        - 只接受 http(s)——file:/// 等其余 scheme 一律 ValueError；
+        - **链接来源唯一**：调用方只准传 getDefinitionsProductType 官方
+          响应里的 schema.link（本客户端不提供任何「自选 URL」入口）；
+        - 宿主与主接口端点分开管理：mock 只准 mock_url 主机；live 的
+          Schema 下载域名允许列表 Environment.schema_hosts **默认空=
+          一律拒绝（fail-closed）**，待真实官方 SchemaLink 观测后由
+          装配期配置登记，绝不猜测放开；
+        - live 仅允许 https；且 DNS 解析结果必须是公网地址——本地/
+          回环/内网/链路本地/云元数据（169.254.169.254）一律拒；
+        - 重定向经 _RedirectGuard：跨主机跳转与 https 降级一律拒，
+          最终连接目标仍受同一套约束；
+        - 不携带 x-amz-access-token——官方 SchemaLink 是自带授权的签名
+          URL，把令牌发给链接目标等于泄露；
+        - 大小上限 max_bytes、超时 self._timeout；幂等 GET 沿用
+          RetryConfig 有界重试（仅 429/5xx/网络错误）。不设独立限流器：
+          Schema 下载属低频操作，节奏由上层批量调度约束；
+        - 异常文本只带「主机+路径」——查询串（可能含 X-Amz-Signature
+          等签名参数）绝不进任何消息/日志。
+        返回 SpApiResult（data=解析后 JSON，raw=原始字节供校验落盘）。
+        """
+        url = str(link_url or "").strip()
+        u = urllib.parse.urlparse(url)
+        where = f"{u.hostname or ''}{u.path}"    # 查询串绝不入文
+        if u.scheme not in ("http", "https"):
+            raise ValueError(f"Schema 链接只允许 http(s)：{u.scheme!r}")
+        if not u.hostname:
+            raise ValueError("Schema 链接缺少主机")
+        if self._env.mode == "live" and u.scheme != "https":
+            raise ValueError("live 环境 Schema 链接仅允许 https")
+        host_l = u.hostname.lower()
+        if self._env.mode != "mock":
+            if host_l not in self._env.schema_hosts:
+                raise SpApiEnvironmentError(
+                    f"live 环境 Schema 下载域名不在允许列表（默认空=一律"
+                    f"拒绝，防任意 URL；待真实官方 SchemaLink 观测后由装"
+                    f"配期配置登记）：{host_l}")
+            _assert_resolves_public(host_l)   # DNS 劫持/内网/元数据防线
+        max_bytes = int(max_bytes)
+        if max_bytes < 1:
+            raise ValueError("max_bytes 必须为正整数")
+        headers = {"Accept": "application/json",
+                   "User-Agent": self._user_agent}    # 无令牌（见 docstring）
+        retry = self._retry
+        attempts = 0
+        t0 = time.monotonic()
+        last_error: SpApiError | None = None
+        while True:
+            attempts += 1
+            delay = min(retry.base_delay * (2 ** (attempts - 1)),
+                        retry.max_delay)
+            try:
+                status, resp_headers, body = self._transport(
+                    "GET", url, headers, self._timeout)
+            except (socket.timeout, TimeoutError):
+                last_error = SpApiNetworkError(
+                    f"Schema 下载超时（>{self._timeout}s）{where}",
+                    phase="timeout", op="fetch_schema")
+            except urllib.error.URLError as e:
+                reason = getattr(e, "reason", e)
+                if isinstance(reason, (socket.timeout, TimeoutError)):
+                    last_error = SpApiNetworkError(
+                        f"Schema 下载超时 {where}", phase="timeout",
+                        op="fetch_schema")
+                else:
+                    last_error = SpApiNetworkError(
+                        f"Schema 下载连接失败："
+                        f"{type(reason).__name__} {where}",
+                        phase="connect", op="fetch_schema")
+            except (ConnectionError, OSError) as e:
+                last_error = SpApiNetworkError(
+                    f"Schema 下载连接失败：{type(e).__name__} {where}",
+                    phase="connect", op="fetch_schema")
+            else:
+                if 200 <= status < 300:
+                    # 环境信任与 _call 同尺（模块 2 修正 2）：
+                    # live 环境收到 X-WZ-Mock=目标可疑，结果作废
+                    if self._env.mode != "mock" and _is_mock(resp_headers):
+                        raise SpApiEnvironmentError(
+                            "live 环境 Schema 下载收到 X-WZ-Mock 响应头"
+                            f"——请求目标疑似模拟服务，结果作废（{where}）",
+                            op="fetch_schema", status=status,
+                            request_id=resp_headers.get("x-amzn-requestid"))
+                    if len(body) > max_bytes:
+                        raise ValueError(
+                            f"Schema 响应 {len(body)} 字节超过上限 "
+                            f"{max_bytes}（{where}）")
+                    data, parsed_errs = _parse_json(body)
+                    if parsed_errs is None:
+                        return SpApiResult(
+                            op="fetch_schema", marketplace_id="",
+                            status=status, data=data,
+                            mock=self._env.mode == "mock", raw=body,
+                            request_id=resp_headers.get("x-amzn-requestid"),
+                            rate_limit=_rate_of(resp_headers),
+                            attempts=attempts,
+                            elapsed=time.monotonic() - t0)
+                    raise SpApiParseError(
+                        f"Schema 响应不是合法 JSON（{parsed_errs}）{where}",
+                        op="fetch_schema", status=status,
+                        request_id=resp_headers.get("x-amzn-requestid"))
+                errs = _error_list(body)
+                req_id = resp_headers.get("x-amzn-requestid")
+                kw = dict(op="fetch_schema", marketplace_id="",
+                          status=status, errors=errs, request_id=req_id)
+                if status == 429:
+                    ra = _retry_after(resp_headers)
+                    if ra is not None and ra > retry.retry_after_cap:
+                        raise SpApiRateLimitError(
+                            f"Schema 下载限流且 Retry-After={ra}s 超过上限"
+                            f" {retry.retry_after_cap}s，放弃（{where}）",
+                            retry_after=ra, **kw)
+                    last_error = SpApiRateLimitError(
+                        f"Schema 下载限流（429）{where}", retry_after=ra,
+                        **kw)
+                    if ra is not None:
+                        delay = ra
+                elif status >= 500:
+                    last_error = SpApiServerError(
+                        f"Schema 下载服务端错误（{status}）{where}", **kw)
+                    ra = _retry_after(resp_headers)
+                    if ra is not None:
+                        delay = ra
+                else:
+                    # 400/401/403/404 等客户端错误一律不重试
+                    raise _client_error(f"Schema 下载 {where}", **kw)
+            if attempts < retry.max_attempts:      # 幂等 GET，有界重试
+                time.sleep(max(delay, 0.0))
+                continue
+            assert last_error is not None
+            raise last_error
+
+    # ---- 引擎 ----
+
+    def _call_checked(self, op: str, marketplace_id: str, params: dict,
+                      required: tuple[str, ...] = (),
+                      path_args: dict | None = None) -> SpApiResult:
+        spec = OPS[op]
+        path = spec.path
+        for k, v in (path_args or {}).items():
+            path = path.replace("{" + k + "}", urllib.parse.quote(
+                str(v), safe=""))
+        result = self._call(op, spec, marketplace_id, path, params)
+        # 200 响应形状核验（官方 OpenAPI required 字段，缺了=不是官方形状）
+        data = result.data
+        if not isinstance(data, dict):
+            raise SpApiParseError(
+                f"{spec.official} 响应不是 JSON 对象：{type(data).__name__}",
+                op=op, marketplace_id=marketplace_id, status=result.status,
+                request_id=result.request_id)
+        missing = [k for k in required if k not in data]
+        if missing:
+            raise SpApiParseError(
+                f"{spec.official} 响应缺官方必填字段：{missing}",
+                op=op, marketplace_id=marketplace_id, status=result.status,
+                request_id=result.request_id)
+        if op == "search_product_types":
+            if not isinstance(data.get("productTypes"), list) or \
+                    not isinstance(data.get("productTypeVersion"), str):
+                raise SpApiParseError(
+                    "searchDefinitionsProductTypes 响应字段类型不对"
+                    f"：productTypes={type(data.get('productTypes')).__name__}"
+                    f" productTypeVersion="
+                    f"{type(data.get('productTypeVersion')).__name__}",
+                    op=op, marketplace_id=marketplace_id,
+                    status=result.status, request_id=result.request_id)
+        return result
+
+    def _call(self, op: str, spec: _OpSpec, marketplace_id: str,
+              path: str, params: dict) -> SpApiResult:
+        base = self._env.endpoint_for(marketplace_id).rstrip("/")
+        url = base + path + "?" + urllib.parse.urlencode(params)
+        # 区域/站点正确性（要求 7）：默认 resolver 已拒未知站点；注入的
+        # resolver 也兜底再验一次 marketplace 合法性。
+        if marketplace_id not in REGION_BY_MARKETPLACE:
+            raise ValueError(f"未知 marketplace_id：{marketplace_id!r}")
+        limiter = self._limiters[op]
+        retry = self._retry
+        attempts = 0
+        t0 = time.monotonic()
+        last_error: SpApiError | None = None
+        while attempts < retry.max_attempts:
+            attempts += 1
+            limiter.acquire()
+            # 令牌只在发请求前一刻取（要求 10：令牌不进日志/异常）
+            if self._token_provider is None:
+                raise SpApiAuthError(
+                    "未注入 token_provider（构造 SpApiClient 时必须提供取"
+                    " LWA 访问令牌的回调）", op=op,
+                    marketplace_id=marketplace_id)
+            try:
+                token = self._token_provider()
+            except SpApiError:
+                raise
+            except Exception as e:  # noqa: BLE001
+                raise SpApiAuthError(
+                    f"token_provider 取令牌失败：{type(e).__name__}",
+                    op=op, marketplace_id=marketplace_id) from None
+            headers = {
+                "x-amz-access-token": token,
+                "Accept": "application/json",
+                "User-Agent": self._user_agent,
+            }
+            try:
+                status, resp_headers, body = self._transport(
+                    spec.method, url, headers, self._timeout)
+            except (socket.timeout, TimeoutError) as e:
+                last_error = SpApiNetworkError(
+                    f"{spec.official} 请求超时（>{self._timeout}s）",
+                    phase="timeout", op=op, marketplace_id=marketplace_id)
+                del e
+            except urllib.error.URLError as e:
+                reason = getattr(e, "reason", e)
+                if isinstance(reason, (socket.timeout, TimeoutError)):
+                    last_error = SpApiNetworkError(
+                        f"{spec.official} 请求超时", phase="timeout",
+                        op=op, marketplace_id=marketplace_id)
+                else:
+                    last_error = SpApiNetworkError(
+                        f"{spec.official} 连接失败：{type(reason).__name__}",
+                        phase="connect", op=op, marketplace_id=marketplace_id)
+            except (ConnectionError, OSError) as e:
+                last_error = SpApiNetworkError(
+                    f"{spec.official} 连接失败：{type(e).__name__}",
+                    phase="connect", op=op, marketplace_id=marketplace_id)
+            else:
+                self._absorb_rate_header(op, resp_headers)
+                if 200 <= status < 300:
+                    # 环境信任（修正 2）：mock 与否由客户端配置决定；
+                    # live 环境见到 X-WZ-Mock 头=目标可疑，结果作废。
+                    mock_by_cfg = self._env.mode == "mock"
+                    if not mock_by_cfg and _is_mock(resp_headers):
+                        raise SpApiEnvironmentError(
+                            f"{spec.official} 在 live 环境收到 X-WZ-Mock "
+                            f"响应头——请求目标疑似模拟服务，结果作废",
+                            op=op, marketplace_id=marketplace_id,
+                            status=status,
+                            request_id=resp_headers.get("x-amzn-requestid"))
+                    data, parsed_errs = _parse_json(body)
+                    if parsed_errs is None:
+                        return SpApiResult(
+                            op=op, marketplace_id=marketplace_id,
+                            status=status, data=data, mock=mock_by_cfg,
+                            request_id=resp_headers.get("x-amzn-requestid"),
+                            rate_limit=_rate_of(resp_headers),
+                            attempts=attempts,
+                            elapsed=time.monotonic() - t0)
+                    raise SpApiParseError(
+                        f"{spec.official} 返回 200 但响应体不是合法 JSON"
+                        f"（{parsed_errs}）", op=op,
+                        marketplace_id=marketplace_id, status=status,
+                        request_id=resp_headers.get("x-amzn-requestid"))
+                errs = _error_list(body)
+                req_id = resp_headers.get("x-amzn-requestid")
+                kw = dict(op=op, marketplace_id=marketplace_id,
+                          status=status, errors=errs, request_id=req_id)
+                if status == 429:
+                    ra = _retry_after(resp_headers)
+                    if ra is not None and ra > retry.retry_after_cap:
+                        raise SpApiRateLimitError(
+                            f"{spec.official} 限流且 Retry-After={ra}s 超过"
+                            f"上限 {retry.retry_after_cap}s，放弃重试",
+                            retry_after=ra, **kw)
+                    last_error = SpApiRateLimitError(
+                        f"{spec.official} 限流（429）", retry_after=ra, **kw)
+                    delay = ra if ra is not None else min(
+                        retry.base_delay * (2 ** (attempts - 1)),
+                        retry.max_delay)
+                elif status >= 500:
+                    last_error = SpApiServerError(
+                        f"{spec.official} 服务端错误（{status}）", **kw)
+                    ra = _retry_after(resp_headers)
+                    delay = ra if ra is not None else min(
+                        retry.base_delay * (2 ** (attempts - 1)),
+                        retry.max_delay)
+                else:
+                    # 400/401/403/404/413/415……客户端错误一律不重试
+                    raise _client_error(spec.official, **kw)
+                if attempts < retry.max_attempts and \
+                        spec.method == "GET":    # 幂等守卫（要求 5）
+                    time.sleep(max(delay, 0.0))
+                    continue
+                raise last_error
+            # 网络错误：有界重试（要求 5）
+            if attempts < retry.max_attempts and spec.method == "GET":
+                time.sleep(min(retry.base_delay * (2 ** (attempts - 1)),
+                               retry.max_delay))
+                continue
+            assert last_error is not None
+            raise last_error
+        raise SpApiError(          # 理论不可达（循环内必 raise），保险丝
+            f"{spec.official} 重试耗尽", op=op,
+            marketplace_id=marketplace_id, status=None)
+
+    def _absorb_rate_header(self, op: str, resp_headers: dict) -> None:
+        v = resp_headers.get("x-amzn-ratelimit-limit")
+        if v:
+            try:
+                self._limiters[op].update_rate(float(v))
+            except (TypeError, ValueError):
+                pass
+
+
+def _parse_json(body: bytes) -> tuple[Any, str | None]:
+    try:
+        return json.loads(body.decode("utf-8", "replace")), None
+    except (ValueError, UnicodeDecodeError) as e:
+        return None, f"{type(e).__name__}: {e}"[:120]
+
+
+def _error_list(body: bytes) -> list[dict]:
+    data, _ = _parse_json(body)
+    if isinstance(data, dict) and isinstance(data.get("errors"), list):
+        return [e for e in data["errors"] if isinstance(e, dict)]
+    return []
+
+
+def _is_mock(resp_headers: dict) -> bool:
+    return str(resp_headers.get("x-wz-mock", "")).strip() == "1"
+
+
+def _rate_of(resp_headers: dict) -> float | None:
+    v = resp_headers.get("x-amzn-ratelimit-limit")
+    if not v:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _retry_after(resp_headers: dict) -> float | None:
+    v = resp_headers.get("retry-after")
+    if not v:
+        return None
+    try:
+        return max(float(v), 0.0)
+    except (TypeError, ValueError):
+        return None
+
+
+def _client_error(official: str, *, status: int, errors: list[dict],
+                  op: str, marketplace_id: str,
+                  request_id: str | None) -> SpApiError:
+    msgs = "; ".join(f"[{e.get('code','')}] {e.get('message','')}"
+                     for e in errors)[:300]
+    msg = f"{official} 客户端错误（{status}）" + (f"：{msgs}" if msgs else "")
+    kw = dict(op=op, marketplace_id=marketplace_id, status=status,
+              errors=errors, request_id=request_id)
+    if status == 401:
+        return SpApiAuthError(msg, **kw)
+    if status == 403:
+        return SpApiForbiddenError(msg, **kw)
+    if status == 404:
+        return SpApiNotFoundError(msg, **kw)
+    return SpApiBadRequestError(msg, **kw)   # 400/413/415/其余 4xx
