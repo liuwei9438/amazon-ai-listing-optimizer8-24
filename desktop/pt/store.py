@@ -75,7 +75,7 @@ from typing import Any, Iterable
 
 _LOG = logging.getLogger("pt.store")   # 模块 2 要求 11：异常必须可诊断
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # ---- 合法枚举（集中定义，写入前一律校验） ----
 VALID_EVIDENCE = {"pending", "confirmed", "missing", "insufficient"}
@@ -249,6 +249,30 @@ CREATE TABLE IF NOT EXISTS pt_verification(
 CREATE INDEX IF NOT EXISTS idx_verification
   ON pt_verification(store_id, marketplace_id, pid, check_kind, id);
 
+-- v5（P5 人工复核证据链）：needs_review 时保存结构化复核证据（AI
+-- 建议/置信度/逐候选评分明细/复核原因/当时官方验证快照）。它只是
+-- **建议记录**，与 pt_assignment（正式分配，completed 才写）严格
+-- 分离——绝不把待复核建议冒充已确认分类；复核 UI 读这张表，不解析
+-- gpt_evidence.jsonl。
+CREATE TABLE IF NOT EXISTS pt_review_evidence(
+  id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+  store_id           TEXT NOT NULL DEFAULT '',
+  marketplace_id     TEXT NOT NULL,
+  pid                TEXT NOT NULL,
+  task_id            TEXT NOT NULL DEFAULT '',
+  env                TEXT NOT NULL DEFAULT 'live',
+  stage              TEXT NOT NULL DEFAULT '',
+  error_kind         TEXT NOT NULL DEFAULT '',
+  review_reasons_json TEXT,
+  ai_chosen          TEXT,
+  ai_confidence      REAL,
+  ai_detail_json     TEXT,
+  official_status_json TEXT,
+  created_at         INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_review_evidence
+  ON pt_review_evidence(store_id, marketplace_id, pid, env, id);
+
 CREATE TABLE IF NOT EXISTS pt_correction(
   id                  INTEGER PRIMARY KEY AUTOINCREMENT,
   store_id            TEXT NOT NULL DEFAULT '',
@@ -420,9 +444,36 @@ class PtStore:
             if v in (1, 2, 3):
                 # v3→v4（集成加固）：pausing 窗口 resume 的持久化意图列。
                 self._migrate_3_to_4()
+            if v in (1, 2, 3, 4):
+                # v4→v5（P5）：人工复核证据链表（纯新增，无列变更）。
+                self._migrate_4_to_5()
                 self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
                 return
             raise RuntimeError(f"未知 schema 版本 v{v}")
+
+    def _migrate_4_to_5(self) -> None:
+        """v4→v5：pt_review_evidence（needs_review 结构化证据）。
+        纯新增表（CREATE IF NOT EXISTS 幂等），不动任何既有表。"""
+        self._db.executescript(
+            "CREATE TABLE IF NOT EXISTS pt_review_evidence(\n"
+            "  id                 INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+            "  store_id           TEXT NOT NULL DEFAULT '',\n"
+            "  marketplace_id     TEXT NOT NULL,\n"
+            "  pid                TEXT NOT NULL,\n"
+            "  task_id            TEXT NOT NULL DEFAULT '',\n"
+            "  env                TEXT NOT NULL DEFAULT 'live',\n"
+            "  stage              TEXT NOT NULL DEFAULT '',\n"
+            "  error_kind         TEXT NOT NULL DEFAULT '',\n"
+            "  review_reasons_json TEXT,\n"
+            "  ai_chosen          TEXT,\n"
+            "  ai_confidence      REAL,\n"
+            "  ai_detail_json     TEXT,\n"
+            "  official_status_json TEXT,\n"
+            "  created_at         INTEGER NOT NULL\n"
+            ");\n"
+            "CREATE INDEX IF NOT EXISTS idx_review_evidence\n"
+            "  ON pt_review_evidence(store_id, marketplace_id, pid,"
+            " env, id);")
 
     def _migrate_3_to_4(self) -> None:
         """v3→v4：pt_task 加 resume_pending（pausing 窗口里收到 resume
@@ -1027,6 +1078,84 @@ class PtStore:
     ) -> dict | None:
         rows = self.verifications(store_id, marketplace_id, pid, check_kind)
         return rows[-1] if rows else None
+
+    # ---- P5 人工复核证据链（AI 建议快照；与正式 assignment 严格分离，
+    #      绝不代表「已确认分类」——确认只来自人工 assignment_confirm） ----
+
+    # P5 集成验收（任务二.7）：同 (店铺,站点,pid,env) 只保留最近
+    # REVIEW_EVIDENCE_KEEP 条建议快照——复核建议按次追加、历史可审计，
+    # 但同一商品反复重跑不得无限累积（写入时原子裁剪，UI 永远取最新）。
+    REVIEW_EVIDENCE_KEEP = 20
+
+    def add_review_evidence(
+        self, *, store_id: str, marketplace_id: str, pid: str,
+        task_id: str = "", env: str = "live", stage: str = "",
+        error_kind: str = "", review_reasons: list | None = None,
+        ai_chosen: str | None = None, ai_confidence: float | None = None,
+        ai_detail: dict | None = None, official_status: list | None = None,
+        now_ts: int | None = None,
+    ) -> int:
+        """needs_review 时落一条结构化建议快照（追加式，不覆盖历史；
+        超出保留窗口的旧行同事务裁剪）。"""
+        _check_env(env)
+        t = now_ts or now()
+        with self._lock:
+            cur = self._db.execute(
+                "INSERT INTO pt_review_evidence(store_id,marketplace_id,"
+                "pid,task_id,env,stage,error_kind,review_reasons_json,"
+                "ai_chosen,ai_confidence,ai_detail_json,"
+                "official_status_json,created_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (store_id, marketplace_id, pid, task_id, env, stage,
+                 error_kind,
+                 json.dumps([str(r)[:200] for r in (review_reasons or [])]
+                            [:12], ensure_ascii=False),
+                 ai_chosen, ai_confidence,
+                 json.dumps(ai_detail, ensure_ascii=False)
+                 if ai_detail is not None else None,
+                 json.dumps(official_status or [], ensure_ascii=False)
+                 if official_status is not None else None,
+                 t),
+            )
+            new_id = int(cur.lastrowid)
+            # 保留策略：同键只留最近 N 条（任务二.7 防无限累积）
+            self._db.execute(
+                "DELETE FROM pt_review_evidence WHERE store_id=? AND"
+                " marketplace_id=? AND pid=? AND env=? AND id NOT IN ("
+                " SELECT id FROM pt_review_evidence WHERE store_id=? AND"
+                " marketplace_id=? AND pid=? AND env=?"
+                " ORDER BY id DESC LIMIT ?)",
+                (store_id, marketplace_id, pid, env,
+                 store_id, marketplace_id, pid, env,
+                 self.REVIEW_EVIDENCE_KEEP),
+            )
+            return new_id
+
+    def latest_review_evidence(
+        self, store_id: str, marketplace_id: str, pid: str,
+        env: str = "live",
+    ) -> dict | None:
+        """复核界面读取口（结构化；不必解析 gpt_evidence.jsonl）。"""
+        _check_env(env)
+        with self._lock:
+            r = self._db.execute(
+                "SELECT * FROM pt_review_evidence WHERE store_id=? AND"
+                " marketplace_id=? AND pid=? AND env=?"
+                " ORDER BY id DESC LIMIT 1",
+                (store_id, marketplace_id, pid, env),
+            ).fetchone()
+        if r is None:
+            return None
+        d = dict(r)
+        for jk, dk in (("review_reasons_json", "review_reasons"),
+                       ("ai_detail_json", "ai_detail"),
+                       ("official_status_json", "official_status")):
+            raw = d.pop(jk, None)
+            try:
+                d[dk] = json.loads(raw) if raw else None
+            except (ValueError, TypeError):
+                d[dk] = None          # 坏 JSON 不崩复核界面
+        return d
 
     # ---- 人工纠错 ----
 

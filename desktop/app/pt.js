@@ -333,6 +333,77 @@ function ptVerifyBadge(v, env) {
   return `<span class="pt-b warn">未通过（${esc(v.status || "?")}）</span>`;
 }
 
+/* ---------- P5：AI 建议快照（review_evidence → 复核侧板） ----------
+   只读渲染 pt_review_evidence 的历史建议：绝不写 assignment、绝不预选
+   人工确认单选钮；仅 needs_review 条目显示（completed 不出现过期建议，
+   已有人工确认分类时降为「历史快照」灰显）。全部文本经 esc() 转义。 */
+function ptOfficialSnapBadge(o) {
+  if (!o) return `<span class="pt-b">未验证</span>`;
+  if (o.status === "passed" && o.official)
+    return `<span class="pt-b ok">已验证（官方）</span>`;
+  if (o.status === "passed")
+    return `<span class="pt-b run">已验证（非官方来源）</span>`;
+  if (o.status === "failed" || o.status === "error")
+    return `<span class="pt-b warn">验证失败</span>`;
+  return `<span class="pt-b">未验证（${esc(o.status || "?")}）</span>`;
+}
+
+function ptAiSuggestHTML(d, item) {
+  const ev = d.review_evidence;
+  if (!ev || !item || item.state !== "needs_review") return "";
+  const det = ev.ai_detail || {};
+  const cands = det.candidates || [];
+  const reasons = ev.review_reasons || [];
+  const official = ev.official_status || [];
+  const dim = d.assignment ? true : false;   // 已有人工确认 → 历史快照灰显
+  const conf = ev.ai_confidence;
+  const rowsHtml = cands.map((c) => `<tr${c.ai_picked ? ` class="pt-ai-pick"` : ""}>
+      <td><b>${esc(c.pt_name)}</b>${c.ai_picked
+        ? ` <span class="pt-b run">AI 所选</span>` : ""}
+        <div class="d-imghint">${esc(c.display_name || "")}</div></td>
+      <td>ev ${c.evidence_score != null ? esc(c.evidence_score) : "—"} /
+          sem ${c.semantic_score != null ? esc(c.semantic_score) : "—"}</td>
+      <td>${c.ai_picked && c.ai_reason
+        ? `<div class="d-imghint pt-ai-why">${esc(String(c.ai_reason))}</div>`
+        : "—"}</td>
+    </tr>`).join("");
+  const reasonHtml = reasons.map((r) => {
+    const g = String(r).indexOf("仅来自 GPT 裁决") >= 0;
+    return `<div class="${g ? "pt-ai-gpt" : "pt-ai-rsn"}">`
+      + `${g ? "⚠️ " : "• "}${esc(r)}</div>`;
+  }).join("");
+  const offHtml = official.length
+    ? official.map((o) => `<div class="pt-ai-off">${ptOfficialSnapBadge(o)}`
+        + ` ${esc(o.check_kind || "")}${o.pt_name ? " · " + esc(o.pt_name) : ""}`
+        + `${o.note ? ` <span class="d-imghint">${esc(o.note)}</span>` : ""}`
+        + `</div>`).join("")
+    : `<div class="pt-ai-off"><span class="pt-b">未验证</span>`
+      + ` <span class="d-imghint">该轮未到达官方验证阶段</span></div>`;
+  return `
+    <div class="d-sub">🤖 AI 建议（历史快照 · 非确认分类）</div>
+    <div class="pt-aisugg${dim ? " pt-ai-dim" : ""}">
+      <div class="pt-ai-head">
+        ${ev.ai_chosen != null
+          ? `<span class="pt-ai-chosen">推荐 <b>${esc(ev.ai_chosen)}</b></span>
+             <span class="pt-b ${conf != null && conf >= 0.55 ? "ok" : "warn"}"
+               >置信度 ${conf != null ? esc(conf) : "—"}</span>`
+          : `<span class="d-imghint">本轮无 AI 推荐（未给出，或未到达 AI 决策
+             阶段）——以下候选证据供人工参考</span>`}
+        <span class="pt-ai-tag">${dim
+          ? "历史建议（该商品已有人工确认分类）" : "建议 ≠ 已确认分类"}</span>
+      </div>
+      ${reasonHtml ? `<div class="pt-ai-reasons">${reasonHtml}</div>` : ""}
+      ${cands.length ? `<table class="recycle-table pt-ai-cands"><thead><tr>
+          <th>候选</th><th>证据/语义</th><th>GPT 理由</th></tr></thead>
+        <tbody>${rowsHtml}</tbody></table>`
+        : `<div class="d-imghint">无候选快照（AI 决策未完成）</div>`}
+      <div class="d-sub pt-ai-offhead">官方验证状态（快照时点）</div>
+      ${offHtml}
+      <div class="d-imghint pt-ai-foot">任务 ${esc(String(ev.task_id || ""))}
+        · ${esc(ev.error_kind || "")} · 阶段 ${esc(ev.stage || "")}</div>
+    </div>`;
+}
+
 function ptRenderDetail() {
   const d = PT.detail;
   if (!d || String(d.pid) !== String(PT.detailPid)) return;
@@ -397,6 +468,8 @@ function ptRenderDetail() {
 
     ${item.error ? `<div class="d-sub">复核原因 / 错误</div>
       <div class="warn">${esc(item.error)}（${esc(item.error_kind || "")}）</div>` : ""}
+
+    ${ptAiSuggestHTML(d, item)}
 
     <div class="d-sub">👤 人工复核（从候选里选一个确认）</div>
     <div class="pt-review">

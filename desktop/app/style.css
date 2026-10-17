@@ -529,3 +529,32 @@ body {
   .pt-main { flex-direction: column; }
   .pt-detail { width: 100%; position: static; max-height: none; }
 }
+
+/* ---- P5：AI 建议快照（pt-aisugg，与 .pt-asg 已确认分类视觉严格区分：
+     虚线边框+米黄底=建议，实线+常规底=确认；灰显=已有人工确认的历史建议） ---- */
+.pt-aisugg {
+  border: 1px dashed #e0a800; border-radius: 10px; background: #fffdf5;
+  padding: 8px 12px; display: flex; flex-direction: column; gap: 6px;
+}
+.pt-ai-dim { border-color: #d8dce2; background: #fafbfc; opacity: 0.75; }
+.pt-ai-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.pt-ai-chosen { font-size: 13px; }
+.pt-ai-tag {
+  margin-left: auto; font-size: 11px; color: #9a6700;
+  border: 1px solid #e0a800; border-radius: 999px; padding: 1px 8px;
+}
+.pt-ai-dim .pt-ai-tag { color: #6a737d; border-color: #d8dce2; }
+.pt-ai-reasons { display: flex; flex-direction: column; gap: 2px; }
+.pt-ai-rsn { font-size: 12px; color: #58606a; overflow-wrap: anywhere; }
+.pt-ai-gpt {
+  font-size: 12px; color: #9a3412; background: #fff4ec;
+  border: 1px solid #f0c8a8; border-radius: 6px; padding: 2px 8px;
+  overflow-wrap: anywhere;
+}
+.pt-ai-cands { table-layout: fixed; }
+.pt-ai-cands td, .pt-ai-cands th { overflow-wrap: anywhere; }
+.pt-ai-pick { background: #f4faff; }
+.pt-ai-why { max-width: 260px; }
+.pt-ai-off { font-size: 12px; }
+.pt-ai-offhead { margin-top: 4px; }
+.pt-ai-foot { font-size: 11px; }

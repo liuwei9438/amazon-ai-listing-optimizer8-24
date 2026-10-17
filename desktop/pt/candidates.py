@@ -69,6 +69,10 @@ class StrategyReport:
     used: int = 0                # 真正采信的命中数（S3 会剔除不一致的）
     attempts: int = 0            # 客户端含重试的尝试数
     status_hint: int | None = None   # error 时的 HTTP 状态（辅助排查）
+    # D3 只读诊断（S3）：Catalog 分类节点覆盖情况——区分「未返回分类
+    # 节点 / 请求失败 / 解析失败 / 证据不足」，空节点≠节点不存在证明。
+    # 纯诊断，不影响任何门槛。
+    diag: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -111,13 +115,18 @@ def _token_set(text: str) -> set[str]:
 
 def _item_text(item: dict) -> str:
     """相似商品的「自我描述」文本：summaries 商品名优先，缺则分类名
-    （官方 Item 两块都可选，mock 服务就不带 summaries）。"""
+    （官方 Item 两块都可选，mock 服务就不带 summaries）。形状异常
+    （字符串冒充列表等）按缺处理——D3：解析异常绝不炸穿策略层。"""
     parts: list[str] = []
     for s in (item.get("summaries") or []):
-        parts.append(str(s.get("itemName") or ""))
+        if isinstance(s, dict):
+            parts.append(str(s.get("itemName") or ""))
     for grp in (item.get("classifications") or []):
+        if not isinstance(grp, dict):
+            continue
         for c in (grp.get("classifications") or []):
-            parts.append(str(c.get("displayName") or ""))
+            if isinstance(c, dict):
+                parts.append(str(c.get("displayName") or ""))
     return " ".join(p for p in parts if p)
 
 
@@ -239,15 +248,34 @@ def retrieve_candidates(client: SpApiClient, material: ProductMaterial, *,
             kw["keywords_locale"] = plan["search_locale"]
         r = client.search_catalog_items(marketplace_id, **kw)
         items = r.data.get("items") or []
+        # D3 只读诊断：分类节点覆盖（请求失败在 _run_strategy 捕获=error；
+        # 这里统计的是成功响应里的证据覆盖——空节点不是节点不存在的证明）
+        diag: dict = {"items": len(items),
+                     "items_with_classifications": 0,
+                     "items_with_product_types": 0,
+                     "items_with_classification_ids": 0,
+                     "shape_anomalies": []}
+        for _probe in items:
+            if not isinstance(_probe, dict):
+                diag["shape_anomalies"].append("item:not_dict")
+                continue
+            if _probe.get("classifications"):
+                diag["items_with_classifications"] += 1
+            if _probe.get("productTypes"):
+                diag["items_with_product_types"] += 1
         body = {t.lower() for t in material.body_terms()}
         if not body:
             return StrategyReport(
-                S3, "skipped", query=dict(kw), hits=len(items),
+                S3, "skipped", query=dict(kw), hits=len(items), diag=diag,
                 detail="本体词为空，无法核验相似商品身份一致性——全部不采信"
                 "（宁缺毋滥）")
         used = 0
         ev_by_pt: dict[str, dict] = {}
         for item in items:
+            if not isinstance(item, dict):
+                if "item:not_dict" not in diag["shape_anomalies"]:
+                    diag["shape_anomalies"].append("item:not_dict")
+                continue          # D3：脏行剔除记诊断，不炸策略
             asin = str(item.get("asin") or "")
             text_tokens = _token_set(_item_text(item))
             overlap = body & text_tokens
@@ -266,11 +294,22 @@ def retrieve_candidates(client: SpApiClient, material: ProductMaterial, *,
                               for grp in (item.get("classifications") or [])
                               for c in (grp.get("classifications") or [])
                               if c.get("classificationId")})
+            if cls_ids:
+                diag["items_with_classification_ids"] += 1
             for pt in pts:
-                ev = ev_by_pt.setdefault(pt, {"query": dict(kw), "asins": [],
-                                              "classification_ids": cls_ids,
-                                              "overlap_examples":
-                                                  sorted(overlap)[:4]})
+                ev = ev_by_pt.get(pt)
+                if ev is None:
+                    ev = ev_by_pt[pt] = {
+                        "query": dict(kw), "asins": [],
+                        "classification_ids": [], "overlap_examples":
+                            sorted(overlap)[:4]}
+                # D3 修复（证据聚合）：同一 PT 的多商品节点必须并集
+                # 采集——旧 setdefault 固定用首商品的 classification_ids，
+                # 后续商品的 Browse Node 被静默丢弃（节点池变小→更容易
+                # bn_no_nodes）
+                if cls_ids:
+                    merged = set(ev["classification_ids"]) | set(cls_ids)
+                    ev["classification_ids"] = sorted(merged)
                 if asin and asin not in ev["asins"]:
                     ev["asins"].append(asin)
         for pt, ev in ev_by_pt.items():
@@ -281,7 +320,8 @@ def retrieve_candidates(client: SpApiClient, material: ProductMaterial, *,
             detail = (f"{len(items)} 个相似商品全部被拒：与产品本体检索词"
                       f"无重叠或无本站点 PT——兼容设备冒充本体的路堵死")
         return StrategyReport(S3, status, query=dict(kw), hits=len(items),
-                              used=used, attempts=r.attempts, detail=detail)
+                              used=used, attempts=r.attempts, detail=detail,
+                              diag=diag)
 
     result.reports[S1] = _run_strategy(S1, s1)
     result.reports[S2] = _run_strategy(S2, s2)
@@ -300,3 +340,37 @@ def retrieve_candidates(client: SpApiClient, material: ProductMaterial, *,
     result.candidates = sorted(by_pt.values(),
                                key=lambda c: (-c.score, c.pt_name))
     return result
+
+
+def bn_missing_reason(cands: CandidatesResult) -> str:
+    """D3 只读诊断：BN 证据缺人话说明（不改任何门槛）。
+
+    区分四类：请求失败 / 解析失败（形状异常）/ Catalog 未返回分类节点
+    （官方该响应没带 classification_ids——空节点≠节点不存在的证明）/
+    证据不足（有节点 ID 但候选没采信）。供 tasks.bn_no_nodes 文案引用。
+    """
+    r = (cands.reports or {}).get(S3)
+    if r is None:
+        return "S3 无报告（未执行）"
+    if r.status == "error":
+        return f"S3 请求失败（{r.kind or 'unknown'}）——证据链断裂，≠节点不存在"
+    d = r.diag or {}
+    if d.get("shape_anomalies"):
+        kinds = ",".join(sorted({str(a).split(":")[0] + ":" +
+                                 str(a).split(":")[-1]
+                                 for a in d["shape_anomalies"]}))[:80]
+        return f"S3 响应形状异常（{kinds}）——解析层面证据不完整"
+    n = int(d.get("items") or 0)
+    wc = int(d.get("items_with_classifications") or 0)
+    wi = int(d.get("items_with_classification_ids") or 0)
+    if r.status == "empty":
+        return (f"S3 返回 {n} 个相似商品但全部未采信（本体词无重叠/无本"
+                "站点 PT）——无节点证据；≠节点不存在")
+    if n and wc == 0:
+        return (f"S3 正常返回 {n} 个相似商品但 classifications 全空"
+                "（includedData 已请求 classifications）——Catalog 未返回"
+                "分类节点，空节点≠节点不存在的证明")
+    if n and wc and wi == 0:
+        return (f"S3 {n} 个商品中 {wc} 个带 classifications 但无 "
+                "classificationId 字段——节点证据不足，需人工或换证据源")
+    return "S3 候选证据未携带 classification_ids——节点证据不足，交人工"

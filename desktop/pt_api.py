@@ -41,6 +41,7 @@ import time
 from pathlib import Path
 
 from pt.ai_gpt import GptDecision
+from pt.normalize import normalize_product_record
 from pt.spapi_client import RetryConfig, SpApiClient, build_environment
 from pt.store import PtStore, TaskConflictError
 from pt.tasks import TaskEngine
@@ -339,6 +340,14 @@ class PtApi:
         return {"ok": True, "env": env, "store_id": sid, "status": out,
                 "env_note": "模拟数据" if env == "mock" else ""}
 
+    def _safe_review_evidence(self, sid: str, mid: str, pid: str,
+                              env: str):
+        """复核证据安全读取（任务二.6）：任何故障降级 None，详情不崩。"""
+        try:
+            return self._store.latest_review_evidence(sid, mid, pid, env=env)
+        except Exception:  # noqa: BLE001 —— 证据链绝不拖垮主流程
+            return None
+
     def product_detail(self, pid: str, q: dict) -> dict:
         user = self._user()
         pid = str(pid or "").strip()
@@ -380,6 +389,11 @@ class PtApi:
                 k: (v[-1] if k != "browse_node" else v)
                 for k, v in kinds.items()},
             "latest_task_item": item,
+            # P5 集成验收（任务二.6）：复核证据读取失败绝不影响商品详情
+            # 主流程——降级为 None（UI 照常渲染其余字段）。
+            "review_evidence": self._safe_review_evidence(sid, mid, pid, env),
+            "review_note": "review_evidence=AI 建议快照（供人工复核参考），"
+                           "绝不等于已确认分类；确认只经人工 assignment_confirm",
             "badge": _ITEM_BADGE.get((item or {}).get("state", ""), ""),
             "human_note": "人工确认只代表人的判断，不等于「官方验证通过」",
         }
@@ -623,19 +637,19 @@ class PtApi:
     # ==================================================================
 
     def _product_record(self, pid: str) -> dict:
-        """prod_list 响应 → pt.material 的 record 形状（带缓存）。"""
+        """prod_list 响应 → pt.material 的 record 形状（带缓存）。
+
+        D1 修复：统一走 pt.normalize.normalize_product_record——
+        live 服务器（英文键+raw_data 嵌套中文 20 列）与 mock/历史
+        （中文键顶层）三形状都标准化成 material 契约；原始行保留在
+        record["_raw_original"] 供追踪。生产与 mock 同一函数（任务一.6）。
+        """
         hit = self._products.get(pid)
         if hit:
             return hit[0]
         data = self._deps["prod_list"](pid)
         prod = (data or {}).get("product") or {}
-        rec = {"pid": pid,
-               "raw_rows": [r for r in prod.get("raw") or []
-                            if isinstance(r, dict)],
-               "opt": prod.get("opt") if isinstance(prod.get("opt"), dict)
-               else None,
-               "sku": str(prod.get("sku") or ""),
-               "cat": str(prod.get("cat") or "")}
+        rec = normalize_product_record(prod, pid)
         if len(self._products) >= _PRODUCT_CACHE_MAX:
             self._products.pop(next(iter(self._products)))
         self._products[pid] = (rec, None, time.time())
@@ -702,10 +716,15 @@ class PtApi:
                     self._product_record(p)
                 except Exception:  # noqa: BLE001
                     pass
+        gpt = self._ai_decide_for(env)
         return TaskEngine(
             store=self._store,
             client=self._client_for(env, sid),
-            ai_decide=self._ai_decide_for(env),
+            ai_decide=gpt,
+            # P2：受限语义裁决与决策器共用凭证/网络/证据管线；语义裁决
+            # 本身判的是「商品↔PT 语义归属」，S3 采信才按 env 门控（在
+            # matcher.s3_semantic_score 里），这里不因 mock 缺席。
+            ai_semantic=gpt.semantic_verdict,
             load_product=self._load_product,
             cache_root=str(self._cache),
             seller_id=self._seller_of(sid),

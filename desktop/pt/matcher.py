@@ -35,6 +35,33 @@ AI 只做一件事：**从模块 3 检索出的真实 API 候选里选一个（�
     单一候选允许自动进入下一步官方验证（status="matched"，
     needs_review=False；official_verified 仍恒 False）；不达标才转
     人工复核——「仅单一候选无从对比」不再一票否决。
+14. P2 语义评分优化（2026-10-16 批准令任务一）：字面语义分
+    （_semantic_score，保留不动）之外增加两类**独立语义证据**，
+    语义门统一取 max(字面, S3 官方目录, GPT 裁决)——阈值常量
+    ABS_MIN_EVIDENCE/ABS_MIN_SEMANTIC/REVIEW_THRESHOLD 一律不变：
+    a) S3 官方目录身份一致性证据（s3_semantic_score）：官方目录里
+       ≥2 个与本体词一致且同站点的相似商品挂该 PT = 官方背书的语义
+       证据（可信条件见函数 docstring；与证据分的关系=回答不同问题，
+       且互不单独放行）；
+    b) 受限 GPT 语义裁决（ai_semantic 回调，装配期注入，可缺省）：
+       仅当（不含它）全员不达标、且有候选 证据≥0.4 且字面语义=0 时
+       问一次「商品是否属于该类型」；确认只把语义抬到下限
+       （ABS_MIN_SEMANTIC），拒绝/低置信/异常一律维持门槛（fail-
+       closed）。GPT 只解释语义关系，**不代替 PTD 官方有效性验证与
+       Browse Node 证据验证**（模块 5 门槛原样在后头）。
+15. P2 安全加固（2026-10-16 批准令·防错误分类自动放行）：
+    a) **GPT-only 语义不自动确认**：候选的语义分若只有 GPT 裁决一个
+       来源（字面=0 且 S3 官方目录=0——裁决资格本身就排除了其他来源），
+       它的「合适」只是 AI 单方判断、缺乏独立语义证据 → 即使证据分与
+       置信度都过线，也只作**人工复核辅助信号**：保留 chosen 推荐、
+       强制 needs_review，绝不 status=matched。
+    b) 证据依赖可追踪（EVIDENCE_DEPENDENCY）：每类检索证据喂了哪些
+       评分维度一表可查；S3 同时喂证据分（弱权重，度量「是否召回」）
+       与语义分（度量「官方目录同类是不是这个 PT」）——同一 API 响应
+       回答两个不同问题，且纯 S3 语义恒 0、双门槛都过才算 suitable，
+       结构上保证任何单一证据不能被当成两份独立证据放行。
+    c) 原始三源评分（lexical/S3/GPT）在 semantic_detail 与
+       confidence_breakdown 原样保留，合成分绝不掩盖原始证据。
 """
 
 from __future__ import annotations
@@ -52,8 +79,25 @@ CONFLICT_EPS = 0.5        # 证据最优与 AI 所选分差小于它 → 视为�
 EVIDENCE_FULL = 5.0       # 候选证据满分（S1+S2 满额；S3 弱证据天然低分）
 ABS_MIN_EVIDENCE = 0.4    # 修正 2：候选证据绝对下限（≈至少 S2 命中 2.0/5.0）
 ABS_MIN_SEMANTIC = 0.25   # 修正 2：语义绝对下限（官方 PT 名至少对上一个本体词）
+# ---- P2（铁律 14a）：S3 官方目录身份一致性语义证据参数 ----
+S3_SEM_MIN_ASINS = 2      # 最低采信相似商品数（单个=检索噪音；与 BN 证据
+                          # 「≥2 官方商品引用节点」同一先例）
+S3_SEM_CAP = 0.75         # 语义值上限——官方目录相似=强而间接的证据，
+                          # 永不冒充满值语义（字面重叠才可能到 1.0）
 W_EVIDENCE, W_SEMANTIC, W_GAP, W_AI = 0.35, 0.30, 0.20, 0.15
 _AI_NONE_PLACEHOLDER = 0.5    # AI 不自报概率时该分量取中性值
+# ---- P2 加固（铁律 15b）：证据来源→评分维度依赖表（可追踪、可审计）----
+EVIDENCE_DEPENDENCY = {
+    "s1_identity_item_name": {"evidence_score": True, "semantic": False},
+    "s2_keywords": {"evidence_score": True, "semantic": False},
+    "s3_catalog_similar": {
+        "evidence_score": True,       # 弱权重 1.0+0.1n（度量「是否召回」）
+        "semantic": "仅当另有 S1/S2 伴随（s3_semantic_score，度量「官方"
+                    "目录同类商品是不是这个 PT」）——纯 S3 语义恒 0"},
+    "gpt_semantic_verdict": {
+        "evidence_score": False, "semantic": True,
+        "note": "确认恰抬到语义下限；GPT-only 抬分不自动确认（铁律 15a）"},
+}
 _HEURISTIC_NOTE = ("confidence 只是启发式匹配评分，不是真实准确概率；"
                    "绝对质量门槛见 abs_gate（修正 2）")
 
@@ -123,7 +167,10 @@ def semantic_terms(material: ProductMaterial) -> set[str]:
 
 
 def _semantic_score(terms: set[str], cand: Candidate) -> float:
-    """候选 PT 显示名/名 itself 与本体语义词的重叠率（0..1）。"""
+    """候选 PT 显示名/名 itself 与本体语义词的重叠率（0..1）。
+
+    P2（铁律 14）：本函数=字面语义分，**保留原样不动**（批准令任务
+    一.2）；新增证据只在外层取 max，不改本公式。"""
     pt_tokens = _tokens(
         (cand.display_name or "") + " " +
         (cand.pt_name or "").replace("_", " "))
@@ -131,6 +178,68 @@ def _semantic_score(terms: set[str], cand: Candidate) -> float:
         return 0.0
     overlap = terms & pt_tokens
     return round(min(len(overlap) / min(len(terms), 4), 1.0), 4)
+
+
+_S3 = "s3_catalog_similar"
+_S3_COMPANIONS = ("s1_identity_item_name", "s2_keywords")
+
+
+def s3_semantic_score(cand: Candidate, env_mode: str) -> float:
+    """S3 官方目录身份一致性语义证据（P2 铁律 14a，0..S3_SEM_CAP）。
+
+    可信条件（全部满足才算数，缺一即 0）：
+    - env live：mock 检索结果绝不冒充官方语义（铁律 5/29）；
+    - 候选另有 S1/S2 检索证据伴随：防同一 S3 响应把证据/语义两道门
+      一起顶开（任务一.4）——纯 S3 候选证据分上限 ≈(1+0.1n)/5 本就
+      过不了 0.4 证据门，语义门同样不认它单独说话；
+    - S3 采信商品数 ≥S3_SEM_MIN_ASINS：采信=candidates.s3 已过身份
+      一致性核验（本体词重叠+本站点 PT），单个相似商品可能是检索
+      噪音。
+    值 = S3_SEM_CAP × min((n-1)/3, 1)：2 个=0.25（恰好语义下限）、
+    3 个=0.5、≥4 个=0.75 封顶。
+    与证据分的关系：证据分度量「官方检索是否**召回**该 PT」（S3 分量
+    1.0+0.1n，弱权重）；本函数度量「官方目录里与本体**一致的同类商品**
+    是不是这个 PT」——同一 API 响应回答两个不同问题，且任何单一证据
+    都不能同时独立打开两道门（双门槛都过才算 suitable）。"""
+    if env_mode != "live":
+        return 0.0
+    n = len((cand.sources.get(_S3) or {}).get("asins") or [])
+    if n < S3_SEM_MIN_ASINS:
+        return 0.0
+    if not any(s in cand.sources for s in _S3_COMPANIONS):
+        return 0.0
+    return round(S3_SEM_CAP * min((n - 1) / 3.0, 1.0), 4)
+
+
+def build_semantic_payload(material: ProductMaterial, cands: CandidatesResult,
+                           eligible: list[Candidate]) -> dict:
+    """受限 GPT 语义裁决载荷（P2 铁律 14b，任务一.5/6）：只问「商品
+    是否属于该类型」，绝不选最终分类、不代替官方验证。"""
+    aux = material.auxiliary_signals()
+    return {
+        "product": {
+            "pid": material.pid,
+            "identity": material.product_identity,
+            "identity_source": material.identity_source,
+            "model": material.model,
+            "title": material.title,
+            "bullets": material.bullets[:5],
+            "usage_scenarios": aux["usage_scenarios"],
+            "fitment": aux["fits"],
+            "compatible_brands_note": aux["note"],
+            "language_guess": material.language_guess,
+        },
+        "candidates": [{
+            "pt_name": c.pt_name,
+            "display_name": c.display_name,
+            "strategies": sorted(c.sources.keys()),
+        } for c in eligible],
+        "env_mode": cands.env_mode,
+        "instruction": "只判断商品与各候选 Product Type 的语义归属"
+                       "（match + confidence + 一句话理由）；不选择最终"
+                       "分类，不代替 PTD 官方有效性验证与 Browse Node "
+                       "证据验证",
+    }
 
 
 def build_payload(material: ProductMaterial,
@@ -198,9 +307,14 @@ def _validate_ai(ai_out: "dict | None", valid: set[str]
 
 
 def match_product(material: ProductMaterial, cands: CandidatesResult,
-                  ai_decide: AiDecide, *, marketplace_id: str
+                  ai_decide: AiDecide, *, marketplace_id: str,
+                  ai_semantic: AiDecide | None = None,
                   ) -> MatchResult:
-    """纯函数：同输入同输出。不落库、不联网、不改传入对象。"""
+    """纯函数：同输入同输出。不落库、不联网、不改传入对象。
+
+    ai_semantic（P2 铁律 14b，可缺省）：受限语义裁决回调——仅当
+    （不含它）全员不达标时对「证据≥0.4 且字面语义=0」的候选问一次；
+    确认只把语义抬到 ABS_MIN_SEMANTIC，绝不更高、绝不代替官方验证。"""
     result = MatchResult(pid=material.pid, marketplace_id=marketplace_id,
                          env_mode=cands.env_mode)
     cand_list = list(cands.candidates)
@@ -211,14 +325,54 @@ def match_product(material: ProductMaterial, cands: CandidatesResult,
 
     valid = {c.pt_name for c in cand_list}
 
-    # ---- 评分（铁律 5）：证据 / 语义 / 绝对门槛逐候选算清 ----
+    # ---- 评分（铁律 5 + P2 铁律 14）：证据 / 语义（max 三源）逐候选 ----
     sem_terms = _semantic_terms(material)
     ev = {c.pt_name: min((c.score or 0.0) / EVIDENCE_FULL, 1.0)
           for c in cand_list}
-    sem = {c.pt_name: _semantic_score(sem_terms, c) for c in cand_list}
-    suitable = {c.pt_name: (ev[c.pt_name] >= ABS_MIN_EVIDENCE
-                            and sem[c.pt_name] >= ABS_MIN_SEMANTIC)
-                for c in cand_list}
+    lexical = {c.pt_name: _semantic_score(sem_terms, c) for c in cand_list}
+    s3_sem = {c.pt_name: s3_semantic_score(c, cands.env_mode)
+              for c in cand_list}
+    sem = {c.pt_name: max(lexical[c.pt_name], s3_sem[c.pt_name])
+           for c in cand_list}
+    gpt_sem: dict[str, dict] = {}      # pt -> {"match","confidence","reason"}
+
+    def _suitable(pt: str) -> bool:
+        return (ev[pt] >= ABS_MIN_EVIDENCE and sem[pt] >= ABS_MIN_SEMANTIC)
+
+    # ---- P2 受限 GPT 语义裁决（铁律 14b）：只在「否则全员不达标」的
+    # 死路上问一次（有任一候选已达标就不问——GPT 调用数不增）。
+    # 资格=证据≥0.4 且 字面语义=0 且 当前语义<下限；确认=语义抬到
+    # 下限（不多给），拒绝/低置信/形状不对/异常=维持门槛（fail-closed）。
+    eligible = [c for c in cand_list
+                if ev[c.pt_name] >= ABS_MIN_EVIDENCE
+                and lexical[c.pt_name] == 0.0
+                and sem[c.pt_name] < ABS_MIN_SEMANTIC]
+    if eligible and ai_semantic is not None \
+            and not any(_suitable(c.pt_name) for c in cand_list):
+        try:
+            verdict = ai_semantic(
+                build_semantic_payload(material, cands, eligible)) or {}
+            sem_map = verdict.get("semantic") \
+                if isinstance(verdict.get("semantic"), dict) else {}
+            for c in eligible:
+                v = sem_map.get(c.pt_name) if sem_map else None
+                if not isinstance(v, dict) or v.get("match") is not True:
+                    continue
+                try:
+                    conf = float(v.get("confidence"))
+                except (TypeError, ValueError):
+                    continue
+                if 0.0 <= conf <= 1.0 and conf >= REVIEW_THRESHOLD:
+                    gpt_sem[c.pt_name] = {
+                        "match": True, "confidence": round(conf, 4),
+                        "reason": str(v.get("reason") or "")[:200]}
+                    sem[c.pt_name] = ABS_MIN_SEMANTIC
+        except Exception as e:  # noqa: BLE001 —— 裁决层任何异常都不放行
+            result.review_reasons.append(
+                f"GPT 语义裁决失败：{type(e).__name__}"
+                "（门槛维持，进人工复核）")
+
+    suitable = {c.pt_name: _suitable(c.pt_name) for c in cand_list}
 
     def _rows() -> list[dict]:
         rows = []
@@ -231,6 +385,10 @@ def match_product(material: ProductMaterial, cands: CandidatesResult,
                 "strategies": sorted(c.sources.keys()),
                 "evidence_score": round(ev[c.pt_name], 4),
                 "semantic_score": sem[c.pt_name],
+                "semantic_detail": {   # P2：语义三源可解释（谁抬的分）
+                    "lexical": lexical[c.pt_name],
+                    "s3_official": s3_sem[c.pt_name],
+                    "gpt": gpt_sem.get(c.pt_name)},
                 "final_score": round(0.6 * ev[c.pt_name]
                                      + 0.4 * sem[c.pt_name], 4),
                 "suitable": suitable[c.pt_name],
@@ -275,6 +433,21 @@ def match_product(material: ProductMaterial, cands: CandidatesResult,
             and not result.review_reasons:
         result.review_reasons.append("AI 未给出选择（返回 null）")
 
+    # ---- P2 加固（铁律 15a）：GPT-only 语义不自动确认 ----
+    # 语义门若只有 GPT 裁决一个来源把候选抬过下限（字面=0 且官方目录=0
+    # ——裁决资格本身排除了其他来源），「合适」只是 AI 单方判断，缺乏
+    # 任何独立语义证据。此时即使证据分与置信度全部过线，也只作为人工
+    # 复核辅助信号：chosen 推荐保留（P5 证据链可见），强制 needs_review。
+    # 对抗性场景（错误候选 ev≥0.6 + GPT 误确认 + AI 高自报 → conf≥0.55）
+    # 由本闸拦下，绝不 status=matched。
+    if adopted is not None and adopted in gpt_sem \
+            and lexical[adopted] < ABS_MIN_SEMANTIC \
+            and s3_sem[adopted] < ABS_MIN_SEMANTIC:
+        result.review_reasons.append(
+            f"所选 {adopted} 的语义证据仅来自 GPT 裁决（字面 "
+            f"{lexical[adopted]:.2f} / 官方目录 {s3_sem[adopted]:.2f}，"
+            "无独立语义证据）——只作人工复核辅助，不自动确认（P2 加固）")
+
     result.candidates = _rows()
     for row in result.candidates:
         row["ai_reason"] = reasons.get(row["pt_name"], "")
@@ -293,10 +466,17 @@ def match_product(material: ProductMaterial, cands: CandidatesResult,
         result.confidence_breakdown = {
             "evidence": round(ev[adopted], 4),
             "semantic": sem[adopted],
+            "semantic_detail": {   # P2：语义分来源（lexical/s3/gpt）
+                "lexical": lexical[adopted],
+                "s3_official": s3_sem[adopted],
+                "gpt": gpt_sem.get(adopted)},
             "gap": round(gap, 4),
             "ai_self": self_conf,
             "weights": {"evidence": W_EVIDENCE, "semantic": W_SEMANTIC,
                         "gap": W_GAP, "ai": W_AI},
+            # P2 加固（铁律 15b/15c）：证据依赖表随结果可审计；
+            # 原始三源见 semantic_detail，合成分不掩盖原始证据。
+            "evidence_dependency": EVIDENCE_DEPENDENCY,
             "abs_gate": {"min_evidence": ABS_MIN_EVIDENCE,
                          "min_semantic": ABS_MIN_SEMANTIC,
                          "chosen_suitable": True},

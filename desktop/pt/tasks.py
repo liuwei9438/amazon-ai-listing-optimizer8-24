@@ -75,7 +75,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
-from pt.candidates import retrieve_candidates
+from pt.candidates import bn_missing_reason, retrieve_candidates
 from pt.material import extract_material
 from pt.matcher import match_product
 from pt.schema import (
@@ -173,6 +173,8 @@ class TaskEngine:
       store        pt.store.PtStore（模块 1，v3）
       client       pt.spapi_client.SpApiClient（模块 2，env 与任务一致）
       ai_decide    AI 决策器（模块 4 契约；引擎内串行调用）
+      ai_semantic  P2 受限语义裁决器（可选；只在字面 0 分死局触发，
+                   绝不替代 PTD/BN 官方验证）
       load_product pid -> (record, understanding) | (None, None)
                    商品资料装载器（桌面版数据侧提供；无此商品返回 None）
       cache_root   Schema 缓存根目录（模块 6）
@@ -188,7 +190,8 @@ class TaskEngine:
                  cache_root: str, seller_id: str = "",
                  max_workers: int = DEFAULT_MAX_WORKERS,
                  item_max_attempts: int = DEFAULT_ITEM_MAX_ATTEMPTS,
-                 http_retry_attempts: int = 1):
+                 http_retry_attempts: int = 1,
+                 ai_semantic: Callable[[dict], dict] | None = None):
         mw = int(max_workers)
         if mw < 1 or mw > MAX_WORKERS_CAP:
             raise ValueError(
@@ -204,6 +207,9 @@ class TaskEngine:
         self._store = store
         self._client = client
         self._ai_decide = ai_decide
+        # P2 受限语义裁决（可选；None=引擎在字面 0 分死局时也不问 GPT，
+        # 行为与修复前一致）。与 ai_decide 共用 _ai_lock 串行。
+        self._ai_semantic = ai_semantic
         self._load_product_fn = load_product
         self._cache_root = str(cache_root)
         self._seller_id = str(seller_id or "")
@@ -487,7 +493,8 @@ class TaskEngine:
         self._store.set_item_stage(t, pid, "ai_matching")
         with self._ai_lock:
             mr = match_product(material, cands, self._ai_decide,
-                               marketplace_id=ctx.marketplace_id)
+                               marketplace_id=ctx.marketplace_id,
+                               ai_semantic=self._ai_semantic)
         if mr.status != "matched" or mr.needs_review or not mr.chosen:
             kind = {
                 "no_candidates": "no_candidates",
@@ -497,6 +504,9 @@ class TaskEngine:
                 t, pid, "needs_review",
                 error="；".join(mr.review_reasons)[:300] or "匹配未放行",
                 error_kind=kind)
+            # P5：AI 建议（chosen/置信度/候选行）随复核快照落库
+            self._save_review_evidence(ctx, t, pid, "ai_matching", kind,
+                                       mr.review_reasons, mr=mr)
             return
         chosen = mr.chosen
 
@@ -532,6 +542,10 @@ class TaskEngine:
                 t, pid, "needs_review",
                 error="官方 404：AI 所选 PT 该站点不存在——不保存非法选择",
                 error_kind="pt_not_found")
+            self._save_review_evidence(
+                ctx, t, pid, "pt_verification", "pt_not_found",
+                ["官方 404：AI 所选 PT 该站点不存在——不保存非法选择"],
+                mr=mr)
             return
         sem = pv.semantic
         if sem.status in ("failed", "insufficient", "error", "skipped"):
@@ -540,6 +554,10 @@ class TaskEngine:
                 error=f"PT 语义适配未通过（{sem.status}）："
                       f"{sem.detail.get('note', '')}",
                 error_kind=f"semantic_{sem.status}")
+            self._save_review_evidence(
+                ctx, t, pid, "pt_verification", f"semantic_{sem.status}",
+                [f"PT 语义适配未通过（{sem.status}）："
+                 f"{sem.detail.get('note', '')}"], mr=mr)
             return
         if sem.status == S_UNAVAILABLE:
             self._fail_retryable(t, pid, "unavailable",
@@ -552,10 +570,17 @@ class TaskEngine:
         self._store.set_item_stage(t, pid, "browse_node_verification")
         nodes = self._bn_nodes_for(cands, chosen)
         if not nodes:
+            # D3 只读诊断：说明为什么没有节点证据（区分 请求失败/解析
+            # 失败/未返回分类节点/证据不足）——门槛不变，仍交人工。
             self._store.set_item_state(
                 t, pid, "needs_review",
-                error="PT 已验证但候选证据无 Browse Node（classification_ids"
-                      " 缺失）——交人工选节点", error_kind="bn_no_nodes")
+                error="PT 已验证但候选证据无 Browse Node——"
+                      f"{bn_missing_reason(cands)}——交人工选节点",
+                error_kind="bn_no_nodes")
+            self._save_review_evidence(
+                ctx, t, pid, "browse_node_verification", "bn_no_nodes",
+                ["PT 已验证但候选证据无 Browse Node——"
+                 f"{bn_missing_reason(cands)}——交人工选节点"], mr=mr)
             return
         best_node: str | None = None
         for nid in nodes:
@@ -583,6 +608,10 @@ class TaskEngine:
                 t, pid, "needs_review",
                 error=f"BN 证据不足（{len(nodes)} 个候选节点无一确认）——"
                       "绝不猜节点，交人工", error_kind="bn_insufficient")
+            self._save_review_evidence(
+                ctx, t, pid, "browse_node_verification", "bn_insufficient",
+                [f"BN 证据不足（{len(nodes)} 个候选节点无一确认）——"
+                 "绝不猜节点，交人工"], mr=mr)
             return
 
         # ---- 阶段 schema_analysis（Schema 成功≠属性齐全） ----
@@ -611,6 +640,9 @@ class TaskEngine:
                 t, pid, "needs_review",
                 error="官方响应缺 schema.link——无 Schema 可下载",
                 error_kind="schema_no_link")
+            self._save_review_evidence(
+                ctx, t, pid, "schema_analysis", "schema_no_link",
+                ["官方响应缺 schema.link——无 Schema 可下载"], mr=mr)
             return
         if so.status != OUT_OK:
             detail = so.detail or {}
@@ -661,6 +693,61 @@ class TaskEngine:
     # ------------------------------------------------------------------
     # 内部：工具
     # ------------------------------------------------------------------
+
+    def _save_review_evidence(self, ctx, task_id: str, pid: str,
+                              stage: str, kind: str,
+                              reasons: list | None,
+                              mr: "MatchResult | None" = None) -> None:
+        """P5：needs_review 时落 AI 建议结构化快照（追加式）。
+
+        只写 pt_review_evidence（建议），绝不写 pt_assignment——待复核
+        建议不得被标记为已确认分类（任务二.3）。mr=None 用于无匹配结果
+        的早期分支（如资料缺失）——本引擎只在有 mr 的分支调用。证据链
+        任何故障都不影响主流程（复核界面至少还有任务条目可看）。"""
+        try:
+            ai_chosen = None
+            ai_conf = None
+            ai_detail = None
+            if mr is not None:
+                ai_conf = mr.confidence
+                for row in (mr.candidates or []):
+                    if row.get("ai_picked"):
+                        ai_chosen = row.get("pt_name")
+                        break
+                ai_detail = {
+                    "status": mr.status,
+                    "chosen": mr.chosen,
+                    "needs_review": mr.needs_review,
+                    "candidates": (mr.candidates or [])[:8],
+                    "confidence_breakdown": mr.confidence_breakdown,
+                    "official_verified": mr.official_verified,
+                }
+            official = []
+            try:
+                rows = self._store.verifications(ctx.store_id,
+                                                 ctx.marketplace_id, pid)
+                for v in rows[-6:]:
+                    detail = v.get("detail") or {}
+                    official.append({
+                        "check_kind": v.get("check_kind"),
+                        "status": v.get("status"),
+                        "pt_name": v.get("pt_name"),
+                        "node_id": v.get("node_id"),
+                        "official": detail.get("official"),
+                        "note": str(detail.get("note") or "")[:120],
+                    })
+            except Exception:              # noqa: BLE001 —— 快照尽力而为
+                official = []
+            self._store.add_review_evidence(
+                store_id=ctx.store_id, marketplace_id=ctx.marketplace_id,
+                pid=pid, task_id=task_id, env=ctx.env, stage=stage,
+                error_kind=kind,
+                review_reasons=[str(r)[:200] for r in (reasons or [])][:12],
+                ai_chosen=ai_chosen, ai_confidence=ai_conf,
+                ai_detail=ai_detail, official_status=official,
+            )
+        except Exception:                  # noqa: BLE001 —— 绝不影响主流程
+            pass
 
     def _phase_of(self, task_id: str) -> str | None:
         task = self._store.get_task(task_id)

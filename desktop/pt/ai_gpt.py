@@ -33,7 +33,7 @@ from typing import Callable
 __all__ = [
     "AiDecisionError", "AiConfigError", "AiTimeoutError", "AiUnreachableError",
     "AiBadStatusError", "AiEmptyResponseError", "AiInvalidJsonError",
-    "GptDecision",
+    "GptDecision", "build_semantic_prompt", "parse_semantic_text",
 ]
 
 
@@ -161,6 +161,78 @@ def build_prompt(payload: dict) -> str:
     return "\n".join(lines)
 
 
+def build_semantic_prompt(payload: dict) -> str:
+    """P2 受限语义裁决 prompt（matcher.build_semantic_payload → 文本）。
+
+    与决策 prompt 的本质区别：只问「商品是否属于该类型」（match/
+    confidence/理由），明令**不选择最终分类、不代替官方验证**——选择
+    与门槛仍归 pt.matcher（唯一裁判），官方验证归模块 5。"""
+    p = payload.get("product") or {}
+    cands = payload.get("candidates") or []
+    lines = [
+        "你是亚马逊商品分类语义审查员。只判断商品与每个候选 Product "
+        "Type 的语义归属：商品是不是这一类东西（整机配件挂整机类型、"
+        "相似词不等于同类）。不选择最终分类，不代替任何官方验证。",
+        "",
+        "【商品】",
+        f"- 标题：{p.get('title') or ''}",
+        f"- 身份：{p.get('identity') or ''}",
+        f"- 型号：{p.get('model') or ''}",
+    ]
+    if p.get("bullets"):
+        lines.append("- 要点：" + "；".join(str(b) for b in p["bullets"][:5]))
+    if p.get("fitment"):
+        lines.append("- 适配设备（辅助线索，商品本体可能只是其配件）：" +
+                     "、".join(str(x.get("value") or x) if isinstance(x, dict)
+                               else str(x) for x in p["fitment"][:8]))
+    lines += ["", "【候选 Product Type】"]
+    for i, c in enumerate(cands, 1):
+        lines.append(f"{i}. {c.get('pt_name')}"
+                     f"（{c.get('display_name') or ''}）")
+    lines += [
+        "",
+        "只输出一个 JSON 对象（不要任何其他文字）：",
+        '{"semantic": {"候选 pt_name": {"match": true或false, '
+        '"confidence": 0.0到1.0, "reason": "一句话理由"}}}',
+    ]
+    return "\n".join(lines)
+
+
+def parse_semantic_text(text: str) -> dict:
+    """裁决输出解析（容忍围栏/前后废话）。合法形状：
+    {"semantic": {pt: {"match": bool, "confidence": 0..1, "reason": str}}}。
+    形状不对 → AiInvalidJsonError（matcher 收到异常=维持门槛）。"""
+    raw = str(text or "").strip()
+    if not raw:
+        raise AiEmptyResponseError("模型返回空内容")
+    body = raw
+    m = _JSON_FENCE.search(raw)
+    if m:
+        body = m.group(1).strip()
+    else:
+        i, j = body.find("{"), body.rfind("}")
+        if i >= 0 and j > i:
+            body = body[i:j + 1]
+    try:
+        obj = json.loads(body)
+    except Exception as e:  # noqa: BLE001
+        raise AiInvalidJsonError(
+            f"模型输出不是合法 JSON：{type(e).__name__}") from e
+    if not isinstance(obj, dict) or not isinstance(obj.get("semantic"),
+                                                   dict):
+        raise AiInvalidJsonError("semantic 裁决输出形状不对（缺 semantic 对象）")
+    out: dict = {"semantic": {}}
+    for k, v in obj["semantic"].items():
+        if not isinstance(v, dict):
+            continue
+        out["semantic"][str(k)] = {
+            "match": v.get("match") is True,
+            "confidence": v.get("confidence"),
+            "reason": str(v.get("reason") or "")[:200],
+        }
+    return out
+
+
 class GptDecision:
     """ai_decide 适配器（线程安全性由 TaskEngine 的 AI 锁保证）。
 
@@ -231,6 +303,38 @@ class GptDecision:
                            latency_ms=round((time.time() - started) * 1000),
                            cands_n=len(cands), cands_hash=cands_hash,
                            chosen=chosen, err_kind=err_kind)
+
+    # ---- P2 受限语义裁决契约（matcher.ai_semantic） ----
+
+    def semantic_verdict(self, payload: dict) -> dict:
+        """受限语义裁决：复用同一凭证/网络/证据管线，prompt 与解析
+        独立（只判 match/confidence，不选分类）。异常分类同 __call__
+        ——matcher 收到异常=维持门槛（fail-closed）。"""
+        pid = str((payload.get("product") or {}).get("pid") or "")
+        cands = payload.get("candidates") or []
+        cands_hash = hashlib.sha1(
+            ",".join(sorted(str(c.get("pt_name") or "")
+                            for c in cands)).encode("utf-8")
+        ).hexdigest()[:10]
+        started = time.time()
+        err_kind = ""
+        matched: list[str] = []
+        try:
+            if not self._key or not self._model:
+                raise AiConfigError("还没配置 AI Key/模型")
+            text = self._ask(build_semantic_prompt(payload))
+            out = parse_semantic_text(text)
+            matched = sorted(k for k, v in (out.get("semantic") or {}).items()
+                             if v.get("match"))
+            return out
+        except AiDecisionError as e:
+            err_kind = e.kind
+            raise
+        finally:
+            self._evidence(pid=pid, model=self._model, kind="semantic",
+                           latency_ms=round((time.time() - started) * 1000),
+                           cands_n=len(cands), cands_hash=cands_hash,
+                           matched=matched, err_kind=err_kind)
 
     def _ask(self, prompt: str) -> str:
         if self._chat_fn is not None:
