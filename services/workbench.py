@@ -1067,6 +1067,14 @@ def _card_body_html(
     if opt_ms:
         lines.append(f"优化时间：{_fmt_ms(opt_ms)}")
 
+    # V2.13.7：采集时间（首次入库）/ 导入产品库时间
+    lines.append(f"采集时间：{_fmt_ms(it.get('created'))}")
+
+    imp_ms = int(it.get("imp") or 0)
+
+    if imp_ms:
+        lines.append(f"导入产品库：{_fmt_ms(imp_ms)}")
+
     src_status = str(it.get("status") or "wait")
 
     if src_status == "found":
@@ -1169,12 +1177,64 @@ def _render_wb_table(
         if "未分类" not in cats:
             cats.append("未分类")
 
+    # ---- V2.13.7 采集库 / 产品库：采集导入的产品先进采集库，
+    # 优化完成后在这里勾选「📦 导入产品库」（worker /prod_promote
+    # 给记录打 imported_at 标，索引项 imp>0 = 已在产品库）----
+    st.session_state.setdefault("wb_pool", "collect")
+
+    n_lib = sum(1 for it in items if int(it.get("imp") or 0) > 0)
+    n_collect = len(items) - n_lib
+
+    pool_cols = st.columns(3)
+
+    pool_defs = [
+        ("all", f"全部（{len(items)}）"),
+        ("collect", f"📥 采集库（{n_collect}）"),
+        ("lib", f"📦 产品库（{n_lib}）"),
+    ]
+
+    for col, (code, label) in zip(pool_cols, pool_defs):
+        active = st.session_state["wb_pool"] == code
+
+        if col.button(
+            label,
+            key=f"wb_pool_{code}",
+            type="primary" if active else "secondary",
+            use_container_width=True,
+        ):
+            st.session_state["wb_pool"] = code
+            st.rerun()
+
+            return
+
+    pool = st.session_state["wb_pool"]
+
+    if pool != "all":
+        # 采集库 = 还没导入（imp==0）；产品库 = 已导入（imp>0）
+        items = [
+            it
+            for it in items
+            if (int(it.get("imp") or 0) > 0) == (pool == "lib")
+        ]
+
     counts = {"all": len(items), "opt": 0, "ready": 0, "thin": 0}
 
     for it in items:
         counts[_wb_state(it)] += 1
 
     st.markdown("#### 产品列表")
+
+    if pool == "collect":
+        st.caption(
+            "采集导入的产品先到采集库；跑完 🚀 AI 优化后勾选，"
+            "点「📦 导入产品库」进入产品库。"
+        )
+
+    elif pool == "lib":
+        st.caption(
+            "产品库 = 从采集库导入的成品（已优化）。"
+            "下面的日期筛选按导入时间。"
+        )
 
     # ---- V2.13.4 老产品库样式：状态标签页（带数量）----
     st.session_state.setdefault("wb_status_code", "")
@@ -1204,7 +1264,10 @@ def _render_wb_table(
 
     state_code = st.session_state["wb_status_code"]
 
-    # ---- 导入日期快捷筛选（created 毫秒，客户端过滤）----
+    # ---- 日期快捷筛选（客户端过滤）。V2.13.7：产品库视图按导入
+    # 时间（imp），采集库/全部按采集入库时间（created）----
+    date_key = "imp" if pool == "lib" else "created"
+
     st.session_state.setdefault("wb_date_code", "all")
 
     date_cols = st.columns(8)
@@ -1317,8 +1380,8 @@ def _render_wb_table(
 
     sort_keys = {
         "最近更新": lambda it: -(int(it.get("updated") or 0)),
-        "最近导入": lambda it: -(int(it.get("created") or 0)),
-        "最早导入": lambda it: int(it.get("created") or 0),
+        "最近导入": lambda it: -(int(it.get(date_key) or 0)),
+        "最早导入": lambda it: int(it.get(date_key) or 0),
         "最近优化": lambda it: -(int(it.get("opt_at") or 0)),
     }
 
@@ -1333,15 +1396,15 @@ def _render_wb_table(
         ) != cat_choice:
             continue
 
-        created_ms = int(it.get("created") or 0)
+        date_ms = int(it.get(date_key) or 0)
 
         if lo_ms is not None and (
-            not created_ms or created_ms < lo_ms
+            not date_ms or date_ms < lo_ms
         ):
             continue
 
         if hi_ms is not None and (
-            not created_ms or created_ms > hi_ms
+            not date_ms or date_ms > hi_ms
         ):
             continue
 
@@ -1503,7 +1566,7 @@ def _render_wb_table(
             )
         )
 
-    opt_btn = cat_btn = del_btn = export_clicked = False
+    opt_btn = cat_btn = del_btn = export_clicked = import_btn = False
 
     if read_only:
         st.caption("👁 只读视图 — 要操作产品请切回自己的库。")
@@ -1536,7 +1599,7 @@ def _render_wb_table(
         sel_bar3.caption(f"已勾选 **{n_sel}** 个（跨页保留）")
 
         # 操作按钮在表格上方：勾选完不用滚过整页数据找按钮
-        b1, b2, b3, b4 = st.columns(4)
+        b1, b2, b3, b4, b5 = st.columns(5)
 
         opt_btn = b1.button(
             f"🚀 AI 优化（{n_sel}）",
@@ -1567,6 +1630,15 @@ def _render_wb_table(
             use_container_width=True,
             disabled=not n_sel,
         )
+
+        # V2.13.7 采集库 → 产品库：只导入已优化的（规则见导入处理）
+        if pool == "collect":
+            import_btn = b5.button(
+                f"📦 导入产品库（{n_sel}）",
+                key="wb_promote_btn",
+                use_container_width=True,
+                disabled=not n_sel,
+            )
 
         if task_busy:
             b1.caption("任务运行中，结束后才能再优化。")
@@ -1608,6 +1680,49 @@ def _render_wb_table(
                     key="wb_export_dl",
                     use_container_width=True,
                 )
+
+        # ---- V2.13.7 批量导入产品库（采集库视图）----
+        if import_btn:
+            opt_map = {
+                str(it.get("pid")): bool(it.get("has_opt"))
+                for it in filtered
+            }
+            ready = [p for p in sel_pids if opt_map.get(p)]
+            skipped = len(sel_pids) - len(ready)
+
+            if not ready:
+                st.warning(
+                    "选中的产品都还没跑过 🚀 AI 优化"
+                    "（导入产品库要求先优化）。"
+                )
+
+            else:
+                try:
+                    from services.product_lib import _prod_write
+
+                    # promote 每条 = 1 读 + 1 写，20 条一块 ≈ 41 次
+                    # KV 子操作，不超过 Worker 免费版单次 50 次上限
+                    _prod_write(
+                        "/prod_promote",
+                        "pids",
+                        ready,
+                        label="导入失败",
+                    )
+                    _refresh_index(src_key)
+                    st.session_state[sel_state_key] = []
+
+                    msg = f"📦 已导入产品库 {len(ready)} 个"
+
+                    if skipped:
+                        msg += f"（{skipped} 个未优化已跳过）"
+
+                    st.toast(msg)
+                    st.rerun()
+
+                    return
+
+                except Exception as exc:
+                    st.error(f"导入失败：{exc}")
 
     # ---- 批量设分类 ----
     if st.session_state.get("prodlib_cat_panel") and n_sel:
