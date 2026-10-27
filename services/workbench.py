@@ -1334,8 +1334,33 @@ def _render_wb_table(
                 hi_date, datetime.max.time()
             ).timestamp() * 1000
 
-    # ---- 分类 / 搜索 / 排序 / 刷新 ----
-    f1, f2, f3, f4 = st.columns([1.4, 2.2, 1.2, 0.5])
+    # ---- 分类 / 业务员 / 搜索 / 排序 / 刷新 ----
+    # V2.13.8：全部产品视图加「业务员」筛选（参考智赢——按采集人
+    # 查产品；采集库 / 产品库两个视图同一套筛选）
+    owners = sorted(
+        {
+            str(it.get("owner") or "").strip()
+            for it in items
+            if str(it.get("owner") or "").strip()
+        }
+    )
+
+    if show_owner and owners:
+        f1, f2, f3, f4, f5 = st.columns([1.3, 1.3, 1.9, 1.1, 0.5])
+
+        with f2:
+            owner_choice = st.selectbox(
+                "业务员",
+                ["全部业务员"] + owners,
+                key="wb_owner",
+            )
+
+        q_col, s_col, r_col = f3, f4, f5
+
+    else:
+        owner_choice = "全部业务员"
+
+        f1, q_col, s_col, r_col = st.columns([1.4, 2.2, 1.2, 0.5])
 
     with f1:
         cat_choice = st.selectbox(
@@ -1344,20 +1369,22 @@ def _render_wb_table(
             key="wb_cat",
         )
 
-    with f2:
+    with q_col:
         query = st.text_input(
-            "搜索（标题 / SKU / 型号）",
+            "搜索（标题 / SKU / 型号"
+            + (" / 业务员" if show_owner and owners else "")
+            + "）",
             key="wb_q",
         )
 
-    with f3:
+    with s_col:
         sort_choice = st.selectbox(
             "排序",
             ["最近更新", "最近导入", "最早导入", "最近优化"],
             key="wb_sort",
         )
 
-    with f4:
+    with r_col:
         st.caption("")
         refresh_clicked = st.button(
             "🔄",
@@ -1396,6 +1423,12 @@ def _render_wb_table(
         ) != cat_choice:
             continue
 
+        # V2.13.8：业务员筛选（全部产品视图）
+        if owner_choice != "全部业务员" and str(
+            it.get("owner") or ""
+        ) != owner_choice:
+            continue
+
         date_ms = int(it.get(date_key) or 0)
 
         if lo_ms is not None and (
@@ -1413,7 +1446,7 @@ def _render_wb_table(
                 r"\s+",
                 "",
                 f"{it.get('title', '')}{it.get('sku', '')}"
-                f"{it.get('model', '')}",
+                f"{it.get('model', '')}{it.get('owner', '')}",
             ).lower()
 
             if needle not in haystack:
