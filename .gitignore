@@ -9,3 +9,6 @@ tasks/
 # Python 缓存
 __pycache__/
 *.pyc
+
+# PT 本地数据（pt.sqlite3/缓存，绝不提交）
+desktop/pt_data/

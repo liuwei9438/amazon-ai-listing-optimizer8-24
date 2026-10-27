@@ -147,6 +147,7 @@ function enterApp() {
   pollTask();  // 万一上次任务还在跑
   pollAutoCat();  // AI 归类同理（在跑就接上进度，空闲首轮即停）
   if (window.PtUI) PtUI.enter();  // 🧭 亚马逊 AI 分类（pt.js 独立模块）
+  if (window.PtwUI) PtwUI.enter();  // 🧪 Mock 刊登台（ptw.js 独立模块，S2e）
 }
 
 async function doLogout() {
@@ -355,7 +356,7 @@ function renderPager() {
 function renderSelBar() {
   const ro = readOnly();
   ["btnSelAll", "btnSelNone", "btnOpt", "btnCat", "btnAutoCat", "btnDel",
-   "btnExport", "btnAmz", "btnImportToggle"].forEach((id) =>
+   "btnExport", "btnAmz", "btnPtw", "btnImportToggle"].forEach((id) =>
     $(id).classList.toggle("hidden", ro));
 
   if (ro) {
@@ -369,20 +370,28 @@ function renderSelBar() {
   $("btnDel").disabled = S.sel.size === 0;
   $("btnExport").disabled = S.sel.size === 0;
   $("btnAmz").disabled = S.sel.size === 0;
+  $("btnPtw").disabled = S.sel.size === 0;
 }
 
 /* ---------- 详情：点卡片立刻秒开（列表缓存先画壳，资料到了再填） ---------- */
 
+let detailSeq = 0;   // 详情切换序号：迟到的旧商品资料绝不覆盖新商品
+
 function openDetail(pid) {
   pid = String(pid);
+  const seq = ++detailSeq;
   const it = S.items.find((x) => String(x.pid) === pid) || { pid };
   renderDetailShell(it);
   $("dlgDetail").classList.remove("hidden");
 
   const owner = readOnly() ? String(it.owner || "") : "";
   api(`/api/product?pid=${encodeURIComponent(pid)}${owner ? `&owner=${encodeURIComponent(owner)}` : ""}`)
-    .then((r) => fillDetail(r.product || {}, it))
+    .then((r) => {
+      if (seq !== detailSeq) return;   // 已切到别的商品：旧资料整包丢弃
+      fillDetail(r.product || {}, it);
+    })
     .catch((e) => {
+      if (seq !== detailSeq) return;
       const el = $("dLoading");
       if (el) el.innerHTML = `<div class="warn">⚠️ 详细资料读取失败：${esc(e.message)}（基础信息还在，关掉重开一次即可）</div>`;
     });
@@ -565,6 +574,11 @@ function fillDetail(rec, it) {
     parts.push(`<div class="d-sec"><div class="warn">⚠️ 资料不全：这条产品没存完整资料。用「📥 导入产品」传同一份 Excel 即可补全（相同 SKU 自动合并，不会重复）。</div></div>`);
   }
 
+  // S2b：Amazon 刊登工作台（只读）——资料明细之后的独立区块。占位
+  // 先行、异步自填：商品资料/AI/图片等区块同步渲染完毕才轮到它，PT
+  // 接口失败只降级本区块，绝不拖垮商品详情原有功能。
+  parts.push(`<div class="d-sec" id="dWb"><h4>🛒 Amazon 刊登工作台（只读）</h4><div class="wb-loading">正在读取刊登准备度…</div></div>`);
+
   // 变体（兜底：只有资料不全、没有 raw 行时才显示这张表；
   // 正常产品的变体已并进上面「资料明细」的变体 SKU 表，不再重复）
   const vars = rec.variants || [];
@@ -582,6 +596,318 @@ function fillDetail(rec, it) {
   if (canEdit) renderSlots();   // 可编辑格子条（拖动/删除/编辑/添加）
 
   bindDetailActs();
+
+  loadWb($("dBody").dataset.pid);   // S2b 工作台异步自填（不阻塞上面任何区块）
+}
+
+/* ---------- S2b：Amazon 刊登工作台（只读，服务端聚合快照） ---------- */
+
+const WB = { seq: 0 };   // 商品切换序号：迟到的旧响应整包丢弃（竞态守卫）
+
+function loadWb(pid) {
+  pid = String(pid || "");
+  const seq = ++WB.seq;
+  const box = document.getElementById("dWb");
+  if (!pid || !box) return;
+  const ac = new AbortController();
+  const tm = setTimeout(() => ac.abort(), 20000);   // PT 卡死不挂死区块
+  // 用户在「AI 分类中心」明确选了 mock → 工作台跟随同一环境（数据连续）；
+  // 其余情况不带 env，由服务端按能力挑（live 优先，响应里 env 如实回标）
+  const envQ = (typeof PT !== "undefined" && PT.inited && PT.env === "mock")
+    ? "?env=mock" : "";
+  fetch(`/api/pt/workbench/${encodeURIComponent(pid)}${envQ}`, {
+    headers: { accept: "application/json" },
+    signal: ac.signal,
+  }).then((r) => r.json().catch(() => ({}))).then((j) => {
+    clearTimeout(tm);
+    // 双重校验：序号已变、或弹窗已切到别的商品，旧响应不得覆盖新内容
+    if (seq !== WB.seq || $("dBody").dataset.pid !== pid) return;
+    renderWb(j && j.ok ? j : null, (j && j.error) || "");
+  }).catch((e) => {
+    clearTimeout(tm);
+    if (seq !== WB.seq || $("dBody").dataset.pid !== pid) return;
+    renderWb(null, (e && e.name === "AbortError")
+      ? "读取超时（20 秒）" : String((e && e.message) || e));
+  });
+}
+
+const WB_STATE = {
+  done: ["✅", "wb-done"], partial: ["🔶", "wb-partial"],
+  pending: ["⚪", "wb-pending"], not_wired: ["🔒", "wb-off"],
+};
+const WB_REVIEW = {
+  proposed: "建议", confirmed: "✅ 已确认", edited: "✏️ 已人工编辑",
+  rejected: "❌ 已否决",
+};
+const WB_VALID = {
+  passed: "✅ 通过", failed: "❌ 不符", pending: "⏳ 未验证",
+};
+
+const wbVal = (v) => (v === null || v === undefined || v === "")
+  ? "—"
+  : esc(typeof v === "object" ? JSON.stringify(v) : String(v));
+
+function renderWb(j, err) {
+  const box = document.getElementById("dWb");
+  if (!box) return;
+  const mock = !!(j && j.ok && j.env === "mock");
+  const head = mock
+    ? "<h4>🛒 Amazon 刊登工作台（模拟测试·可操作）</h4>"
+    : "<h4>🛒 Amazon 刊登工作台（只读）</h4>";
+  if (err || !j) {
+    // 只降级本区块；商品详情其余功能照常（填料已同步渲染完毕）
+    box.innerHTML = head
+      + `<div class="warn" data-wb="error">⚠️ 刊登工作台暂不可用：${esc(err || "无数据")}（商品详情其余功能不受影响）</div>`;
+    return;
+  }
+  const p = j.product || {};
+  const a = j.assignment || {};
+  const at = j.attributes || {};
+  const rows = at.rows || [];
+  const c = (at.counts && at.counts.by_review_status) || {};
+  const conf = (typeof a.confidence === "number")
+    ? `，置信 ${a.confidence.toFixed(2)}` : "";
+  const bn = (j.verifications && j.verifications.browse_node) || [];
+  const bnHtml = bn.length
+    ? bn.map((v) => `节点 ${esc(String(v.node_id || "?"))}：${esc(String(v.status || "?"))}`).join("；")
+    : "—（还没跑节点验证）";
+  const s = j.schema || null;
+  const schLine = !s
+    ? "Schema：—（还没分类，无 Schema 上下文）"
+    : `Schema：${esc(s.status || "?")}${s.version ? ` · 版本 ${esc(s.version)}` : ""}`
+      + (s.file_present ? "" : "（缓存文件缺失——预检不可能通过）")
+      + (s.row_version_mismatch
+        ? `（${s.row_version_mismatch} 行与现行 Schema 版本不符）` : "");
+
+  const steps = (j.readiness && j.readiness.steps) || [];
+  const chain = `<div class="wb-chain" data-wb="chain">` + steps.map((st) => {
+    const [icon, cls] = WB_STATE[st.state] || WB_STATE.pending;
+    return `<div class="wb-step ${cls}" data-wb-step="${esc(st.key)}" data-wb-state="${esc(st.state)}">`
+      + `<span class="wb-ic">${icon}</span><span class="wb-lb">${esc(st.label)}</span>`
+      + `<span class="wb-dt">${esc(st.detail || "")}</span></div>`;
+  }).join("") + `</div>`;
+
+  // —— S2e（mock 才有的可操作区；live 一律保持 S2b 只读零按钮）——
+  // 上下文挂在容器上：动作处理统一从这里取（商品/店铺/env 跟数据走，
+  // 绝不由客户端凭空指定别人家的东西）
+  box.dataset.wbPid = String(j.pid || "");
+  box.dataset.wbStore = String(j.store_id || "");
+  box.dataset.wbEnv = String(j.env || "");
+
+  const v = j.validation || null;
+  const exc = (j.exceptions || []).filter((x) => x.status === "open");
+  const validHtml = !mock ? "" : `<div class="wb-valid" data-wb="valid">`
+    + (v
+      ? (v.validated
+        ? `<span class="pt-b ok" data-wb-valid="passed">✅ 本地校验通过</span>`
+          + `<span class="wb-hint">（本地引擎全规则通过 ≠ 亚马逊平台最终接受）</span>`
+        : `<span class="pt-b warn" data-wb-valid="blocked">🛑 本地校验未过：`
+          + `${esc((v.exception_types || []).join("、") || "阻断")}</span>`)
+      : `<span class="pt-b" data-wb-valid="none">还没跑过校验</span>`)
+    + ` <button class="btn small" data-wb-act="revalidate" data-wb="btn-revalidate">🔄 重新校验</button>`
+    + `</div>`;
+
+  const excRowHtml = exc.map((x) => {
+    const det = x.detail || {};
+    const e0 = (det.entries || [])[0] || {};
+    return `<tr data-wb-exc="${esc(x.id)}">`
+      + `<td class="k">${esc(x.exception_type || "")}<div class="d-imghint">${esc(x.attribute_path || "")}</div></td>`
+      + `<td>${esc(String(e0.reason || det.summary || "").slice(0, 110))}`
+      + (e0.suggestion ? `<div class="d-imghint">建议：${esc(String(e0.suggestion).slice(0, 100))}</div>` : "")
+      + `<div class="d-imghint">来源 ${esc(x.source || "—")}</div></td>`
+      + `<td class="wb-acts"><span class="wb-excbtns">`
+      + `<button class="btn small" data-wb-excact="confirm" data-wb-xid="${esc(x.id)}">✅ 确认值</button>`
+      + `<button class="btn small" data-wb-excact="edit" data-wb-xid="${esc(x.id)}">✏️ 改值</button>`
+      + `<button class="btn small" data-wb-excact="dismiss" data-wb-xid="${esc(x.id)}">🗑 驳回</button>`
+      + `</span><input class="inp wb-excval hidden" data-wb-xid="${esc(x.id)}"
+           placeholder="新值（改值时填）" style="max-width:150px;margin-top:4px"></td>`
+      + `</tr>`;
+  }).join("");
+  const excHtml = !mock ? "" : `<div class="d-sub">🚨 异常工单（open ${exc.length} 条——阻断本地校验，处置后须重跑校验）</div>`
+    + (exc.length
+      ? `<table class="wb-attr" data-wb="exctbl"><tr><th>类型/属性</th><th>原因 · 修复建议</th><th style="width:230px">人工处置</th></tr>${excRowHtml}</table>`
+      : `<div class="d-imghint">（没有待处理工单${v && v.validated ? "——校验全过" : ""}）</div>`);
+
+  const grade = (g) => `<span class="wb-gr wb-gr-${esc(g || "?")}" data-grade="${esc(g || "?")}">${esc(g || "?")}</span>`;
+  // 行操作（S2e）：复核状态机允许的跳转才给按钮（proposed/edited→确认/
+  // 改/否决；confirmed→改/否决；rejected→改=复活）；confirmed 行只显示状态
+  const rowAct = (r) => {
+    if (!mock) return "";
+    const rs = String(r.review_status || "");
+    const b = [];
+    if (rs === "proposed" || rs === "edited")
+      b.push(`<button class="btn small" data-wb-rowact="confirm" data-wb-path="${esc(r.attribute_path || "")}">✅</button>`);
+    if (rs !== "confirmed")
+      b.push(`<button class="btn small" data-wb-rowact="edit" data-wb-path="${esc(r.attribute_path || "")}">✏️</button>`);
+    if (rs === "proposed" || rs === "edited" || rs === "confirmed")
+      b.push(`<button class="btn small" data-wb-rowact="reject" data-wb-path="${esc(r.attribute_path || "")}">✖</button>`);
+    return `<td class="wb-acts"><span class="wb-rowbtns">${b.join("") || "—"}</span>`
+      + `<input class="inp wb-rowval hidden" data-wb-path="${esc(r.attribute_path || "")}"
+           placeholder="新值" style="max-width:120px;margin-top:4px"></td>`;
+  };
+  const attrTbl = rows.length
+    ? `<table class="wb-attr"><tr><th>属性</th><th>值</th><th>证据</th><th>出处</th><th>校验</th><th>复核</th>${mock ? "<th>操作</th>" : ""}</tr>`
+      + rows.map((r) => `<tr data-wb-row="${esc(r.attribute_path || "")}">`
+        + `<td class="k">${esc(r.attribute_path || "")}</td>`
+        + `<td>${wbVal(r.value)}</td>`
+        + `<td>${grade(r.source_grade)}<span class="wb-cf">${typeof r.confidence === "number" ? r.confidence.toFixed(2) : ""}</span></td>`
+        + `<td class="wb-src">${esc(r.source_reference || "—")}</td>`
+        + `<td>${WB_VALID[r.validation_status] ? esc(WB_VALID[r.validation_status])
+              + (r.validation_status === "failed" && (r.validation_errors || []).length
+                ? `<div class="wb-err">${esc((r.validation_errors || []).join("；"))}</div>` : "")
+              : "—"}</td>`
+        + `<td>${WB_REVIEW[r.review_status] ? esc(WB_REVIEW[r.review_status]) : esc(r.review_status || "—")}${r.lifecycle === "stale" ? " ⌛" : ""}</td>`
+        + rowAct(r)
+        + `</tr>`).join("")
+      + `</table>`
+    : `<div class="d-imghint">（还没有属性候选行）</div>`;
+
+  const conflictHtml = (at.conflicts || []).length
+    ? `<div class="wb-gap">⚖️ 冲突属性（候选值互异，须人工裁决）：`
+      + (at.conflicts || []).map((x) => `<div>· <b>${esc(x.attribute_path || "")}</b>：${wbVal(x.values)}（${esc(x.source_reference || "")}）</div>`).join("")
+      + `</div>` : "";
+  const missingHtml = (at.missing || []).length
+    ? `<div class="wb-gap">🧩 缺失属性（无证据来源，需人工补）：`
+      + (at.missing || []).map((x) => `<div>· <b>${esc(x.attribute_path || "")}</b> — ${esc(x.reason || "")}</div>`).join("")
+      + `</div>` : "";
+  const staleHtml = (at.stale || []).length
+    ? `<div class="wb-gap">⌛ 已失效候选 ${at.stale.length} 行（${esc((at.stale[0] || {}).stale_reason || "Schema 已变化")}）——须在新 Schema 下重新生成，失效行不参与预检。</div>`
+    : "";
+
+  const ll = j.latest_listing || null;
+  const llHtml = !mock ? "" : `<div class="d-sub">🧪 单品模拟刊登（Mock 演示，绝不调用真实 Listings）</div>`
+    + `<div class="wb-single" data-wb="single">`
+    + (ll
+      ? `<div class="d-imghint">最近条目：${esc(ll.state || "?")}${ll.error_kind ? ` · ${esc(ll.error_kind)}` : ""}`
+        + `${ll.submission_id ? ` · 模拟受理 ${esc(String(ll.submission_id).slice(0, 16))}` : "（未产生受理记录）"}`
+        + ` · 任务 ${esc(String(ll.task_id || ""))}</div>`
+        : `<div class="d-imghint">还没跑过模拟刊登任务</div>`)
+    + `<button class="btn small primary" data-wb-act="mock_single" data-wb="btn-single">🧪 发起模拟刊登任务（单品）</button>`
+    + `</div>`;
+
+  box.innerHTML = head
+    + (j.env_note ? `<div class="wb-mock" id="wbMock">🎭 ${esc(j.env_note)}</div>` : "")
+    + validHtml
+    + `<table class="wb-meta">
+        <tr><td class="k">Amazon Product Type</td><td>${a.pt_name
+          ? `<b>${esc(a.pt_name)}</b>（${esc(a.chosen_by || "?")}${conf}）` : "—（还没分类）"}</td></tr>
+        <tr><td class="k">内部商品分类</td><td>${esc(p.internal_cat || "—")}<span class="wb-hint">（内部找货分类，不是 Amazon Product Type）</span></td></tr>
+        <tr><td class="k">Browse Node 验证</td><td>${bnHtml}</td></tr>
+        <tr><td class="k">Schema</td><td>${schLine}</td></tr>
+       </table>`
+    + `<div class="d-sub">刊登准备度</div>` + chain
+    + excHtml
+    + `<div class="d-sub">属性候选（${rows.length} 行 · 已确认 ${(c.confirmed || 0) + (c.edited || 0)}/${rows.length} · A/B/C/D=证据分级，不是官方结论）</div>`
+    + attrTbl + conflictHtml + missingHtml + staleHtml
+    + llHtml
+    + (mock
+      ? `<div class="wb-foot">🎭 模拟测试工作台：确认/改值/否决走人工授权接口（操作人=当前账号，全程审计）；本地校验通过 ≠ 亚马逊平台接受；模拟提交 ≠ 真实刊登。批量入口=产品列表「🧪 模拟刊登」/ 分类页「模拟刊登这个分类」。</div>`
+      : `<div class="wb-foot">只读工作台（live 未接入模拟操作；S2c 统一任务引擎 Mock-only）——属性确认/编辑请到「AI 分类中心」。</div>`);
+  wbBindActs();
+}
+
+/* ---------- S2e：工作台动作（人工授权 API；live 无按钮=物理不可达） ---------- */
+
+WB.actBusy = false;
+
+async function wbAct(fn) {
+  if (WB.actBusy) return;               // 双击/连点守卫（服务端幂等兜底）
+  WB.actBusy = true;
+  try { await fn(); } finally { WB.actBusy = false; }
+}
+
+function wbBindActs() {
+  const box = document.getElementById("dWb");
+  if (!box || box.dataset.actsBound) return;
+  box.dataset.actsBound = "1";
+  box.addEventListener("click", (e) => {
+    const act = e.target.closest("[data-wb-act]");
+    if (act) {
+      const pid = box.dataset.wbPid || $("dBody").dataset.pid;
+      const store = box.dataset.wbStore, env = box.dataset.wbEnv;
+      if (act.dataset.wbAct === "revalidate") {
+        wbAct(async () => {
+          if (!window.PtwUI) { toast("刊登台模块未加载", "err"); return; }
+          try { await PtwUI.revalidate(pid, store, env); }
+          catch (err) { /* toast 已在助手内 */ }
+          finally { loadWb(pid); }      // 校验报告/工单刷新（带竞态守卫）
+        });
+      } else if (act.dataset.wbAct === "mock_single") {
+        wbAct(async () => {
+          if (!window.PtwUI) { toast("刊登台模块未加载", "err"); return; }
+          await PtwUI.startSingle(pid, store);
+          setTimeout(() => loadWb(pid), 1500);   // 建完回读最近条目
+        });
+      }
+      return;
+    }
+    const ra = e.target.closest("[data-wb-rowact]");
+    if (ra) {
+      const pid = box.dataset.wbPid || $("dBody").dataset.pid;
+      const path = ra.dataset.wbPath;
+      const actName = ra.dataset.wbRowact;
+      const inp = box.querySelector(
+        `.wb-rowval[data-wb-path="${CSS.escape(String(path))}"]`);
+      if (actName === "edit") {
+        if (inp) inp.classList.remove("hidden");
+        if (!inp || !inp.value.trim()) {
+          toast("改值：在行内输入框填新值后再点 ✏️", "");
+          return;
+        }
+        wbAct(async () => {
+          if (!window.PtwUI) return;
+          try {
+            await PtwUI.attrAction(pid, box.dataset.wbStore, box.dataset.wbEnv,
+                                   path, "edit", inp.value.trim());
+            loadWb(pid);
+          } catch (err) { /* toast 已在助手内 */ }
+        });
+        return;
+      }
+      wbAct(async () => {
+        if (!window.PtwUI) return;
+        try {
+          await PtwUI.attrAction(pid, box.dataset.wbStore, box.dataset.wbEnv,
+                                 path, actName === "confirm" ? "confirm" : "reject");
+          loadWb(pid);
+        } catch (err) { /* toast 已在助手内 */ }
+      });
+      return;
+    }
+    const xa = e.target.closest("[data-wb-excact]");
+    if (xa) {
+      const pid = box.dataset.wbPid || $("dBody").dataset.pid;
+      const xid = xa.dataset.wbXid;
+      const action = xa.dataset.wbExcact;
+      let value;
+      if (action === "edit") {
+        const inp = box.querySelector(
+          `.wb-excval[data-wb-xid="${CSS.escape(String(xid))}"]`);
+        if (inp) inp.classList.remove("hidden");
+        if (!inp || !inp.value.trim()) {
+          toast("改值：在本行输入框填新值后再点「改值」（缺值工单不能空解决）", "err");
+          return;
+        }
+        value = inp.value.trim();
+      }
+      if (action === "dismiss" && !confirm(
+        "驳回留档=记录人工判定不处理，不改属性。确认？")) return;
+      wbAct(async () => {
+        try {
+          const body = { action };
+          if (value !== undefined) body.value = value;
+          await api(`/api/pt/review/exceptions/${encodeURIComponent(xid)}/resolve`, body);
+          toast("✅ 已处置（人工授权+审计）——请点「🔄 重新校验」确认全链", "ok");
+          loadWb(pid);
+        } catch (err) {
+          const msg = String(err.message || "");
+          toast(/已处置|409/.test(msg)
+            ? `该工单刚被处置过（重复点击不重复执行）：${msg}` : msg, "err");
+          loadWb(pid);
+        }
+      });
+    }
+  });
 }
 
 /* ---------- V3（D1.2.0）：图片集格子 + 编辑器 ---------- */
@@ -1900,14 +2226,15 @@ function applyView() {
   const v = S.view;
   $("sidenav").querySelectorAll(".nav-item").forEach((el) =>
     el.classList.toggle("on", el.dataset.view === v));
-  $("catPanel").classList.toggle("hidden", v === "list" || v === "words" || v === "pt");
+  $("catPanel").classList.toggle("hidden", v === "list" || v === "words" || v === "pt" || v === "ptw");
   $("catHead").classList.toggle("hidden", v !== "cat");
   $("recycleBox").classList.toggle("hidden", v !== "recycle");
-  $("wordsBox").classList.toggle("hidden", v !== "words" && v !== "pt");
+  $("wordsBox").classList.toggle("hidden", v !== "words" && v !== "pt" && v !== "ptw");
   $("ptBox").classList.toggle("hidden", v !== "pt");          // 🧭 亚马逊 AI 分类视图
-  $("selCat").classList.toggle("hidden", v === "cat" || v === "words" || v === "pt");   // 分类视图用树筛，不重复
+  $("ptwBox").classList.toggle("hidden", v !== "ptw");        // 🧪 Mock 刊登台视图（S2e）
+  $("selCat").classList.toggle("hidden", v === "cat" || v === "words" || v === "pt" || v === "ptw");   // 分类视图用树筛，不重复
 
-  const showProducts = v !== "recycle" && v !== "words" && v !== "pt";   // 回收站/词典/pt 视图只看自己的表格
+  const showProducts = v !== "recycle" && v !== "words" && v !== "pt" && v !== "ptw";   // 回收站/词典/pt/刊登台视图只看自己的表格
   $("statusTabs").classList.toggle("hidden", !showProducts);
   $("dateTabs").classList.toggle("hidden", !showProducts);
   $("filterRow").classList.toggle("hidden", !showProducts);
@@ -1942,6 +2269,12 @@ function catEligible() {
   };
 }
 
+function catPtwStart() {   // S2e category 入口：整分类模拟刊登（服务端冻结集合）
+  const cat = S.viewCat;
+  if (!cat) { toast("先在左边分类树里选一个分类", "err"); return; }
+  if (window.PtwUI) PtwUI.startCategory(cat === "__none__" ? "" : cat);
+}
+
 async function catOptStart() {
   const cat = S.viewCat;
   const { eligible } = catEligible();
@@ -1970,7 +2303,8 @@ function renderCatHead() {
     `<b>🗂 分类产品：${esc(catLabel(S.viewCat))}</b>` +
     `<span class="cat-head-n">${list.length} 个产品</span>` +
     (readOnly() ? "" : `　<span class="hint">勾选产品后点「🏷 移动分类」把它们分到这里</span>`
-      + `　<button class="btn small primary" onclick="catOptStart()">🚀 优化这个分类${n ? `（${n} 个待优化）` : ""}</button>`);
+      + `　<button class="btn small primary" onclick="catOptStart()">🚀 优化这个分类${n ? `（${n} 个待优化）` : ""}</button>`
+      + `　<button class="btn small" onclick="catPtwStart()">🧪 模拟刊登这个分类（Mock）</button>`);
 }
 
 async function applyDelete() {
@@ -2930,6 +3264,10 @@ function bindEvents() {
   $("btnDelApply").onclick = applyDelete;
   $("btnExport").onclick = doExport;
   $("btnAmz").onclick = openAmz;
+  $("btnPtw").onclick = () => {   // S2e selected 入口：勾选批量模拟刊登
+    if (!S.sel.size) { toast("先勾选产品", "err"); return; }
+    if (window.PtwUI) PtwUI.startSelected([...S.sel]);
+  };
   $("azBind").onclick = () => $("amzCfgBox").classList.toggle("hidden");
   $("azStore").onchange = azSelectStore;
   $("azStoreDel").onclick = azUnbind;

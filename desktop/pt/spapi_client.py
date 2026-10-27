@@ -276,7 +276,9 @@ class RateLimiter:
 # 传输层与环境隔离（模块 2 修正：显式 Direct/Proxy/Mock 三模式）
 # ---------------------------------------------------------------------------
 
-Transport = Callable[[str, str, dict, float], tuple[int, dict, bytes]]
+Transport = Callable[..., tuple[int, dict, bytes]]   # (method,url,headers,
+# timeout[, body]) —— body 为 S2c Mock 刊登提交新增的可选参（缺省无体，
+# 既有只读调用零影响）
 # transport(method, url, headers, timeout) -> (status, headers小写dict, body字节)
 
 TRANSPORT_MODES = ("direct", "proxy", "mock")
@@ -332,9 +334,13 @@ def _proxy_url_with_auth(proxy: ProxyConfig) -> str:
 
 
 def _urllib_call(opener, method: str, url: str, headers: dict,
-                 timeout: float) -> tuple[int, dict, bytes]:
-    """统一 urllib 调用：HTTPError 拆成三元组返回（状态分类在客户端做）。"""
-    req = urllib.request.Request(url, method=method, headers=headers)
+                 timeout: float, body: bytes | None = None
+                 ) -> tuple[int, dict, bytes]:
+    """统一 urllib 调用：HTTPError 拆成三元组返回（状态分类在客户端做）。
+    body=None=无请求体（既有四个只读操作全部如此）；带 body 仅 S2c
+    刊登引擎的 Mock 提交使用。"""
+    req = urllib.request.Request(url, data=body, method=method,
+                                 headers=headers)
     try:
         with opener.open(req, timeout=timeout) as resp:
             return int(resp.status), _lc(resp.headers), resp.read()
@@ -460,9 +466,10 @@ def build_environment(mode: str, *, proxy: ProxyConfig | None = None,
         host = _host_of(mock_url)
         opener_holder = _no_proxy_opener()
 
-        def mock_transport(method, url, headers, timeout):
+        def mock_transport(method, url, headers, timeout, body=None):
             _assert_host(url, host)
-            return _urllib_call(opener_holder, method, url, headers, timeout)
+            return _urllib_call(opener_holder, method, url, headers,
+                                timeout, body)
 
         base = mock_url.rstrip("/")
         return Environment("mock", mock_transport, lambda mid: base,
@@ -485,9 +492,9 @@ def build_environment(mode: str, *, proxy: ProxyConfig | None = None,
         else:
             opener = _no_proxy_opener()
 
-        def live_transport(method, url, headers, timeout):
+        def live_transport(method, url, headers, timeout, body=None):
             _assert_official_or(url, allowed)   # 官方端点 ∪ Schema 允许列表
-            return _urllib_call(opener, method, url, headers, timeout)
+            return _urllib_call(opener, method, url, headers, timeout, body)
 
         return Environment("live", live_transport, official_endpoint,
                            allowed)

@@ -70,9 +70,32 @@ STATE: dict = {
     "schema_mode": None,     # /schemas/ 定向故障：link_dead|timeout|badjson|oversize；
                              # hash_wrong 只把 PTD 里的 checksum 换成错的
     "pt_version": None,      # 覆盖 productTypeVersion（None=mock-ver-1；版本变更测试用）
+    # ---- S2c：Listings 模拟提交（默认关闭，不影响任何既有路由）----
+    "listings_mode": "ok",   # ok|badrequest|unauthorized|ratelimit_then_ok|
+                             # server_error_then_ok|timeout|rejected
+    "listings_fail_times": 1,   # *_then_ok 的失败次数
+    "listings_reject_skus": None,  # None=不拒；传 SKU 集合=定向拒绝
+    "listings_process_after": 0,   # 状态轮询几次后才 PROCESSED（0=立即）
+    "listings_get_fails_left": 0,  # S3-B2：GET 前多少次注入 429/500（0=关）
 }
 _LOCK = threading.Lock()
 RECORDS: list[dict] = []    # 每请求一条（不含令牌值，只记长度）
+LISTINGS: dict[str, dict] = {}   # S2c：幂等令牌 → 模拟提交台账
+LISTING_BY_SKU: dict[str, list[dict]] = {}   # "seller|sku" → 台账引用列表
+_LISTING_SEQ = [0]               # submissionId 单调序号（_LOCK 内自增）
+
+
+def reset_listings() -> None:
+    """清空 Listings 台账与旋钮（测试隔离用；不影响其他路由状态）。"""
+    with _LOCK:
+        LISTINGS.clear()
+        LISTING_BY_SKU.clear()
+        _LISTING_SEQ[0] = 0
+        STATE["listings_mode"] = "ok"
+        STATE["listings_fail_times"] = 1
+        STATE["listings_get_fails_left"] = 0
+        STATE["listings_reject_skus"] = None
+        STATE["listings_process_after"] = 0
 
 
 def make_item(asin: str, mid: str, classification_id: str,
@@ -234,6 +257,134 @@ class _Handler(BaseHTTPRequestHandler):
             return sum(1 for r in RECORDS
                        if r["path"].split("?")[0] == self.path.split("?")[0])
 
+    # ---- S2c：Listings 模拟提交（PUT 受理 + GET 终态轮询）----
+    # 契约按官方 Listings Items API 形状简化：PUT /listings/2021-08-01/
+    # items/{sellerId}/{sku} → {submissionId,status}；幂等令牌走
+    # X-WZ-Idempotency-Token 头（同令牌重放=返回同一 submissionId，
+    # 绝不产生第二次受理）。GET 同路径 → 当前模拟终态。
+
+    def do_PUT(self) -> None:      # noqa: N802（http.server 约定）
+        u = urlparse(self.path)
+        parts = [p for p in u.path.split("/") if p]
+        # /listings/2021-08-01/items/{sellerId}/{sku}
+        if (len(parts) == 5 and parts[0] == "listings"
+                and parts[2] == "items"):
+            self._record({})
+            return self._listings_put(parts[3], parts[4])
+        self._record({})
+        self._err(404, "NotFound", f"mock 无此路由：{u.path}")
+
+    def _listings_auth(self) -> bool:
+        token = self.headers.get("x-amz-access-token") or ""
+        mode = self._mode()
+        if mode == "no_token" and not token:
+            self._err(401, "Unauthorized", "缺少 x-amz-access-token（mock）")
+            return False
+        if mode == "bad_token" and token == "BAD_TOKEN":
+            self._err(401, "InvalidAuthenticationToken",
+                      "访问令牌无效或已过期（mock）")
+            return False
+        return True
+
+    def _listings_put(self, seller: str, sku: str) -> None:
+        if not self._listings_auth():
+            return
+        with _LOCK:
+            lm = STATE["listings_mode"]
+            ft = int(STATE["listings_fail_times"])
+            reject = set(STATE["listings_reject_skus"] or ())
+        if lm == "badrequest":
+            return self._err(400, "InvalidInput", "载荷不合法（mock）")
+        if lm == "unauthorized":
+            return self._err(401, "Unauthorized", "认证失败（mock）")
+        if lm in ("ratelimit_then_ok", "server_error_then_ok") \
+                and self._hits() <= ft:
+            if lm == "ratelimit_then_ok":
+                return self._send(
+                    429, _error_body("QuotaExceeded", "请求超限（mock）"),
+                    extra={"Retry-After": "0"})
+            return self._send(500, _error_body("InternalFailure",
+                                               "服务端错误（mock）"))
+        if lm == "timeout":
+            time.sleep(float(STATE["sleep"]))
+        try:
+            ln = int(self.headers.get("Content-Length") or 0)
+            payload = json.loads(self.rfile.read(ln) or b"{}")
+        except Exception:  # noqa: BLE001
+            return self._err(400, "InvalidInput", "载荷不是合法 JSON（mock）")
+        token = self.headers.get("X-WZ-Idempotency-Token") or ""
+        with _LOCK:
+            hit = LISTINGS.get(token) if token else None
+            if hit is not None:      # 幂等重放：同一令牌=同一受理
+                rec = dict(hit)
+            else:
+                _LISTING_SEQ[0] += 1
+                n = _LISTING_SEQ[0]
+                rejected = (lm == "rejected") or (sku in reject)
+                rec = {
+                    "token": token, "submissionId": f"mock-sub-{n}",
+                    "sellerId": seller, "sku": sku,
+                    "status": "REJECTED" if rejected else "PROCESSING",
+                    "issues": ([{"code": "5000", "message":
+                                 "模拟平台拒绝：必填属性缺失（mock）"},
+                               {"code": "5001", "message":
+                                "模拟平台拒绝：属性值与 Schema 约束"
+                                "不符（mock）"}]
+                               if rejected else []),
+                    "payload": payload, "polls": 0, "at": time.time(),
+                }
+                if token:
+                    LISTINGS[token] = rec
+                LISTING_BY_SKU.setdefault(f"{seller}|{sku}", []).append(rec)
+            resp_status = rec["status"]
+        self._send(200, json.dumps({
+            "submissionId": rec["submissionId"],
+            "status": resp_status}, ensure_ascii=False).encode())
+
+    def _listings_get(self, seller: str, sku: str) -> None:
+        if not self._listings_auth():
+            return
+        with _LOCK:
+            lm = STATE["listings_mode"]
+            gl = int(STATE.get("listings_get_fails_left") or 0)
+            if gl > 0:
+                STATE["listings_get_fails_left"] = gl - 1
+        # S3-B2：GET 故障旋钮（结果 unknown 语义测试用——受理后查询
+        # 断线/超限/认证失败 ≠ 平台拒绝）：unauthorized=恒 401；
+        # listings_get_fails_left>0 时按 listings_mode 注入 429/500
+        # （计数独立于 PUT 的 _hits，PUT/GET 互不干扰）
+        if lm == "unauthorized":
+            return self._err(401, "Unauthorized", "认证失败（mock）")
+        if gl > 0:
+            if lm == "server_error_then_ok":
+                return self._send(500, _error_body(
+                    "InternalFailure", "服务端错误（mock）"))
+            return self._send(
+                429, _error_body("QuotaExceeded", "请求超限（mock）"),
+                extra={"Retry-After": "0"})
+        if lm == "timeout":
+            # 睡在锁外（持锁睡会挡住全服）；醒来再取锁读台账
+            time.sleep(float(STATE["sleep"]))
+        with _LOCK:
+            after = int(STATE["listings_process_after"])
+            lst = LISTING_BY_SKU.get(f"{seller}|{sku}") or []
+            rec = lst[-1] if lst else None
+            if rec is None:
+                missing = True
+            else:
+                missing = False
+                if rec["status"] == "PROCESSING":
+                    rec["polls"] += 1
+                    if rec["polls"] > after:
+                        rec["status"] = "PROCESSED"
+                out = {"sku": sku, "submissionId": rec["submissionId"],
+                       "status": rec["status"], "issues": rec["issues"]}
+        # 发响应不持锁（_send 自取锁——持锁调用会自锁死）
+        if missing:
+            return self._err(404, "NotFound",
+                             f"该 SKU 尚无模拟提交：{sku}")
+        self._send(200, json.dumps(out, ensure_ascii=False).encode())
+
     # ---- 路由 ----
 
     def do_GET(self) -> None:      # noqa: N802（http.server 约定）
@@ -346,6 +497,11 @@ class _Handler(BaseHTTPRequestHandler):
             if sm == "oversize":
                 self._send(200, b'{"padding":"' + b"x" * 2_500_000 + b'"}')
                 return
+
+        # S2c：Listings 终态轮询（自带响应；不经 _body）
+        if u.path.startswith("/listings/2021-08-01/items/"):
+            parts = [p for p in u.path.split("/") if p]
+            return self._listings_get(parts[3], parts[4])
 
         body = self._body(u.path, qs, mid)
         if body is None:

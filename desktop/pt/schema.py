@@ -150,6 +150,12 @@ def _err_detail(e: BaseException) -> dict:
     if isinstance(e, SpApiError):
         d = {"kind": _err_kind(e), "error": type(e).__name__,
              "official_messages": e.official_messages()[:3]}
+        # D1.12.2：异常人话一并带上（SpApi 文本按设计只含主机+路径、
+        # 绝不含查询串/令牌——见 fetch_schema 安全模型），用户不再只能
+        # 看到裸类名 SpApiEnvironmentError 猜原因。
+        msg = str(e).strip()
+        if msg:
+            d["message"] = msg[:240]
         if e.request_id:
             d["request_id"] = e.request_id
         return d
@@ -449,6 +455,7 @@ def _ensure(client: SpApiClient, store, cache_root: str,
                       "error": "临时文件写入/替换失败（.tmp 已清理）"}
         return out
     sha = _sha256_hex(raw)
+    prev_sha = str((meta or {}).get("payload_sha256") or "")
     store.upsert_schema_meta(
         marketplace_id=marketplace_id, pt_name=pt, seller_id=seller_id,
         locale=locale, requirements=requirements,
@@ -456,6 +463,19 @@ def _ensure(client: SpApiClient, store, cache_root: str,
         parentage_level=parentage_level, product_type_version=version,
         payload_sha256=sha, payload_path=final.name, status=ST_OK,
         fetched_at=t, env=env, cache_key=key)
+    # S2a 最小失效钩子（批复一.4）：重下载后内容哈希变化 → 定向失效该
+    # cache_key 的属性候选（只此一键，绝不扩大）。续期/同内容强制重下
+    # 不会走到或哈希相等，天然不失效。钩子失败只告警，绝不拦下载成功。
+    if prev_sha != sha and callable(
+            getattr(store, "invalidate_attributes_for_schema", None)):
+        try:
+            store.invalidate_attributes_for_schema(
+                key, reason=f"Schema 重新下载：内容哈希变化"
+                            f"（{prev_sha[:12] or '无'}→{sha[:12]}），"
+                            f"productTypeVersion={version or '未知'}")
+        except Exception:  # noqa: BLE001 —— 失效失败不影响 Schema 缓存本体
+            _LOG.warning("属性失效钩子失败（不拦 Schema 下载）key=%s", key,
+                         exc_info=True)
     out.status = OUT_OK
     out.schema = res.data if isinstance(res.data, dict) \
         else json.loads(raw.decode("utf-8"))
@@ -520,8 +540,20 @@ class PropertyReq:
     enum: list | None = None
     pattern: str | None = None
     format: str | None = None
-    condition: str | None = None      # conditional 时的条件摘要
+    condition: str | None = None      # conditional 时的条件摘要（展示用）
     unknown_reason: str | None = None
+    # —— S2d 校验引擎扩展：标量边界约束（analyze 捕获、_validate_fact 执行）
+    minimum: float | None = None
+    maximum: float | None = None
+    exclusive_min: bool = False       # draft-04 布尔修饰词
+    exclusive_max: bool = False
+    multiple_of: float | None = None
+    min_length: int | None = None
+    max_length: int | None = None
+    min_items: int | None = None
+    max_items: int | None = None
+    cond_if: dict | None = None       # conditional 时的原始 if 节点
+                                       # （结构化——校验引擎可求值的简单子集）
 
 
 @dataclass
@@ -545,6 +577,34 @@ class SchemaAnalysis:
 
 
 _REQ_ORDER = {"unknown": 0, "required": 1, "conditional": 2, "optional": 3}
+
+
+def _num(x: Any) -> float | None:
+    """标量数值约束安全取值（非数值→None=不约束）。"""
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        return None
+    return float(x)
+
+
+def _int(x: Any) -> int | None:
+    if isinstance(x, bool) or not isinstance(x, int):
+        return None
+    return int(x)
+
+
+# S2d：format 关键字安全子集（保守正则，够判定「明显不符」；子集外的
+# format 一律 unknown——绝不因不认识就当作通过）
+FORMAT_CHECKERS: dict[str, str] = {
+    "date-time": r"^\d{4}-\d{2}-\d{2}[Tt ]\d{2}:\d{2}:\d{2}"
+                 r"(\.\d+)?([Zz]|[+-]\d{2}:?\d{2})?$",
+    "date": r"^\d{4}-\d{2}-\d{2}$",
+    "time": r"^\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:?\d{2})?$",
+    "uri": r"^[A-Za-z][A-Za-z0-9+.\-]*://\S+$",
+    "url": r"^[A-Za-z][A-Za-z0-9+.\-]*://\S+$",
+    "email": r"^[^@\s]+@[^@\s]+\.[^@\s]+$",
+    "uuid": r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}"
+            r"-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$",
+}
 
 
 def _cond_summary(node: Any) -> str:
@@ -652,6 +712,10 @@ def analyze_schema(schema: dict) -> SchemaAnalysis:
             t = view.get("type")
             types = [str(x) for x in t] if isinstance(t, list) \
                 else ([t] if isinstance(t, str) else [])
+            # S2d：边界约束一并捕获（数值范围/长度/数组项数/multipleOf；
+            # draft-04 布尔型与 draft-06+ 数值型 exclusive* 统一成界值）
+            emin, emax = view.get("exclusiveMinimum"), \
+                view.get("exclusiveMaximum")
             bump(path, name, types=types,
                  enum=[e for e in (view.get("enum") or [])
                        ][:ENUM_PREVIEW] if isinstance(view.get("enum"),
@@ -659,7 +723,20 @@ def analyze_schema(schema: dict) -> SchemaAnalysis:
                  pattern=view.get("pattern") if isinstance(
                      view.get("pattern"), str) else None,
                  format=view.get("format") if isinstance(
-                     view.get("format"), str) else None)
+                     view.get("format"), str) else None,
+                 minimum=_num(view.get("minimum")),
+                 maximum=_num(view.get("maximum")),
+                 exclusive_min=True if emin is True else None,
+                 exclusive_max=True if emax is True else None,
+                 multiple_of=_num(view.get("multipleOf")),
+                 min_length=_int(view.get("minLength")),
+                 max_length=_int(view.get("maxLength")),
+                 min_items=_int(view.get("minItems")),
+                 max_items=_int(view.get("maxItems")))
+            if isinstance(emin, (int, float)) and not isinstance(emin, bool):
+                bump(path, name, minimum=float(emin), exclusive_min=True)
+            if isinstance(emax, (int, float)) and not isinstance(emax, bool):
+                bump(path, name, maximum=float(emax), exclusive_max=True)
         if unknown:
             if path:
                 bump(path, name, requiredness="unknown",
@@ -667,7 +744,7 @@ def analyze_schema(schema: dict) -> SchemaAnalysis:
             unknowns.extend(f"{path or '<根>'}:{u}" for u in unknown)
         req_here = {str(r) for r in (view.get("required") or [])
                     if isinstance(r, str)}
-        cond: dict[str, str] = {}
+        cond: dict[str, tuple[str, dict]] = {}
         if isinstance(view.get("if"), dict):
             summary = _cond_summary(view["if"])
             for branch in ("then", "else"):
@@ -676,7 +753,7 @@ def analyze_schema(schema: dict) -> SchemaAnalysis:
                     m2, _ = expand(b, depth + 1)
                     for r in (m2.get("required") or []):
                         if isinstance(r, str):
-                            cond.setdefault(r, summary)
+                            cond.setdefault(r, (summary, view["if"]))
         # anyOf/oneOf/not 组合约束未完全解析：分支属性一律 unknown（铁律 6）
         for comb in ("anyOf", "oneOf", "not"):
             if comb in view:
@@ -700,7 +777,8 @@ def analyze_schema(schema: dict) -> SchemaAnalysis:
                 bump(cpath, pname, requiredness="required")
             elif pname in cond:
                 bump(cpath, pname, requiredness="conditional",
-                     condition=cond[pname])
+                     condition=cond[pname][0],
+                     cond_if=cond[pname][1])
             else:
                 bump(cpath, pname, requiredness="optional")
             walk(pnode, cpath, depth + 1)      # 本节点自身标量约束（含 array）
@@ -714,10 +792,11 @@ def analyze_schema(schema: dict) -> SchemaAnalysis:
                 bump(cpath, r, requiredness="required",
                      unknown_reason="官方 Schema 未给该属性的定义节点"
                                     "——仍按必填报告")
-        for r, summary in cond.items():
+        for r, (summary, raw_if) in cond.items():
             if r not in (prop_defs or {}):
                 cpath = f"{path}.{r}" if path else r
-                bump(cpath, r, requiredness="conditional", condition=summary)
+                bump(cpath, r, requiredness="conditional", condition=summary,
+                     cond_if=raw_if)
 
     walk(root, "", 0)
     return SchemaAnalysis(properties=[props[k] for k in sorted(props)],
@@ -813,6 +892,61 @@ def _validate_fact(val: Any, p: PropertyReq) -> tuple[str, str]:
         if not any(t in ok_map and ok_map[t](val) for t in types):
             return "mismatch", f"数据类型与官方要求不符（要 {p.types}，" \
                                f"实为 {type(val).__name__}）"
+    # —— S2d：数值范围 / multipleOf / 长度 / 数组项数 / format ——
+    def _as_num(x: Any) -> float | None:
+        if isinstance(x, bool):
+            return None
+        if isinstance(x, (int, float)):
+            return float(x)
+        if isinstance(x, str):
+            try:
+                return float(x.strip())
+            except ValueError:
+                return None
+        return None
+
+    if p.minimum is not None or p.maximum is not None or \
+            p.multiple_of is not None:
+        n = _as_num(val)
+        if n is not None:            # 非数值值交给类型检查，不在此误报
+            if p.minimum is not None and (n < p.minimum or (
+                    p.exclusive_min and n == p.minimum)):
+                return "mismatch", (f"数值低于官方下限"
+                                    f"（minimum={p.minimum}"
+                                    f"{'（exclusive）' if p.exclusive_min else ''}"
+                                    f"，实为 {val}）")
+            if p.maximum is not None and (n > p.maximum or (
+                    p.exclusive_max and n == p.maximum)):
+                return "mismatch", (f"数值高于官方上限"
+                                    f"（maximum={p.maximum}"
+                                    f"{'（exclusive）' if p.exclusive_max else ''}"
+                                    f"，实为 {val}）")
+            if p.multiple_of not in (None, 0):
+                k = n / p.multiple_of
+                if abs(k - round(k)) > 1e-9:
+                    return "mismatch", (f"数值不是官方步长的整数倍"
+                                        f"（multipleOf={p.multiple_of}，"
+                                        f"实为 {val}）")
+    if isinstance(val, str) and (p.min_length is not None
+                                 or p.max_length is not None):
+        ln = len(val)
+        if p.min_length is not None and ln < p.min_length:
+            return "mismatch", f"长度低于官方下限（minLength={p.min_length}，实为 {ln}）"
+        if p.max_length is not None and ln > p.max_length:
+            return "mismatch", f"长度超过官方上限（maxLength={p.max_length}，实为 {ln}）"
+    if isinstance(val, (list, tuple)) and (p.min_items is not None
+                                           or p.max_items is not None):
+        ln = len(val)
+        if p.min_items is not None and ln < p.min_items:
+            return "mismatch", f"数组项数低于官方下限（minItems={p.min_items}，实为 {ln}）"
+        if p.max_items is not None and ln > p.max_items:
+            return "mismatch", f"数组项数超过官方上限（maxItems={p.max_items}，实为 {ln}）"
+    if p.format:
+        rx = FORMAT_CHECKERS.get(str(p.format))
+        if rx is None:
+            return "unknown", f"官方 format 本引擎不校验（{p.format}）——无法确认"
+        if isinstance(val, str) and re.fullmatch(rx, val) is None:
+            return "mismatch", f"不符合官方 format 约束（{p.format}）"
     return "ok", ""
 
 

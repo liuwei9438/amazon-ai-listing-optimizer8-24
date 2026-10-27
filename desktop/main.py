@@ -3341,7 +3341,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._static("index.html")
                 return
 
-            if url.path in ("/app.js", "/style.css", "/pt.js"):
+            if url.path in ("/app.js", "/style.css", "/pt.js", "/ptw.js"):
                 self._static(url.path.lstrip("/"))
                 return
 

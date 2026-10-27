@@ -558,3 +558,77 @@ body {
 .pt-ai-off { font-size: 12px; }
 .pt-ai-offhead { margin-top: 4px; }
 .pt-ai-foot { font-size: 11px; }
+
+/* ---------- S2b：Amazon 刊登工作台（只读） ---------- */
+#wb { margin-top: 8px; }
+.wb-loading { font-size: 12px; color: #888; padding: 6px 0; }
+.wb-mock {
+  display: inline-block; font-size: 11px; color: #9a3412;
+  background: #fff4ec; border: 1px solid #f0c8a8;
+  border-radius: 6px; padding: 1px 8px; margin: 2px 0 6px;
+}
+.wb-meta td.k { width: 130px; }
+.wb-hint { font-size: 11px; color: #999; margin-left: 6px; }
+.wb-chain { display: flex; flex-direction: column; gap: 3px; margin: 4px 0; }
+.wb-step {
+  display: flex; gap: 8px; align-items: baseline;
+  font-size: 12px; padding: 3px 8px; border-radius: 6px;
+  background: #f7f8fa; border: 1px solid #eceff3;
+}
+.wb-step .wb-ic { flex: 0 0 auto; }
+.wb-step .wb-lb { flex: 0 0 150px; font-weight: 600; }
+.wb-step .wb-dt { color: #58606a; overflow-wrap: anywhere; }
+.wb-step.wb-done { background: #f0faf1; border-color: #cdeed1; }
+.wb-step.wb-done .wb-lb { color: #116329; }
+.wb-step.wb-partial { background: #fdf6e7; border-color: #f0dfb2; }
+.wb-step.wb-partial .wb-lb { color: #8a6d3b; }
+.wb-step.wb-off { background: #f2f3f5; border-color: #e1e4e8; color: #8a929c; }
+.wb-step.wb-off .wb-lb { color: #6b7480; }
+.wb-attr { table-layout: fixed; }
+.wb-attr td, .wb-attr th { overflow-wrap: anywhere; }
+.wb-attr td.k { width: 180px; }
+.wb-attr .wb-src { font-size: 11px; color: #6b7480; }
+.wb-attr .wb-err { font-size: 11px; color: #b71c1c; }
+.wb-cf { font-size: 11px; color: #8a929c; margin-left: 4px; }
+.wb-gr {
+  display: inline-block; min-width: 18px; text-align: center;
+  font-size: 11px; font-weight: 700; border-radius: 4px;
+  padding: 0 4px; border: 1px solid transparent;
+}
+.wb-gr-A { background: #e8f5e9; color: #116329; border-color: #cdeed1; }
+.wb-gr-B { background: #e3f2fd; color: #0d47a1; border-color: #bbdefb; }
+.wb-gr-C { background: #fff8e1; color: #8a6d3b; border-color: #f0dfb2; }
+.wb-gr-D { background: #fdecea; color: #b71c1c; border-color: #f5c6c2; }
+.wb-gap {
+  font-size: 12px; color: #8a6d3b; background: #fdf6e7;
+  border: 1px solid #f0dfb2; border-radius: 6px;
+  padding: 4px 8px; margin-top: 6px; overflow-wrap: anywhere;
+}
+.wb-foot { font-size: 11px; color: #8a929c; margin-top: 8px; }
+
+/* ===== S2e：Mock 刊登台（ptw）+ 工作台可操作区（mock）===== */
+.ptw-x-miss, .ptw-x-ev, .ptw-x-unc { background: #fdecea; color: #b71c1c; }
+.ptw-x-conf, .ptw-x-var { background: #fdf3e3; color: #8a6d3b; }
+.ptw-x-cls { background: #ede7f6; color: #4527a0; }
+.ptw-x-stale { background: #eceff1; color: #546e7a; }
+[class*="ptw-x-"] {
+  display: inline-block; font-size: 11px; font-weight: 600;
+  border-radius: 6px; padding: 1px 6px; white-space: nowrap;
+}
+.ptw-qedit, .wb-excval, .wb-rowval { margin-top: 4px; font-size: 12px; }
+
+/* 详情工作台（mock）新增块 */
+.wb-valid {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  font-size: 12px; margin: 6px 0; padding: 6px 8px;
+  background: #f7f9fb; border: 1px solid #e3e8ef; border-radius: 6px;
+}
+.wb-acts { white-space: nowrap; }
+.wb-acts .btn { margin-right: 3px; }
+.wb-excbtns, .wb-rowbtns { display: inline-flex; gap: 3px; flex-wrap: wrap; }
+.wb-single {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 6px 8px; background: #f7f9fb;
+  border: 1px dashed #c9d3e0; border-radius: 6px; margin-top: 4px;
+}
+.pt-aidimrow td { opacity: 0.62; }

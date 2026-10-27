@@ -66,16 +66,21 @@ env（mock|live）贯穿每笔写入，Mock/Live 任务互不可见；来源可�
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import sqlite3
 import threading
 import time
 import uuid
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Callable, Iterable
 
-from pt.candidates import bn_missing_reason, retrieve_candidates
+from pt.candidates import (
+    Candidate, CandidatesResult, bn_missing_reason, retrieve_candidates,
+)
 from pt.material import extract_material
 from pt.matcher import match_product
 from pt.schema import (
@@ -83,7 +88,8 @@ from pt.schema import (
     analyze_schema, attribute_gap_report, ensure_schema,
 )
 from pt.verifier import (
-    S_FORBIDDEN, S_UNAVAILABLE, save_browse_node_verification,
+    BrowseNodeVerification, CheckResult, PtVerification, S_FORBIDDEN,
+    S_UNAVAILABLE, save_browse_node_verification,
     save_pt_verification, verify_browse_node, verify_product_type,
 )
 from pt.store import ACTIVE_TASK_PHASES
@@ -91,8 +97,11 @@ from pt.store import ACTIVE_TASK_PHASES
 _LOG = logging.getLogger("pt.tasks")
 
 # ---- 常量（与商品无关；批复七/八的上限集中在此） ----
-DEFAULT_MAX_WORKERS = 2          # 批复八：默认保守
+DEFAULT_MAX_WORKERS = 3          # D1.12.2：批量默认 3（AI 并发上限同 3；
+                                 # 批复八的 1..8 帽与保守语义不变）
 MAX_WORKERS_CAP = 8              # 可配并发上限帽
+DEFAULT_AI_CONCURRENCY = 3       # D1.12.2：AI 决策并发初始上限（任务书④）
+AI_CONCURRENCY_CAP = 5           # AI 并发硬帽（绝不无限提并发）
 DEFAULT_ITEM_MAX_ATTEMPTS = 2    # 条目失败预算（attempt=失败次数）
 MAX_STAGE_REQUEST_BUDGET = 12    # 两层重试统一预算（条目×HTTP ≤ 上限）
 BN_NODE_CAP = 2                  # 每商品最多验证的 BN 节点数
@@ -114,6 +123,104 @@ REVIEW_KINDS = frozenset({
 
 # 任务层可直接操作的相位集合（store.ACTIVE_TASK_PHASES 的再导出视图）
 RESUMABLE_PHASES = ("created", "paused", "interrupted")
+
+
+
+# ---- D1.12.2（任务书④）：SP-API 各接口独立限流（保护性上限） ----
+# 按「方法名 → 接口类」分桶：PTD 检索 / PTD 定义 / 目录检索 / Schema 下载
+# 各自独立令牌桶（rate rps + burst 突发）；默认值只防失控循环，不压制
+# 正常批量节奏；429 的 Retry-After 语义仍归客户端 RetryConfig，互不越权。
+_SPAPI_OP_CLASS = {
+    "search_product_types": "ptd_search",
+    "get_product_type": "ptd_get",
+    "search_catalog_items": "catalog_search",
+    "get_catalog_item": "catalog_get",
+    "fetch_schema": "schema_fetch",
+}
+
+
+class _TokenBucket:
+    """极简令牌桶（单接口类一个；锁内短临界区，不做持久化）。"""
+
+    def __init__(self, rate: float, burst: float):
+        self.rate = max(float(rate), 0.1)
+        self.burst = max(float(burst), 1.0)
+        self.tokens = self.burst
+        self.t = time.monotonic()
+        self.cv = threading.Condition()
+
+    def acquire(self) -> None:
+        with self.cv:
+            while True:
+                now = time.monotonic()
+                self.tokens = min(self.burst, self.tokens
+                                  + (now - self.t) * self.rate)
+                self.t = now
+                if self.tokens >= 1.0:
+                    self.tokens -= 1.0
+                    return
+                self.cv.wait(timeout=0.05)
+
+
+class _Inflight:
+    """singleflight 在途槽：首个线程算，其余等结果（任务书④ PTD/Schema
+    在途去重）。失败不广播——等待者各自重算（行为与无去重时一致）。"""
+
+    __slots__ = ("event", "result", "done")
+
+    def __init__(self):
+        self.event = threading.Event()
+        self.result = None
+        self.done = False
+
+
+class _RateLimitedClient:
+    """透传包装：只拦 SP-API 只读动词计数+限流，其余属性/方法原样
+    转发（env_mode 等元数据读取不受影响；测试假客户端同样适用）。"""
+
+    def __init__(self, inner, *, rate: float, burst: float, perf: dict):
+        object.__setattr__(self, "_inner", inner)
+        object.__setattr__(self, "_buckets", {
+            cls: _TokenBucket(rate, burst)
+            for cls in set(_SPAPI_OP_CLASS.values()) | {"default"}
+        })
+        object.__setattr__(self, "_perf", perf)
+        object.__setattr__(self, "_perf_lock", threading.Lock())
+
+    def __getattr__(self, name):
+        inner = object.__getattribute__(self, "_inner")
+        attr = getattr(inner, name)
+        if not callable(attr) or name not in _SPAPI_OP_CLASS:
+            return attr
+        cls = _SPAPI_OP_CLASS[name]
+
+        def wrapped(*a, **kw):
+            object.__getattribute__(self, "_buckets")[cls].acquire()
+            perf = object.__getattribute__(self, "_perf")
+            with object.__getattribute__(self, "_perf_lock"):
+                sp = perf.setdefault("spapi", {})
+                sp[cls] = sp.get(cls, 0) + 1
+            return attr(*a, **kw)
+        return wrapped
+
+
+def _material_fp(material) -> str:
+    """资料指纹（任务书④：阶段复用须核对输入指纹）。覆盖参与 AI
+    决策与候选检索的全部本体字段；指纹变=上游资料已改，已有阶段
+    结论不得复用（宁可重跑，绝不拿旧结论配新资料）。"""
+    core = {
+        "pid": material.pid, "title": material.title,
+        "title_raw": material.title_raw, "bullets": material.bullets,
+        "description": material.description, "model": material.model,
+        "product_identity": material.product_identity,
+        "identity_source": material.identity_source,
+        "compat": sorted(material.compat_values()),
+        "language_guess": material.language_guess,
+        "degraded": bool(material.degraded),
+    }
+    return hashlib.sha256(
+        json.dumps(core, ensure_ascii=False, sort_keys=True)
+        .encode("utf-8")).hexdigest()
 
 
 class TaskStateError(Exception):
@@ -164,6 +271,11 @@ class ItemResult:
     attribute_verification: dict | None = None   # 缺口结论（≠可刊登）
     schema_status: str | None = None
     verified_against: str | None = None      # mock | live（诚实来源）
+    # D1.12.2 六态可见（条目行级，后续阶段失败也保留前序结论）：
+    ai_pt: str | None = None                 # AI 已分类（所选 PT）
+    ai_confidence: float | None = None
+    schema_ok: bool = False                  # Schema 已获取（缓存命中含）
+    attr_status: str | None = None           # 属性已校验（缺口结论）
 
 
 class TaskEngine:
@@ -191,11 +303,18 @@ class TaskEngine:
                  max_workers: int = DEFAULT_MAX_WORKERS,
                  item_max_attempts: int = DEFAULT_ITEM_MAX_ATTEMPTS,
                  http_retry_attempts: int = 1,
-                 ai_semantic: Callable[[dict], dict] | None = None):
+                 ai_semantic: Callable[[dict], dict] | None = None,
+                 ai_concurrency: int = DEFAULT_AI_CONCURRENCY,
+                 spapi_rate: float = 10.0, spapi_burst: float = 12.0):
         mw = int(max_workers)
         if mw < 1 or mw > MAX_WORKERS_CAP:
             raise ValueError(
                 f"max_workers 须在 1..{MAX_WORKERS_CAP}（批复八：默认保守）")
+        ac = int(ai_concurrency)
+        if ac < 1 or ac > AI_CONCURRENCY_CAP:
+            raise ValueError(
+                f"ai_concurrency 须在 1..{AI_CONCURRENCY_CAP}"
+                "（任务书④：AI 并发有界，绝不无限提）")
         ima = int(item_max_attempts)
         hra = max(1, int(http_retry_attempts))
         if ima < 1:
@@ -205,17 +324,40 @@ class TaskEngine:
                 f"两层重试预算超限：条目 {ima} × HTTP {hra} = {ima * hra} > "
                 f"{MAX_STAGE_REQUEST_BUDGET}（批复七：统一预算防放大）")
         self._store = store
+        # D1.12.2（任务书④）：阶段耗时/请求计数/跳过统计（审计用，
+        # 不参与任何门控；收尾落 pt_task.perf_json）。
+        self._perf = {"stages": {}, "spapi": {}, "ai_stage_runs": 0,
+                      "stage_skips": {}}
+        self._perf_lock = threading.Lock()
         self._client = client
         self._ai_decide = ai_decide
         # P2 受限语义裁决（可选；None=引擎在字面 0 分死局时也不问 GPT，
-        # 行为与修复前一致）。与 ai_decide 共用 _ai_lock 串行。
+        # 行为与修复前一致）。与 ai_decide 共用 _ai_sem 限并发。
         self._ai_semantic = ai_semantic
         self._load_product_fn = load_product
         self._cache_root = str(cache_root)
         self._seller_id = str(seller_id or "")
         self._max_workers = mw
         self._item_max_attempts = ima
-        self._ai_lock = threading.Lock()   # 注入的 AI 决策器无需线程安全
+        # D1.12.2（任务书④）：AI 并发由信号量限界（默认 3）；注入的
+        # AI 决策器无需线程安全——并发上限本身就是它的保护层。
+        self._ai_sem = threading.BoundedSemaphore(ac)
+        # SP-API 各接口独立限流（保护性上限：默认 10 rps/突发 12——
+        # 只防失控循环，不压制正常批量节奏；429 语义仍由客户端
+        # Retry-After 处理，两者互不越权）。
+        self._client = _RateLimitedClient(
+            client, rate=float(spapi_rate), burst=float(spapi_burst),
+            perf=self._perf)
+        # 批内去重（singleflight 结果复用，任务书④）：同 PT 的 PTD
+        # 验证/同节点的目录验证在本轮内只做一次，其余条目复用结论。
+        self._ptd_memo: dict[tuple, object] = {}
+        self._bn_memo: dict[tuple, object] = {}
+        self._schema_memo: dict[tuple, object] = {}
+        self._ptd_inflight: dict[tuple, _Inflight] = {}
+        self._bn_inflight: dict[tuple, _Inflight] = {}
+        self._schema_inflight: dict[tuple, _Inflight] = {}
+        self._memo_lock = threading.Lock()
+        self._stage_t0: dict[str, tuple] = {}
 
     # ------------------------------------------------------------------
     # 生命周期 API
@@ -223,14 +365,16 @@ class TaskEngine:
 
     def create_task(self, *, kind: str, store_id: str, marketplace_id: str,
                     pids: Iterable[str], env: str = "live", source: str = "",
-                    idem_key: str | None = None,
+                    idem_key: str | None = None, new_operation: bool = False,
                     task_id: str | None = None) -> dict:
         """创建任务（三种入口=三种 kind+source，编排层不区分特例）。
-        幂等/重叠守卫由 store.create_task 保证（批复四）。"""
+        幂等/重叠守卫由 store.create_task 保证（批复四）；终态同键
+        拒绝复用/显式新一轮语义同在 store 层（S3-B2-F）。"""
         tid = task_id or f"pt-{uuid.uuid4().hex[:12]}"
         return self._store.create_task(
             tid, kind, store_id, marketplace_id, pids, env=env,
-            source=source, idem_key=idem_key)
+            source=source, idem_key=idem_key,
+            new_operation=new_operation)
 
     def resume(self, task_id: str) -> bool:
         """恢复/起跑：created|paused|interrupted → running（CAS）。
@@ -305,7 +449,8 @@ class TaskEngine:
                 f"任务 {task_id} 处于 {task['phase']}，不可运行"
                 f"（resume 后再 run；暂停/取消由 request_* 发起）")
         ctx = _Ctx(task_id=task_id, store_id=task["store_id"],
-                   marketplace_id=task["marketplace_id"], env=task["env"])
+                   marketplace_id=task["marketplace_id"], env=task["env"],
+                   created_at=int(task.get("created_at") or 0))
         auth_evt = threading.Event()
         while True:
             # 外层循环：暂停落定时消费到持久化的「继续」意图（相位已回
@@ -355,6 +500,12 @@ class TaskEngine:
             finally:
                 pool.shutdown(wait=True)
             task = self._finalize(task_id, auth_evt)
+            try:
+                self._store.set_task_perf(
+                    task_id, json.dumps(self._perf_snapshot(),
+                                        ensure_ascii=False))
+            except Exception:  # noqa: BLE001 —— perf 审计绝不影响任务态
+                _LOG.exception("perf 落盘失败 task=%s（忽略）", task_id)
             if task["phase"] != "running" or auth_evt.is_set():
                 return task
             # running=消费到了挂起的「继续」意图：回到外层循环顶部
@@ -420,12 +571,19 @@ class TaskEngine:
                 stage=it["stage"], attempt=it["attempt"],
                 error_kind=it["error_kind"], error=it["error"],
                 result_ref=it["result_ref"],
-                ai_chosen_pt=(asg or {}).get("pt_name"),
-                confidence=(asg or {}).get("confidence"),
+                ai_chosen_pt=(asg or {}).get("pt_name")
+                             or (it.get("ai_pt") or None),
+                confidence=(asg or {}).get("confidence")
+                            if (asg or {}).get("confidence") is not None
+                            else it.get("ai_confidence"),
                 official_candidates=cands, pt_verification=ptv,
                 semantic_verification=semv, bn_verifications=bnvs,
                 attribute_verification=attr, schema_status=schema_status,
-                verified_against=env))
+                verified_against=env,
+                ai_pt=(it.get("ai_pt") or None),
+                ai_confidence=it.get("ai_confidence"),
+                schema_ok=bool(it.get("schema_ok")),
+                attr_status=(it.get("attr_status") or None)))
         return out
 
     # ------------------------------------------------------------------
@@ -466,14 +624,29 @@ class TaskEngine:
             return
         material = extract_material(pid, record, understanding)
 
+        # ---- D1.12.2：资料指纹 + 阶段级续跑判定（任务书④⑤）----
+        # 同一任务内重试（自动预算内或用户显式重试）时，已成功阶段的
+        # 结论不重跑：候选/AI/PTD/BN 各自按「指纹一致 + 已落库结论」
+        # 复用；资料变了（指纹不符）=全部重跑，绝不旧结论配新资料。
+        fp = _material_fp(material)
+        prior = self._store.task_item_row(t, pid) or {}
+        resumable = bool(prior.get("material_fp")
+                         and prior["material_fp"] == fp)
+        if not resumable and prior.get("material_fp") is not None:
+            self._perf_skip("resume_reset_material_changed")
+        self._store.update_item_progress(t, pid, material_fp=fp)
+
         # ---- 阶段 candidate_search ----
         if self._checkpoint(t, pid, auth_evt):
             return
-        self._store.set_item_stage(t, pid, "candidate_search")
-        cands = retrieve_candidates(
-            self._client, material, marketplace_id=ctx.marketplace_id)
-        # 候选证据先落库（审计+复核可见；历史不被静默覆盖）
-        self._persist_candidates(ctx, pid, cands)
+        self._stage_mark(ctx, pid, "candidate_search")
+        cands = self._candidates_for(ctx, pid, material,
+                                     reuse=resumable)
+        if getattr(cands, "_resumed", False):
+            self._perf_skip("candidate_search")
+        else:
+            # 候选证据先落库（审计+复核可见；历史不被静默覆盖）
+            self._persist_candidates(ctx, pid, cands)
         blocker = self._strategy_blocker(cands)
         if blocker is not None:
             kind, msg = blocker
@@ -490,11 +663,30 @@ class TaskEngine:
         # ---- 阶段 ai_matching ----
         if self._checkpoint(t, pid, auth_evt):
             return
-        self._store.set_item_stage(t, pid, "ai_matching")
-        with self._ai_lock:
-            mr = match_product(material, cands, self._ai_decide,
-                               marketplace_id=ctx.marketplace_id,
-                               ai_semantic=self._ai_semantic)
+        self._stage_mark(ctx, pid, "ai_matching")
+        prior_pt = (prior.get("ai_pt") or "") if resumable else ""
+        if prior_pt:
+            # AI 已分类（本任务此前轮次结论+指纹一致）：不重问、不重耗
+            # Token；置信度取当时落库值，证据链不动。
+            self._perf_skip("ai_matching")
+            class _Mr:  # noqa: N801 —— 复用路径的最小替身（只填下游用到的字段）
+                pass
+            mr = _Mr()
+            mr.status, mr.needs_review, mr.chosen = "matched", False, prior_pt
+            mr.confidence = prior.get("ai_confidence")
+            mr.review_reasons = []
+            chosen = prior_pt
+        else:
+            with self._ai_sem:
+                mr = match_product(material, cands, self._ai_decide,
+                                   marketplace_id=ctx.marketplace_id,
+                                   ai_semantic=self._ai_semantic)
+            chosen = None
+        with self._perf_lock:
+            self._perf["ai_stage_runs"] = self._perf.get(
+                "ai_stage_runs", 0) + (0 if prior_pt else 1)
+        if chosen is None:
+            chosen = mr.chosen
         if mr.status != "matched" or mr.needs_review or not mr.chosen:
             kind = {
                 "no_candidates": "no_candidates",
@@ -508,19 +700,32 @@ class TaskEngine:
             self._save_review_evidence(ctx, t, pid, "ai_matching", kind,
                                        mr.review_reasons, mr=mr)
             return
-        chosen = mr.chosen
+        # D1.12.2 六态之一「AI 已分类」：后续阶段失败也保留（条目行真源）
+        self._store.update_item_progress(t, pid, ai_pt=chosen,
+                                         ai_confidence=mr.confidence)
 
         # ---- 阶段 pt_verification（AI 匹配成功≠官方验证） ----
         if self._checkpoint(t, pid, auth_evt):
             return
-        self._store.set_item_stage(t, pid, "pt_verification")
+        self._stage_mark(ctx, pid, "pt_verification")
         cand_sources = {c.pt_name: sorted(c.sources)
                         for c in cands.candidates}
-        pv = verify_product_type(
-            self._client, material, chosen,
-            marketplace_id=ctx.marketplace_id,
-            candidate_sources=cand_sources)
-        save_pt_verification(self._store, pv, store_id=ctx.store_id, pid=pid)
+        pv = None
+        # 复用闸过了=本 pid 的验证行已在库（memo 只是免网络）：
+        # 无论 memo 命中还是行重建，都不重复追加证据链。
+        pv_resumed = resumable and self._ptd_passed(ctx, pid, chosen)
+        if pv_resumed:
+            pv = self._ptd_memo.get((ctx.marketplace_id, chosen))
+            if pv is None:
+                pv = self._ptd_rebuild(ctx, pid, chosen)
+            if pv is not None:
+                self._perf_skip("pt_verification")
+        if pv is None:
+            pv = self._verify_pt_shared(
+                material, chosen, ctx.marketplace_id, cand_sources)
+        if not pv_resumed:   # 续跑复用=行已在库，不重复追加证据链
+            save_pt_verification(self._store, pv,
+                                 store_id=ctx.store_id, pid=pid)
         ex = pv.exists
         if ex.status == S_FORBIDDEN:
             auth_evt.set()
@@ -567,7 +772,7 @@ class TaskEngine:
         # ---- 阶段 browse_node_verification（PT 存在≠BN 适配） ----
         if self._checkpoint(t, pid, auth_evt):
             return
-        self._store.set_item_stage(t, pid, "browse_node_verification")
+        self._stage_mark(ctx, pid, "browse_node_verification")
         nodes = self._bn_nodes_for(cands, chosen)
         if not nodes:
             # D3 只读诊断：说明为什么没有节点证据（区分 请求失败/解析
@@ -586,11 +791,20 @@ class TaskEngine:
         for nid in nodes:
             if self._checkpoint(t, pid, auth_evt):
                 return
-            bnv = verify_browse_node(
-                self._client, material, nid,
-                marketplace_id=ctx.marketplace_id)
-            save_browse_node_verification(
-                self._store, bnv, store_id=ctx.store_id, pid=pid)
+            bnv = None
+            bnv_resumed = resumable and self._bn_passed(ctx, pid, nid)
+            if bnv_resumed:
+                bnv = self._bn_memo.get((ctx.marketplace_id, nid))
+                if bnv is None:
+                    bnv = self._bn_rebuild(ctx, pid, nid)
+                if bnv is not None:
+                    self._perf_skip("browse_node_verification")
+            if bnv is None:
+                bnv = self._verify_bn_shared(material, nid,
+                                             ctx.marketplace_id)
+            if not bnv_resumed:   # 同上：复用不重复落行
+                save_browse_node_verification(
+                    self._store, bnv, store_id=ctx.store_id, pid=pid)
             if bnv.existence.status == S_FORBIDDEN:
                 auth_evt.set()
                 self._fail_retryable(t, pid, "auth",
@@ -617,11 +831,8 @@ class TaskEngine:
         # ---- 阶段 schema_analysis（Schema 成功≠属性齐全） ----
         if self._checkpoint(t, pid, auth_evt):
             return
-        self._store.set_item_stage(t, pid, "schema_analysis")
-        so = ensure_schema(
-            self._client, self._store, self._cache_root, pt_name=chosen,
-            marketplace_id=ctx.marketplace_id, seller_id=self._seller_id,
-            env=ctx.env)
+        self._stage_mark(ctx, pid, "schema_analysis")
+        so = self._ensure_schema_shared(ctx, chosen)
         if so.status == OUT_FORBIDDEN:
             auth_evt.set()
             self._fail_retryable(t, pid, "auth", "Schema 授权不足（401/403）")
@@ -658,11 +869,13 @@ class TaskEngine:
         analysis = analyze_schema(so.schema)
         gap = attribute_gap_report(material, analysis, pt_name=chosen,
                                    marketplace_id=ctx.marketplace_id)
+        self._store.update_item_progress(t, pid, schema_ok=1,
+                                         attr_status=gap.summary)
 
         # ---- 阶段 persist_result（缺口报告≠可刊登：incomplete 不拦完成）----
         if self._checkpoint(t, pid, auth_evt):
             return
-        self._store.set_item_stage(t, pid, "persist_result")
+        self._stage_mark(ctx, pid, "persist_result")
         # 属性缺口结论入审计链（check_kind=attribute；official=False——
         # 内部报告绝不冒充官方结论；complete_for_review≠可刊登）
         self._store.add_verification(
@@ -693,6 +906,253 @@ class TaskEngine:
     # ------------------------------------------------------------------
     # 内部：工具
     # ------------------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # D1.12.2 内部：阶段打点 / 续跑复用 / 批内去重 / perf 聚合
+    # ------------------------------------------------------------------
+
+    def _stage_mark(self, ctx: "_Ctx", pid: str, stage: str) -> None:
+        """阶段切换打点：落库（真源）+ 记上一阶段耗时（perf 审计）。"""
+        now = time.monotonic()
+        with self._perf_lock:
+            prev = self._stage_t0.pop(pid, None)
+            if prev is not None:
+                name, t0 = prev
+                st = self._perf["stages"].setdefault(
+                    name, {"count": 0, "total_ms": 0.0, "max_ms": 0.0})
+                dur = (now - t0) * 1000.0
+                st["count"] += 1
+                st["total_ms"] += dur
+                st["max_ms"] = max(st["max_ms"], dur)
+            self._stage_t0[pid] = (stage, now)
+        self._store.set_item_stage(ctx.task_id, pid, stage)
+
+    def _perf_skip(self, what: str) -> None:
+        with self._perf_lock:
+            skips = self._perf["stage_skips"]
+            skips[what] = skips.get(what, 0) + 1
+
+    def _perf_snapshot(self) -> dict:
+        with self._perf_lock:
+            out = json.loads(json.dumps(self._perf))   # 深拷贝聚合值
+            for name, st in out.get("stages", {}).items():
+                if st["count"]:
+                    st["avg_ms"] = round(st["total_ms"] / st["count"], 1)
+                st["total_ms"] = round(st["total_ms"], 1)
+                st["max_ms"] = round(st["max_ms"], 1)
+        return out
+
+    def _candidates_for(self, ctx: "_Ctx", pid: str, material,
+                        *, reuse: bool):
+        """候选检索（可复用）：同任务同指纹此前已落库 → 零网络重建
+        CandidatesResult；否则真检索（reports 全量保留在当轮对象里）。"""
+        if reuse:
+            rows = self._store.candidates(
+                ctx.store_id, ctx.marketplace_id, pid, env=ctx.env)
+            if rows:
+                merged = {}
+                for r in rows:
+                    pt = str(r.get("pt_name") or "")
+                    if not pt:
+                        continue
+                    c = merged.setdefault(
+                        pt, Candidate(pt_name=pt,
+                                      display_name=str(
+                                          r.get("display_name") or "")))
+                    ev = r.get("evidence")
+                    strat = str(r.get("strategy") or "reused")
+                    if isinstance(ev, dict):
+                        c.sources[strat] = ev
+                    if r.get("score") is not None:
+                        c.score = max(c.score, float(r["score"]))
+                if merged:
+                    res = CandidatesResult(
+                        pid=pid, marketplace_id=ctx.marketplace_id,
+                        env_mode=ctx.env,
+                        candidates=sorted(
+                            merged.values(),
+                            key=lambda c: -c.score))
+                    setattr(res, "_resumed", True)
+                    return res
+        return retrieve_candidates(
+            self._client, material, marketplace_id=ctx.marketplace_id)
+
+    def _singleflight(self, memo: dict, inflight: dict, key,
+                      keep, compute):
+        """通用在途去重：结果命中直接回；同 key 在途就等首发；首发
+        失败/超时不广播（等待者各自重算=与无去重时同语义，绝不放大
+        也绝不吞错）。keep(result)=True 才进结果缓存（部分通过的结论
+        不复用）。"""
+        with self._memo_lock:
+            if key in memo:
+                return memo[key]
+            fl = inflight.get(key)
+            owner = fl is None
+            if owner:
+                fl = _Inflight()
+                inflight[key] = fl
+        if not owner:
+            fl.event.wait(timeout=120.0)
+            if fl.done:
+                return fl.result
+            return compute()          # 首发失败：自己再算
+        try:
+            result = compute()
+        except BaseException:
+            with self._memo_lock:
+                inflight.pop(key, None)
+            fl.event.set()
+            raise
+        fl.result = result
+        fl.done = True
+        with self._memo_lock:
+            inflight.pop(key, None)
+            if keep(result):
+                memo[key] = result
+        fl.event.set()
+        return result
+
+    def _verify_pt_shared(self, material, chosen: str, mid: str,
+                          cand_sources: dict):
+        """PTD 验证（singleflight）：同 (站点, PT) 并发条目只发一次真
+        请求；全部通过才入结果缓存（部分通过不复用）。"""
+        def keep(pv):
+            return (pv.exists.status == "passed"
+                    and pv.semantic is not None
+                    and pv.semantic.status == "passed")
+        if (mid, chosen) in self._ptd_memo:
+            self._perf_skip("pt_verification_memo")
+        return self._singleflight(
+            self._ptd_memo, self._ptd_inflight, (mid, chosen), keep,
+            lambda: verify_product_type(
+                self._client, material, chosen, marketplace_id=mid,
+                candidate_sources=cand_sources))
+
+    def _verify_bn_shared(self, material, nid: str, mid: str):
+        if (mid, nid) in self._bn_memo:
+            self._perf_skip("browse_node_memo")
+        return self._singleflight(
+            self._bn_memo, self._bn_inflight, (mid, nid),
+            lambda bnv: bnv.existence.status == "passed",
+            lambda: verify_browse_node(self._client, material, nid,
+                                       marketplace_id=mid))
+
+    def _ensure_schema_shared(self, ctx: "_Ctx", pt: str):
+        """Schema 获取（singleflight）：同 (站点, PT, 卖家, env) 并发
+        条目只走一次 ensure_schema（含缓存命中判定——缓存本身也是共享
+        的）。OUT_OK 才入结果缓存；失败各算各的（重试语义不变）。"""
+        key = (ctx.marketplace_id, pt, self._seller_id, ctx.env)
+
+        def keep(so):
+            return so.status == OUT_OK
+        if key in self._schema_memo:
+            self._perf_skip("schema_memo")
+        return self._singleflight(
+            self._schema_memo, self._schema_inflight, key, keep,
+            lambda: ensure_schema(
+                self._client, self._store, self._cache_root, pt_name=pt,
+                marketplace_id=ctx.marketplace_id,
+                seller_id=self._seller_id, env=ctx.env))
+
+    def _verif_rows(self, ctx: "_Ctx", pid: str) -> list:
+        try:
+            return self._store.verifications(
+                ctx.store_id, ctx.marketplace_id, pid)
+        except Exception:  # noqa: BLE001 —— 复用判定降级=不跳过（安全侧）
+            return []
+
+    def _ptd_passed(self, ctx: "_Ctx", pid: str, pt: str) -> bool:
+        """续跑复用闸：本任务时间窗内 pt_exists+semantic 双通过且
+        PT 与本轮 AI 结论一致（含批内 memo 命中路径的等价判定）。"""
+        t0 = ctx.created_at or 0
+        ok_pt = ok_sem = False
+        for v in self._verif_rows(ctx, pid):
+            if int(v.get("checked_at") or 0) < t0:
+                continue
+            if v.get("pt_name") != pt:
+                continue
+            if (v.get("check_kind") == "pt_exists"
+                    and v.get("status") == "passed"):
+                ok_pt = True
+            if (v.get("check_kind") == "semantic"
+                    and v.get("status") == "passed"):
+                ok_sem = True
+        return ok_pt and ok_sem
+
+    def _ptd_rebuild(self, ctx: "_Ctx", pid: str, pt: str):
+        """从落库行重建 PtVerification 替身（只填下游消费的字段）。
+        无法重建（行缺失/形状异常）→ None=不跳过，真跑一遍。"""
+        rows = self._verif_rows(ctx, pid)
+        ex = next((v for v in reversed(rows)
+                   if v.get("check_kind") == "pt_exists"
+                   and v.get("pt_name") == pt
+                   and v.get("status") == "passed"), None)
+        sem = next((v for v in reversed(rows)
+                    if v.get("check_kind") == "semantic"
+                    and v.get("pt_name") == pt
+                    and v.get("status") == "passed"), None)
+        if ex is None or sem is None:
+            return None
+        try:
+            src_e = str((ex.get("detail") or {}).get("source") or "spapi")
+            src_s = str((sem.get("detail") or {}).get("source") or "spapi")
+            pv = PtVerification(
+                pt_name=pt, marketplace_id=ctx.marketplace_id, env=ctx.env,
+                checked_at=int(ex.get("checked_at") or 0),
+                exists=CheckResult(
+                    check_kind="pt_exists", status="passed",
+                    source=src_e, official=True,
+                    detail=dict(ex.get("detail") or {})),
+                semantic=CheckResult(
+                    check_kind="semantic", status="passed",
+                    source=src_s, official=True,
+                    detail=dict(sem.get("detail") or {})))
+            with self._memo_lock:
+                self._ptd_memo.setdefault((ctx.marketplace_id, pt), pv)
+            return pv
+        except Exception:  # noqa: BLE001 —— 形状对不上=不复用
+            return None
+
+    def _bn_passed(self, ctx: "_Ctx", pid: str, nid: str) -> bool:
+        t0 = ctx.created_at or 0
+        for v in self._verif_rows(ctx, pid):
+            if (v.get("check_kind") == "browse_node"
+                    and v.get("node_id") == nid
+                    and v.get("status") == "passed"
+                    and int(v.get("checked_at") or 0) >= t0):
+                return True
+        return False
+
+    def _bn_rebuild(self, ctx: "_Ctx", pid: str, nid: str):
+        rows = self._verif_rows(ctx, pid)
+        v = next((r for r in reversed(rows)
+                  if r.get("check_kind") == "browse_node"
+                  and r.get("node_id") == nid
+                  and r.get("status") == "passed"), None)
+        if v is None:
+            return None
+        try:
+            src = str((v.get("detail") or {}).get("source") or "spapi")
+            det = dict(v.get("detail") or {})
+            ok = CheckResult(check_kind="browse_node", status="passed",
+                             source=src, official=True, detail=det)
+            bnv = BrowseNodeVerification(
+                node_id=nid, marketplace_id=ctx.marketplace_id,
+                env=ctx.env, checked_at=int(v.get("checked_at") or 0),
+                existence=ok,
+                catalog=CheckResult(check_kind="browse_node",
+                                    status="passed", source=src,
+                                    official=True, detail=det),
+                fit=CheckResult(check_kind="browse_node", status="passed",
+                                source=src, official=True, detail=det),
+                usability=CheckResult(
+                    check_kind="browse_node", status="not_assessable",
+                    source="internal", official=False, detail={}))
+            with self._memo_lock:
+                self._bn_memo.setdefault((ctx.marketplace_id, nid), bnv)
+            return bnv
+        except Exception:  # noqa: BLE001
+            return None
 
     def _save_review_evidence(self, ctx, task_id: str, pid: str,
                               stage: str, kind: str,
@@ -912,3 +1372,4 @@ class _Ctx:
     store_id: str
     marketplace_id: str
     env: str
+    created_at: int = 0        # 任务创建时间（续跑复用判定窗口下界）

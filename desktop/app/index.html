@@ -42,6 +42,7 @@
     <div class="nav-cap">产品</div>
     <div class="nav-item on" data-view="list" title="全部产品">📋 产品列表</div>
     <div class="nav-item" data-view="pt" title="亚马逊 AI 分类（Product Type / 分类节点 / 属性缺口 / 人工复核）">🧭 亚马逊 AI 分类</div>
+    <div class="nav-item" data-view="ptw" title="Mock 刊登任务 + 异常复核队列（模拟测试，不是真实刊登）">🧪 Mock 刊登台</div>
     <div class="nav-item" data-view="cat" title="分类管理 + 分类产品">🗂 产品分类</div>
     <div class="nav-item" data-view="recycle" title="已删除的分类">♻️ 分类回收站</div>
     <div class="nav-item" data-view="words" title="侵权词对照表 + 分类→商品类型映射（上传时自动替换/自动填）">🛡 侵权词库</div>
@@ -161,6 +162,7 @@
         <!-- A 商品列表 -->
         <div class="pt-list">
           <div class="tabs small" id="ptFilterTabs"></div>
+          <div class="d-imghint" style="margin:2px 0 6px">商品来自产品库：分类只创建任务并写分类状态，商品不会被删除或移出产品库；已完成阶段（AI/PTD/节点/Schema/属性）在失败重试时不会重跑。</div>
           <div class="filter-row">
             <input id="ptQ" class="inp grow" placeholder="搜索：标题 / SKU">
             <button id="ptBatch" class="btn primary small">🧭 批量 AI 分类（0）</button>
@@ -172,9 +174,9 @@
               <th>商品</th><th style="width:120px">当前分类</th>
               <th style="width:110px">任务状态</th><th style="width:90px">操作</th>
             </tr></thead>
-            <tbody id="ptBody"></tbody>
+            <tbody id="ptListBody"></tbody>
           </table>
-          <div id="ptEmpty" class="empty hidden" style="padding:36px 0">这里会列出产品库里的商品和它们的 AI 分类进度。</div>
+          <div id="ptListEmpty" class="empty hidden" style="padding:36px 0">这里会列出产品库里的商品和它们的 AI 分类进度。</div>
         </div>
 
         <!-- B 分类详情 / D 人工复核（侧板） -->
@@ -186,6 +188,78 @@
           <div id="ptdEnv" class="d-imghint"></div>
           <div id="ptdBody" class="pt-detail-body"></div>
         </div>
+      </div>
+    </div>
+
+    <!-- ============ 🧪 Mock 刊登台（S2e：刊登任务中心 + 异常复核队列，全部模拟测试） ============ -->
+    <div id="ptwBox" class="pt-root hidden">
+      <div class="pt-top">
+        <label>店铺</label>
+        <select id="ptwStore" class="inp" style="max-width:200px"></select>
+        <span id="ptwMockBadge" class="pt-mock">🎭 模拟测试（Mock 演示，不是真实刊登）</span>
+        <button id="ptwRefresh" class="btn small">🔄 刷新</button>
+      </div>
+
+      <div class="tabs small" id="ptwTabs">
+        <div class="tab on" data-ptwtab="tasks">📋 刊登任务</div>
+        <div class="tab" data-ptwtab="queue">🚨 异常复核队列</div>
+      </div>
+
+      <!-- 刊登任务：列表 + 选中任务卡 + 逐 SKU 条目 -->
+      <div id="ptwTaskPane">
+        <div id="ptwTaskList" class="pt-tasklist"></div>
+        <div id="ptwTaskCard" class="task-card hidden">
+          <div class="task-head">
+            <b>🧪 模拟刊登任务</b><span id="ptwTaskPhase" class="chip"></span>
+            <span id="ptwTaskMsg" class="task-msg"></span>
+            <span class="task-acts">
+              <button id="ptwPause" class="btn small">⏸ 暂停</button>
+              <button id="ptwResume" class="btn small">▶ 继续</button>
+              <button id="ptwCancel" class="btn small">⛔ 取消</button>
+              <button id="ptwRetry" class="btn small">🔁 重试阻断/失败</button>
+              <button id="ptwNewRound" class="btn small">🔄 新一轮刊登</button>
+              <button id="ptwCloseTask" class="btn small">✖ 收起</button>
+            </span>
+          </div>
+          <div class="bar"><div id="ptwTaskBar" class="bar-in"></div></div>
+          <div id="ptwTaskStat" class="task-stat"></div>
+        </div>
+        <table class="recycle-table">
+          <thead><tr>
+            <th>商品 / SKU</th><th style="width:80px">变体</th>
+            <th style="width:120px">状态</th><th style="width:110px">阶段</th>
+            <th>阻断/错误原因</th><th>模拟提交</th>
+          </tr></thead>
+          <tbody id="ptwItemsBody"></tbody>
+        </table>
+        <div id="ptwTaskEmpty" class="empty" style="padding:30px 0">还没有模拟刊登任务。从商品详情工作台（单品）、产品列表勾选（批量）或分类页（整分类）发起。</div>
+      </div>
+
+      <!-- 异常复核队列：过滤 + 工单表 + 人工处置 -->
+      <div id="ptwQueuePane" class="hidden">
+        <div class="filter-row">
+          <select id="ptwType" class="inp" style="max-width:230px">
+            <option value="">全部异常类型</option>
+          </select>
+          <select id="ptwStatus" class="inp" style="max-width:130px">
+            <option value="open">待处理（open）</option>
+            <option value="resolved">已人工处置</option>
+            <option value="all">全部状态</option>
+          </select>
+          <input id="ptwPid" class="inp grow" placeholder="按商品 pid 过滤（可留空）">
+          <button id="ptwFilter" class="btn small primary">🔍 查询</button>
+        </div>
+        <div id="ptwQueueCount" class="d-imghint" style="margin:4px 0 8px"></div>
+        <table class="recycle-table">
+          <thead><tr>
+            <th>类型 / 属性</th><th style="width:110px">商品</th>
+            <th>原因 · 证据 · 修复建议</th><th style="width:150px">状态 / 处置记录</th>
+            <th style="width:250px">人工处置</th>
+          </tr></thead>
+          <tbody id="ptwQueueBody"></tbody>
+        </table>
+        <div id="ptwQueueEmpty" class="empty hidden" style="padding:30px 0">没有符合条件的异常工单。</div>
+        <div class="d-imghint" style="margin-top:8px">处置动作走人工授权接口（操作人=当前登录账号，全程审计）；「确认值/改值」只是补齐证据，之后必须重跑校验，不能跳过修复。</div>
       </div>
     </div>
 
@@ -243,6 +317,7 @@
       <button id="btnDel" class="btn danger">🗑 删除</button>
       <button id="btnExport" class="btn">⬇️ 导出优化结果</button>
       <button id="btnAmz" class="btn">📤 上传亚马逊</button>
+      <button id="btnPtw" class="btn">🧪 模拟刊登（Mock）</button>
       <button id="btnImportToggle" class="btn">📥 导入产品</button>
     </div>
 
@@ -584,5 +659,6 @@
 
 <script src="/app.js"></script>
 <script src="/pt.js"></script>
+<script src="/ptw.js"></script>
 </body>
 </html>

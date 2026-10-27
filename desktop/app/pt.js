@@ -125,7 +125,7 @@ async function ptTickTask() {
     if (!PT_ACTIVE.has(r.task.phase)) {
       ptStopPoll();
       await ptLoadStatus();
-      if (PT.viewing === "task") await ptLoadTaskItems();
+      await ptLoadTaskItems();   // 无条件刷新：终态条目立即可见
       toast("🧭 分类任务已结束：" + (PT_PHASE_LABEL[r.task.phase] || r.task.phase));
     }
     ptRenderTaskCard();
@@ -150,8 +150,11 @@ function ptRenderTaskCard() {
     (t.env === "mock" ? "［模拟数据］" : "") +
     (t.error ? String(t.error).slice(0, 120) : `${total} 个商品`);
   pt$("ptTaskBar").style.width = p + "%";
+  const active = PT_ACTIVE.has(t.phase);
   pt$("ptTaskStat").textContent =
     `进度 ${p}%（${finished}/${total}）`
+    + (active && t.pending ? ` · 排队 ${t.pending}` : "")
+    + (active && t.running ? ` · 处理中 ${t.running}` : "")
     + (t.completed ? ` · 完成 ${t.completed}` : "")
     + (t.needs_review ? ` · 待复核 ${t.needs_review}` : "")
     + (t.retryable_failed || t.permanent_failed
@@ -256,8 +259,8 @@ function ptRender() {
   pt$("ptBatch").classList.remove("hidden");
   pt$("ptSelAll").parentElement.classList.remove("hidden");
   const list = ptFiltered();
-  const body = pt$("ptBody");
-  pt$("ptEmpty").classList.toggle("hidden", list.length > 0);
+  const body = pt$("ptListBody");
+  pt$("ptListEmpty").classList.toggle("hidden", list.length > 0);
   body.innerHTML = list.slice(0, 300).map((it) => {
     const pid = String(it.pid);
     const s = PT.status[pid] || {};
@@ -283,6 +286,20 @@ function ptRenderBatchBtn() {
   pt$("ptBatch").disabled = !PT.sel.size;
 }
 
+function ptStageChips(x) {
+  // 六态（任务书③）：AI已分类/PTD已验证/节点已验证/Schema已获取/
+  // 属性已校验 —— 五枚阶段点 + 状态字（待复核/失败在状态列）。
+  const dot = (on, label) =>
+    `<span class="pt-b ${on ? "ok" : ""}" title="${label}${on ? "：已完成" : "：未到/未过"}">${on ? "✓" : "·"}${label}</span>`;
+  return [
+    dot(!!(x.ai_pt || x.pt), "AI"),
+    dot(x.pt_status === "passed", "PTD"),
+    dot(!!x.bn_verified, "节点"),
+    dot(!!x.schema_ok || !!x.attr_status, "Schema"),
+    dot(!!x.attr_status, "属性"),
+  ].join(" ");
+}
+
 function ptRenderItems() {
   pt$("ptBackList").classList.remove("hidden");
   pt$("ptBatch").classList.add("hidden");
@@ -291,16 +308,17 @@ function ptRenderItems() {
   const items = PT.items;
   const byPid = {};
   for (const it of (S.items || [])) byPid[String(it.pid)] = it;
-  pt$("ptEmpty").classList.toggle("hidden", items.length > 0);
-  pt$("ptEmpty").textContent = "任务还没有商品结果（刚创建？稍等片刻点刷新）。";
-  pt$("ptBody").innerHTML = items.map((x) => {
+  pt$("ptListEmpty").classList.toggle("hidden", items.length > 0);
+  pt$("ptListEmpty").textContent = "任务还没有商品结果（刚创建？稍等片刻点刷新）。";
+  pt$("ptListBody").innerHTML = items.map((x) => {
     const p = byPid[x.pid] || {};
     const bad = ["needs_review", "retryable_failed", "permanent_failed"].includes(x.state);
     return `<tr data-ptrow="${esc(x.pid)}" class="${bad ? "pt-rowbad" : ""}">
       <td></td>
       <td><b>${esc(p.title || x.pid)}</b><div class="d-imghint">${esc(x.sku || p.sku || x.pid)}</div></td>
       <td>${x.pt ? `<b>${esc(x.pt)}</b>` : "—"}${x.confidence != null ? `<div class="d-imghint">置信度 ${x.confidence}</div>` : ""}</td>
-      <td>${PT_ITEM_LABEL[x.state] || esc(x.state)}${x.error ? `<div class="d-imghint pt-err">${esc(String(x.error).slice(0, 90))}</div>` : ""}</td>
+      <td><div>${PT_ITEM_LABEL[x.state] || esc(x.state)}${x.error ? `<div class="d-imghint pt-err">${esc(String(x.error).slice(0, 90))}</div>` : ""}</div>
+        <div class="d-imghint">${ptStageChips(x)}</div></td>
       <td><button class="btn small" data-ptopen="${esc(x.pid)}">详情</button></td>
     </tr>`;
   }).join("");
@@ -522,7 +540,18 @@ async function ptStart(pids) {
   if (PT.env === "mock" && !confirm("当前是【模拟环境 Mock】——结果全部是模拟数据，仅供演示。继续？")) return;
   try {
     busy(true, "创建分类任务…");
-    const r = await api("/api/pt/tasks", { pids, store_id: PT.store, env: PT.env });
+    const body = { pids, store_id: PT.store, env: PT.env };
+    let r;
+    try {
+      r = await api("/api/pt/tasks", body);
+    } catch (e) {
+      // S3-B2-F 幂等新鲜度：同集合上一轮已结束（分类结果基于当时内容）
+      // → 409 引导显式新一轮，绝不静默复用旧任务
+      if (!/new_operation|已结束/.test(String(e && e.message || ""))) throw e;
+      if (!confirm("同集合的上一轮分类任务已结束（结果基于当时的商品内容，商品可能已改动）。\n要用当前商品重新分类一轮吗？（旧任务与结果原样保留）")) throw e;
+      r = await api("/api/pt/tasks", { ...body, new_operation: true });
+      toast("🔄 已发起新一轮分类（旧任务保留）", "ok");
+    }
     PT.task = r.task || null; PT.taskId = (r.task || {}).id || "";
     PT.viewing = "task";
     PT.sel.clear();   // 选择集随提交消费：防回列表后旧勾选混进新批次
@@ -566,11 +595,11 @@ function ptBind() {
     if (!c) return;
     PT.taskId = c.dataset.pttask;
     PT.viewing = "task";
-    pt$("ptBody").innerHTML = "";
+    pt$("ptListBody").innerHTML = "";
     pt$("ptdBody") && (pt$("ptdBody").innerHTML = "");
     ptTickNow().catch(() => {});
   });
-  pt$("ptBody").addEventListener("click", (e) => {
+  pt$("ptListBody").addEventListener("click", (e) => {
     const one = e.target.closest("[data-ptone]");
     if (one) { ptStart([one.dataset.ptone]); return; }
     const open = e.target.closest("[data-ptopen]");
@@ -578,7 +607,7 @@ function ptBind() {
     const row = e.target.closest("[data-ptrow]");
     if (row && !e.target.closest("input,button")) ptOpenDetail(row.dataset.ptrow);
   });
-  pt$("ptBody").addEventListener("change", (e) => {
+  pt$("ptListBody").addEventListener("change", (e) => {
     const ck = e.target.closest("[data-ptsel]");
     if (!ck) return;
     if (ck.checked) PT.sel.add(ck.dataset.ptsel); else PT.sel.delete(ck.dataset.ptsel);
