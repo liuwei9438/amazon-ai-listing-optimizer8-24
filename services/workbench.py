@@ -1015,7 +1015,7 @@ _WB_STATUS = {
 # V2.13.4 产品卡片（老产品库样式：图片 + 信息 + 状态角标）
 # =====================================================
 
-CARDS_PER_ROW = 5
+CARDS_PER_ROW = 7  # 对齐桌面版 D1.12.2（每行 7 张卡）
 
 _WB_BADGE = {
     "opt": ("✅ 已优化", "#1a6b32", "#e8f5e9"),
@@ -1133,7 +1133,9 @@ def _render_product_card(
             unsafe_allow_html=True,
         )
 
-        sel_col, det_col = st.columns(2)
+        # V2.13.13：对齐桌面版——一张全宽「选择/已选中」为主，
+        # 详情收成旁边的窄 📄 键
+        sel_col, det_col = st.columns([4, 1])
 
         if read_only:
             # 只读视图不能勾选 / 改标记，但可以看详情
@@ -1269,22 +1271,13 @@ def _render_wb_table(
     state_code = st.session_state["wb_status_code"]
 
     # ---- 日期快捷筛选（客户端过滤）。V2.13.7：产品库视图按导入
-    # 时间（imp），采集库/全部按采集入库时间（created）----
-    # V2.13.11：整行包进带边框的容器并加标签（老板反馈找不到
-    # 时间筛选在哪——和状态标签页长得一样被淹没了）
+    # 时间（imp），采集库/全部按采集入库时间（created）。
+    # V2.13.13：对齐桌面版——朴素一行按钮，不加边框容器
     date_key = "imp" if pool == "lib" else "created"
 
     st.session_state.setdefault("wb_date_code", "all")
 
-    date_box = st.container(border=True)
-
-    date_box.caption(
-        "🗓 时间筛选（按{}）：".format(
-            "导入时间" if pool == "lib" else "采集时间"
-        )
-    )
-
-    date_cols = date_box.columns(8)
+    date_cols = st.columns(8)
 
     date_defs = [
         ("all", "全部时间"),
@@ -1330,7 +1323,7 @@ def _render_wb_table(
         )
 
     elif st.session_state["wb_date_code"] == "custom":
-        lo_col, hi_col = date_box.columns(2)
+        lo_col, hi_col = st.columns(2)
 
         with lo_col:
             lo_date = st.date_input("起始日期", key="wb_date_lo")
