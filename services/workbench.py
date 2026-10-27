@@ -1271,11 +1271,21 @@ def _render_wb_table(
 
     # ---- 日期快捷筛选（客户端过滤）。V2.13.7：产品库视图按导入
     # 时间（imp），采集库/全部按采集入库时间（created）----
+    # V2.13.11：整行包进带边框的容器并加标签（老板反馈找不到
+    # 时间筛选在哪——和状态标签页长得一样被淹没了）
     date_key = "imp" if pool == "lib" else "created"
 
     st.session_state.setdefault("wb_date_code", "all")
 
-    date_cols = st.columns(8)
+    date_box = st.container(border=True)
+
+    date_box.caption(
+        "🗓 时间筛选（按{}）：".format(
+            "导入时间" if pool == "lib" else "采集时间"
+        )
+    )
+
+    date_cols = date_box.columns(8)
 
     date_defs = [
         ("all", "全部时间"),
@@ -1321,7 +1331,7 @@ def _render_wb_table(
         )
 
     elif st.session_state["wb_date_code"] == "custom":
-        lo_col, hi_col = st.columns(2)
+        lo_col, hi_col = date_box.columns(2)
 
         with lo_col:
             lo_date = st.date_input("起始日期", key="wb_date_lo")
@@ -1475,10 +1485,10 @@ def _render_wb_table(
         st.session_state.get("wb_page_size", 0) or PAGE_SIZE
     )
 
-    # V2.13.6：砍掉 200 档（录屏实测老板选 200/页后点一次删除，
-    # 两千多个元素把连接挤断 51 秒）；旧会话残留的非法值就地回收到
-    # 默认——必须在这里做，下面 total_pages 用的就是 page_size
-    _sizes = [20, 50, 100]
+    # V2.13.6 曾砍 200 档（当年每卡 10+ 元素，200/页点删除把连接
+    # 挤断 51 秒）；V2.13.11 恢复——卡片正文已压成 1 个 HTML 块，
+    # 200/页 ≈ 600 元素，对齐桌面版每页 200 的习惯
+    _sizes = [20, 50, 100, 200]
 
     if page_size not in _sizes:
         page_size = PAGE_SIZE
@@ -1554,8 +1564,8 @@ def _render_wb_table(
 
         return
 
-    # V2.13.6：每页条数选项（200 档已砍，回收逻辑在上面
-    # page_size 读取处——total_pages 前就要修好）
+    # V2.13.11：每页条数选项（200 档恢复；非法值回收在
+    # 上面 page_size 读取处——total_pages 前就要修好）
     jump3.selectbox(
         "每页",
         _sizes,

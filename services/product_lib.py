@@ -196,6 +196,8 @@ def _refresh_index(src_key: str) -> dict:
         raise RuntimeError(str(data.get("error") or "读取产品库失败"))
 
     st.session_state["prodlib_index"] = data
+    # V2.13.11：记拉取时间，_ensure_index 按它做过期判断
+    st.session_state["prodlib_index_at"] = time.time()
 
     # scope=all 的响应带全部库主名单（给「看谁的库」下拉用）
     if data.get("owners"):
@@ -209,10 +211,18 @@ def _refresh_index(src_key: str) -> dict:
 def _ensure_index(src_key: str) -> dict:
     cached = st.session_state.get("prodlib_index")
 
+    # V2.13.11：缓存 120 秒自动过期重拉——页面挂久了也能看到
+    # 插件新采集的产品（原来整个会话都是旧索引，和桌面版「不同步」
+    # 的主要体感来源；按钮点击触发的 rerun 不会连环重拉）
+    cache_age = time.time() - float(
+        st.session_state.get("prodlib_index_at") or 0
+    )
+
     if (
         isinstance(cached, dict)
         and cached.get("ok")
         and isinstance(cached.get("items"), list)
+        and cache_age < 120
     ):
         return cached
 
