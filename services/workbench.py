@@ -1043,15 +1043,15 @@ def _card_body_html(
             ' loading="lazy" referrerpolicy="no-referrer"'
             " onerror=\"this.onerror=null;"
             "this.style.visibility='hidden'\""
-            ' style="width:100%;height:110px;object-fit:contain;'
-            'background:#fafafa;border-radius:6px;" />'
+            ' style="width:100%;height:120px;object-fit:contain;'
+            'background:#fafafa;border-radius:8px;" />'
         )
 
     else:
         media = (
-            '<div style="height:110px;display:flex;align-items:center;'
-            'justify-content:center;color:#aaa;font-size:12px;'
-            'background:#fafafa;border-radius:6px;">（无图片）</div>'
+            '<div style="height:120px;display:flex;align-items:center;'
+            'justify-content:center;color:#bbb;font-size:12px;'
+            'background:#fafafa;border-radius:8px;">（无图片）</div>'
         )
 
     title = html.escape(str(it.get("title") or "（无标题）")[:60])
@@ -1062,7 +1062,7 @@ def _card_body_html(
             html.escape(str(it.get("model") or "—")[:20]),
         ),
         "分类：{}（资料 {} 行）".format(
-            html.escape(str(it.get("cat") or "未分类")[:20]),
+            html.escape(str(it.get("cat") or "未分类")[:44]),
             int(it.get("n_rows") or 0),
         ),
     ]
@@ -1072,14 +1072,9 @@ def _card_body_html(
     if opt_ms:
         lines.append(f"优化时间：{_fmt_ms(opt_ms)}")
 
-    # V2.13.7：采集时间（首次入库）/ 导入产品库时间
-    lines.append(f"采集时间：{_fmt_ms(it.get('created'))}")
-
-    imp_ms = int(it.get("imp") or 0)
-
-    if imp_ms:
-        lines.append(f"导入产品库：{_fmt_ms(imp_ms)}")
-
+    # V2.13.12：卡片文字行对齐桌面版（desktop/app/style.css .card）
+    # ——桌面版不显示采集时间/导入产品库两行，网页版跟齐；
+    # 字段本身还在（时间筛选用 created/imp），只是卡片上不印。
     src_status = str(it.get("status") or "wait")
 
     if src_status == "found":
@@ -1091,17 +1086,21 @@ def _card_body_html(
     if show_owner:
         lines.append("👤 " + html.escape(str(it.get("owner") or "—")[:16]))
 
-    body = "<br/>".join(html.escape(x) for x in lines)
+    # 行内容在拼的时候就已逐字段 escape 过，这里不能再整体
+    # escape 一遍（曾把 SKU 里的 & 显示成 &amp;）
+    body = "<br/>".join(lines)
 
     return (
         f'{media}'
         f'<span style="background:{bg};color:{fg};border-radius:999px;'
-        f'padding:2px 10px;font-size:12px;font-weight:700;'
-        f'display:inline-block;margin-top:6px;">{label}</span>'
-        f'<div style="font-weight:700;font-size:13px;'
-        f'margin:4px 0 2px;word-break:break-word;">{title}</div>'
+        f'padding:2px 10px;font-size:11px;font-weight:700;'
+        f'display:inline-block;margin-top:7px;">{label}</span>'
+        f'<div style="font-weight:700;font-size:13px;margin:4px 0 2px;'
+        f'word-break:break-word;display:-webkit-box;'
+        f'-webkit-line-clamp:2;-webkit-box-orient:vertical;'
+        f'overflow:hidden;">{title}</div>'
         f'<div style="font-size:12px;color:#555;'
-        f'line-height:1.6;">{body}</div>'
+        f'line-height:1.55;">{body}</div>'
     )
 
 
