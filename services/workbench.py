@@ -1599,7 +1599,7 @@ def _render_wb_table(
             )
         )
 
-    opt_btn = cat_btn = del_btn = export_clicked = import_btn = False
+    opt_btn = cat_btn = del_btn = export_clicked = import_btn = cls_btn = False
 
     if read_only:
         st.caption("👁 只读视图 — 要操作产品请切回自己的库。")
@@ -1632,7 +1632,8 @@ def _render_wb_table(
         sel_bar3.caption(f"已勾选 **{n_sel}** 个（跨页保留）")
 
         # 操作按钮在表格上方：勾选完不用滚过整页数据找按钮
-        b1, b2, b3, b4, b5 = st.columns(5)
+        # V2.13.9：加「🤖 分类优化」——AI 自动归类并直接应用，6 列
+        b1, b2, b3, b4, b5, b6 = st.columns(6)
 
         opt_btn = b1.button(
             f"🚀 AI 优化（{n_sel}）",
@@ -1649,7 +1650,15 @@ def _render_wb_table(
             disabled=not n_sel,
         )
 
-        del_btn = b3.button(
+        # V2.13.9 AI 自动归类：员工名-大分类-产品分类-细小分类
+        cls_btn = b3.button(
+            f"🤖 分类优化（{n_sel}）",
+            key="wb_cls_btn",
+            use_container_width=True,
+            disabled=not n_sel,
+        )
+
+        del_btn = b4.button(
             f"🗑 删除（{n_sel}）",
             key="wb_del_btn",
             use_container_width=True,
@@ -1657,7 +1666,7 @@ def _render_wb_table(
         )
 
         # V2.13.1：没有「网页导出」权限的账号不显示导出按钮
-        export_clicked = _exp_lib_ok() and b4.button(
+        export_clicked = _exp_lib_ok() and b5.button(
             f"⬇️ 导出优化结果（{n_sel}）",
             key="wb_export_btn",
             use_container_width=True,
@@ -1666,7 +1675,7 @@ def _render_wb_table(
 
         # V2.13.7 采集库 → 产品库：只导入已优化的（规则见导入处理）
         if pool == "collect":
-            import_btn = b5.button(
+            import_btn = b6.button(
                 f"📦 导入产品库（{n_sel}）",
                 key="wb_promote_btn",
                 use_container_width=True,
@@ -1756,6 +1765,98 @@ def _render_wb_table(
 
                 except Exception as exc:
                     st.error(f"导入失败：{exc}")
+
+        # ---- V2.13.9 分类优化（AI 自动归类，直接应用，无预览）----
+        if cls_btn:
+            if not str(api_key or "").strip():
+                st.warning("先在左侧配置 AI 服务商和 Key 再用分类优化。")
+
+            else:
+                by_pid = {str(it.get("pid")): it for it in filtered}
+                targets = [
+                    {
+                        "pid": p,
+                        "owner": (
+                            str(by_pid[p].get("owner") or "").strip()
+                            or str(
+                                st.session_state.get("auth_user") or ""
+                            ).strip()
+                        ),
+                        "title": str(by_pid[p].get("title") or ""),
+                        "old_cat": str(by_pid[p].get("cat") or ""),
+                    }
+                    for p in sel_pids
+                    if p in by_pid
+                ]
+
+                if not targets:
+                    st.warning("选中的产品不在当前列表里，刷新后再试。")
+
+                else:
+                    from services.classifier import classify_products
+
+                    n_t = len(targets)
+                    prog = st.progress(0.0, text=f"🤖 AI 分类中：0/{n_t}")
+
+                    try:
+                        done, failed_n = classify_products(
+                            api_key,
+                            model,
+                            targets,
+                            progress=lambda v: prog.progress(
+                                v,
+                                text=(
+                                    "🤖 AI 分类中："
+                                    f"{min(int(v * n_t) + 1, n_t)}/{n_t}"
+                                ),
+                            ),
+                        )
+
+                    except Exception as exc:
+                        done = None
+                        failed_n = 0
+                        prog.empty()
+                        st.error(f"分类优化失败：{exc}")
+
+                    if done is not None:
+                        prog.empty()
+
+                        if not done:
+                            st.error(
+                                "AI 没有返回任何可用分类——检查左侧"
+                                "服务商 Key / 余额，稍后重试。"
+                            )
+
+                        else:
+                            try:
+                                from services.product_lib import _prod_write
+
+                                # /prod_update 每条 = 读旧值 + 写回
+                                # 两次 KV 子操作，20 条一块不超上限
+                                _prod_write(
+                                    "/prod_update",
+                                    "updates",
+                                    [
+                                        {"pid": p, "cat": c}
+                                        for p, c in done.items()
+                                    ],
+                                    label="分类写入失败",
+                                )
+                                _refresh_index(src_key)
+                                st.session_state[sel_state_key] = []
+
+                                msg = f"🤖 已分类 {len(done)} 个"
+
+                                if failed_n:
+                                    msg += f"（{failed_n} 个失败已跳过）"
+
+                                st.toast(msg)
+                                st.rerun()
+
+                                return
+
+                            except Exception as exc:
+                                st.error(f"分类写入失败：{exc}")
 
     # ---- 批量设分类 ----
     if st.session_state.get("prodlib_cat_panel") and n_sel:
