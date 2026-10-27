@@ -79,6 +79,11 @@ TASK_RUNNING_STATUS = ["created", "running", "processing"]
 
 PAGE_SIZE = 20  # 卡片墙每页张数（V2.13.4）
 
+# V2.13.10：AI 分类优化按钮先隐藏——现配 Key 按条计费费用高
+# （2026-10-27 用户决定）。分类逻辑保留在 services/classifier.py，
+# 要复用时改 True；或走 Codex 离线批处理（导出→归类→/prod_update）。
+ENABLE_AI_CLASSIFY = False
+
 # 采集插件 20 列模板 → FieldMap（粘贴导入直接建 ProductRecord，
 # 和 Excel 上传走同一条 build_product_records 路径）
 _TEMPLATE_FIELDS = FieldMap(
@@ -1632,8 +1637,13 @@ def _render_wb_table(
         sel_bar3.caption(f"已勾选 **{n_sel}** 个（跨页保留）")
 
         # 操作按钮在表格上方：勾选完不用滚过整页数据找按钮
-        # V2.13.9：加「🤖 分类优化」——AI 自动归类并直接应用，6 列
-        b1, b2, b3, b4, b5, b6 = st.columns(6)
+        # V2.13.9 加「🤖 分类优化」；V2.13.10 默认隐藏（费用，
+        # 见文件顶部 ENABLE_AI_CLASSIFY 说明），隐藏时回 5 列
+        if ENABLE_AI_CLASSIFY:
+            b1, b2, b3, b4, b5, b6 = st.columns(6)
+        else:
+            b1, b2, b4, b5, b6 = st.columns(5)
+            b3 = None
 
         opt_btn = b1.button(
             f"🚀 AI 优化（{n_sel}）",
@@ -1651,12 +1661,14 @@ def _render_wb_table(
         )
 
         # V2.13.9 AI 自动归类：员工名-大分类-产品分类-细小分类
-        cls_btn = b3.button(
-            f"🤖 分类优化（{n_sel}）",
-            key="wb_cls_btn",
-            use_container_width=True,
-            disabled=not n_sel,
-        )
+        # V2.13.10 默认不渲染（费用高），处理器随 cls_btn 休眠
+        if ENABLE_AI_CLASSIFY:
+            cls_btn = b3.button(
+                f"🤖 分类优化（{n_sel}）",
+                key="wb_cls_btn",
+                use_container_width=True,
+                disabled=not n_sel,
+            )
 
         del_btn = b4.button(
             f"🗑 删除（{n_sel}）",
